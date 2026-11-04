@@ -1,11 +1,6 @@
-#!/system/bin/sh
+#!/sbin/sh
 TMPDIR=/dev/tmp
-rm -rf $TMPDIR 2>/dev/null
-mkdir -p $TMPDIR
-chcon u:object_r:system_file:s0 $TMPDIR 2>/dev/null
-
-export OUTFD=$2
-export ZIPFILE=$3
+umask 022
 
 ui_print() {
   if [ "$BOOTMODE" = "true" ]; then
@@ -15,51 +10,95 @@ ui_print() {
   fi
 }
 
-# 检测是否在 Manager 还是 Recovery 环境
-ps | grep zygote | grep -v grep >/dev/null && export BOOTMODE=true || export BOOTMODE=false
-$BOOTMODE || ps -A 2>/dev/null | grep zygote | grep -v grep >/dev/null && export BOOTMODE=true
+require_new_magisk() {
+  ui_print "**********************************"
+  ui_print " 请安装 Magisk v24.0+ 或 KernelSU / APatch "
+  ui_print "**********************************"
+  exit 1
+}
 
-ui_print "========================================="
-ui_print "     蜃楼工坊 · MirageForge Installer    "
-ui_print "========================================="
+OUTFD=$2
+ZIPFILE=$3
 
-# 挂载 /data 分区（Recovery 模式必需）
-if ! $BOOTMODE; then
-  ui_print "- 当前处于 Recovery 模式，正在挂载 /data..."
-  mount /data 2>/dev/null
-  if [ ! -d "/data/adb" ]; then
-    ui_print "! 错误：无法挂载 /data 或未检测到 Magisk/KernelSU 环境"
-    exit 1
-  fi
+mount /data 2>/dev/null
+
+# 1. 优先尝试加载 Magisk / KSU / APatch 标准安装函数库
+if [ -f /data/adb/magisk/util_functions.sh ]; then
+  . /data/adb/magisk/util_functions.sh
+  install_module
+  exit 0
+elif [ -f /data/adb/ksu/bin/busybox ]; then
+  export PATH="/data/adb/ksu/bin:$PATH"
+elif [ -f /data/adb/ap/bin/busybox ]; then
+  export PATH="/data/adb/ap/bin:$PATH"
 fi
+
+# 2. 独立安装引擎（兼容无 util_functions.sh 的 KSU/APatch 环境与 TWRP Recovery）
+rm -rf $TMPDIR 2>/dev/null
+mkdir -p $TMPDIR
+
+ps | grep zygote | grep -v grep >/dev/null && BOOTMODE=true || BOOTMODE=false
+$BOOTMODE || ps -A 2>/dev/null | grep zygote | grep -v grep >/dev/null && BOOTMODE=true
+export BOOTMODE OUTFD ZIPFILE TMPDIR
+
+abort() {
+  ui_print "$1"
+  rm -rf $TMPDIR
+  exit 1
+}
+
+set_perm() {
+  chown $2:$3 $1 || return 1
+  chmod $4 $1 || return 1
+  local CON=$5
+  [ -z $CON ] && CON=u:object_r:system_file:s0
+  chcon $CON $1 2>/dev/null
+}
+
+set_perm_recursive() {
+  find $1 -type d 2>/dev/null | while read dir; do
+    set_perm $dir $2 $3 $4 $6
+  done
+  find $1 -type f -o -type l 2>/dev/null | while read file; do
+    set_perm $file $2 $3 $5 $6
+  done
+}
+
+# 获取系统架构与 API 版本
+ABI=$(getprop ro.product.cpu.abi)
+case "$ABI" in
+  arm64*) ARCH=arm64; IS64BIT=true ;;
+  armeabi*) ARCH=arm; IS64BIT=false ;;
+  x86_64*) ARCH=x64; IS64BIT=true ;;
+  x86*) ARCH=x86; IS64BIT=false ;;
+  *) abort "! 未知的 CPU 架构: $ABI" ;;
+esac
+API=$(getprop ro.build.version.sdk)
+export ARCH ABI IS64BIT API
 
 MODID="mirage_forge"
-MODPATH="/data/adb/modules_update/$MODID"
-if ! $BOOTMODE; then
+if $BOOTMODE; then
+  MODPATH="/data/adb/modules_update/$MODID"
+  mkdir -p "/data/adb/modules/$MODID"
+else
   MODPATH="/data/adb/modules/$MODID"
 fi
+export MODID MODPATH
 
 rm -rf "$MODPATH" 2>/dev/null
 mkdir -p "$MODPATH"
 
-ui_print "- 正在解压模块文件..."
-unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >&2
-
-# 执行自定义安装脚本
-if [ -f "$MODPATH/customize.sh" ]; then
-  . "$MODPATH/customize.sh"
+unzip -o "$ZIPFILE" "customize.sh" -d "$TMPDIR" >&2
+if [ -f "$TMPDIR/customize.sh" ]; then
+  . "$TMPDIR/customize.sh"
+else
+  abort "! 安装包损坏：缺失 customize.sh"
 fi
 
-# Manager 模式下写入 update 标记
 if $BOOTMODE; then
-  mkdir -p "/data/adb/modules/$MODID"
   touch "/data/adb/modules/$MODID/update"
   cp -af "$MODPATH/module.prop" "/data/adb/modules/$MODID/module.prop"
 fi
 
-chmod -R 755 "$MODPATH"
-chcon -R u:object_r:system_file:s0 "$MODPATH" 2>/dev/null
-
-ui_print "- 安装完成！重启设备后生效。"
 rm -rf $TMPDIR
 exit 0
