@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>蜃楼工坊 · MirageForge</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-container">
+    <!-- 顶部栏 -->
+    <header class="top-bar">
+      <div class="brand-wrap">
+        <div class="logo-badge">蜃</div>
+        <div>
+          <h1>蜃楼工坊 <span class="ver-tag">Zygisk</span></h1>
+          <p class="subtitle">MirageForge · 应用级千面伪装矩阵</p>
+        </div>
+      </div>
+      <div class="stat-pill" id="statusPill">就绪</div>
+    </header>
+
+    <!-- 导航栏 -->
+    <nav class="tab-nav">
+      <button class="tab-btn active" data-tab="tab-templates">机型模板库</button>
+      <button class="tab-btn" data-tab="tab-parser">一键解析 .prop</button>
+      <button class="tab-btn" data-tab="tab-apps">应用分流绑定</button>
+    </nav>
+
+    <!-- 页面 1：机型模板库 -->
+    <main id="tab-templates" class="tab-panel active">
+      <div class="section-header">
+        <h2>已保存的机型模板</h2>
+        <button class="btn-primary" id="btnNewTemplate">+ 新建机型</button>
+      </div>
+      <div id="templateList" class="card-grid"></div>
+    </main>
+
+    <!-- 页面 2：一键解析 .prop -->
+    <main id="tab-parser" class="tab-panel">
+      <div class="glass-card">
+        <h2>一键导入 / 解析 build.prop</h2>
+        <p class="hint-text">支持直接上传提取的 <code>build.prop</code> 文件，或将属性文本粘贴至下方，系统将自动提取品牌、型号、设备代号与指纹并生成机型模板。</p>
+        
+        <div class="upload-zone" id="uploadZone">
+          <input type="file" id="propFileInput" accept=".prop,.txt,.conf,*/*" hidden />
+          <div class="upload-icon">📄</div>
+          <div class="upload-title">点击选择本地 .prop 文件导入</div>
+          <div class="upload-sub">支持 system / vendor / odm / product 等各类 build.prop</div>
+        </div>
+
+        <textarea id="propRawText" rows="7" placeholder="或者在此处直接粘贴 build.prop 内容，例如：&#10;ro.product.brand=Xiaomi&#10;ro.product.model=2410DPN6CC&#10;ro.product.device=haotian&#10;ro.build.fingerprint=Xiaomi/haotian/..."></textarea>
+
+        <div class="action-row">
+          <button class="btn-secondary" id="btnClearProp">清空内容</button>
+          <button class="btn-primary" id="btnParseProp">⚡ 立即解析并生成模板</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- 页面 3：应用分流绑定 -->
+    <main id="tab-apps" class="tab-panel">
+      <div class="filter-bar glass-card">
+        <input type="text" id="appSearchInput" placeholder="🔍 搜索应用包名..." />
+        <div class="filter-chips">
+          <button class="chip active" data-filter="all">全部应用</button>
+          <button class="chip" data-filter="configured">仅已伪装</button>
+          <button class="chip" id="btnRefreshApps">🔄 刷新列表</button>
+        </div>
+      </div>
+      <div id="appList" class="app-list"></div>
+    </main>
+  </div>
+
+  <!-- 机型编辑/新建弹窗 -->
+  <div class="modal-backdrop" id="templateModal">
+    <div class="modal-card">
+      <h3 id="modalTitle">编辑机型模板</h3>
+      <input type="hidden" id="tplId" />
+      <div class="form-grid">
+        <label>模板显示名称 *
+          <input type="text" id="tplName" placeholder="例如：小米 15 Pro" />
+        </label>
+        <label>手机型号 (MODEL) *
+          <input type="text" id="tplModel" placeholder="ro.product.model (如 2410DPN6CC)" />
+        </label>
+        <label>品牌 (BRAND) *
+          <input type="text" id="tplBrand" placeholder="ro.product.brand (如 Xiaomi)" />
+        </label>
+        <label>制造商 (MANUFACTURER) *
+          <input type="text" id="tplManufacturer" placeholder="ro.product.manufacturer" />
+        </label>
+        <label>设备代号 (DEVICE)
+          <input type="text" id="tplDevice" placeholder="ro.product.device (如 haotian)" />
+        </label>
+        <label>产品名称 (PRODUCT)
+          <input type="text" id="tplProduct" placeholder="ro.product.name" />
+        </label>
+        <label>主板平台 (BOARD)
+          <input type="text" id="tplBoard" placeholder="ro.board.platform / ro.product.board" />
+        </label>
+        <label>硬件标识 (HARDWARE)
+          <input type="text" id="tplHardware" placeholder="ro.hardware (如 qcom)" />
+        </label>
+        <label class="full-width">设备指纹 (FINGERPRINT)
+          <input type="text" id="tplFingerprint" placeholder="ro.build.fingerprint" />
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" id="btnCancelModal">取消</button>
+        <button class="btn-primary" id="btnSaveTemplate">保存机型模板</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
