@@ -1,0 +1,65 @@
+#!/system/bin/sh
+TMPDIR=/dev/tmp
+rm -rf $TMPDIR 2>/dev/null
+mkdir -p $TMPDIR
+chcon u:object_r:system_file:s0 $TMPDIR 2>/dev/null
+
+export OUTFD=$2
+export ZIPFILE=$3
+
+ui_print() {
+  if [ "$BOOTMODE" = "true" ]; then
+    echo "$1"
+  else
+    echo -e "ui_print $1\nui_print" >> /proc/self/fd/$OUTFD
+  fi
+}
+
+# 检测是否在 Manager 还是 Recovery 环境
+ps | grep zygote | grep -v grep >/dev/null && export BOOTMODE=true || export BOOTMODE=false
+$BOOTMODE || ps -A 2>/dev/null | grep zygote | grep -v grep >/dev/null && export BOOTMODE=true
+
+ui_print "========================================="
+ui_print "     蜃楼工坊 · MirageForge Installer    "
+ui_print "========================================="
+
+# 挂载 /data 分区（Recovery 模式必需）
+if ! $BOOTMODE; then
+  ui_print "- 当前处于 Recovery 模式，正在挂载 /data..."
+  mount /data 2>/dev/null
+  if [ ! -d "/data/adb" ]; then
+    ui_print "! 错误：无法挂载 /data 或未检测到 Magisk/KernelSU 环境"
+    exit 1
+  fi
+fi
+
+MODID="mirage_forge"
+MODPATH="/data/adb/modules_update/$MODID"
+if ! $BOOTMODE; then
+  MODPATH="/data/adb/modules/$MODID"
+fi
+
+rm -rf "$MODPATH" 2>/dev/null
+mkdir -p "$MODPATH"
+
+ui_print "- 正在解压模块文件..."
+unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >&2
+
+# 执行自定义安装脚本
+if [ -f "$MODPATH/customize.sh" ]; then
+  . "$MODPATH/customize.sh"
+fi
+
+# Manager 模式下写入 update 标记
+if $BOOTMODE; then
+  mkdir -p "/data/adb/modules/$MODID"
+  touch "/data/adb/modules/$MODID/update"
+  cp -af "$MODPATH/module.prop" "/data/adb/modules/$MODID/module.prop"
+fi
+
+chmod -R 755 "$MODPATH"
+chcon -R u:object_r:system_file:s0 "$MODPATH" 2>/dev/null
+
+ui_print "- 安装完成！重启设备后生效。"
+rm -rf $TMPDIR
+exit 0
