@@ -1,4 +1,4 @@
-name: Build MirageForge Zygisk Module
+name: Build MirageForge v4.0 Hypervisor
 
 on:
   push:
@@ -8,51 +8,52 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-zygisk:
+  build-zygisk-v4:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Source Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Android NDK
+      - name: Setup Android NDK r26d
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
           ndk-version: r26d
           add-to-path: true
 
-      - name: Fetch Latest zygisk.hpp (API v4)
+      - name: Fetch Official zygisk.hpp (API v4)
         run: |
-          if [ ! -f "zygisk/src/main/cpp/zygisk.hpp" ]; then
+          mkdir -p zygisk/src/main/cpp/include
+          if [ ! -f "zygisk/src/main/cpp/include/zygisk.hpp" ]; then
             curl -sSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
-              -o zygisk/src/main/cpp/zygisk.hpp
+              -o zygisk/src/main/cpp/include/zygisk.hpp
           fi
 
-      - name: Compile Zygisk Native Libraries (All ABIs)
+      - name: Build Native Hypervisor Libraries (All 4 ABIs)
         run: |
           mkdir -p module/zygisk
           ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
           for ABI in "${ABIS[@]}"; do
-            echo "Building ABI: $ABI"
+            echo ">>> Compiling MirageForge v4.0 for $ABI..."
             cmake -B build/$ABI \
               -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
               -DANDROID_ABI=$ABI \
               -DANDROID_PLATFORM=android-26 \
               -DCMAKE_BUILD_TYPE=Release \
               zygisk/src/main/cpp
-            cmake --build build/$ABI --config Release
-            cp build/$ABI/libmirage_forge.so module/zygisk/$ABI.so
+            cmake --build build/$ABI --config Release --parallel $(nproc)
+            cp -f build/$ABI/libmirage_forge.so module/zygisk/$ABI.so
           done
 
-      - name: Package Flashable Magisk/KSU/Recovery Zip
+      - name: Package Flashable Module Zip (Manager + Recovery)
         run: |
           chmod +x module/META-INF/com/google/android/update-binary
-          chmod +x module/customize.sh module/uninstall.sh
+          chmod +x module/customize.sh module/action.sh module/uninstall.sh
           cd module
-          zip -r9 ../MirageForge-Zygisk-v1.0.0.zip . -x "*.DS_Store"
+          zip -r9 ../MirageForge-Zygisk-v4.0.0.zip . -x "*.DS_Store"
 
-      - name: Upload Flashable Module Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MirageForge-Zygisk-Module
-          path: MirageForge-Zygisk-v1.0.0.zip
+          name: MirageForge-Zygisk-v4.0.0
+          path: MirageForge-Zygisk-v4.0.0.zip
