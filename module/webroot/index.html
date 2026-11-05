@@ -3,81 +3,112 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>蜃楼工坊 · MirageForge v2.0</title>
+  <title>蜃楼工坊 · MirageForge v4.0</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <div class="app-container">
+    <!-- 顶部全息状态栏 -->
     <header class="top-bar">
       <div class="brand-wrap">
         <div class="logo-badge">蜃</div>
         <div>
-          <h1>蜃楼工坊 <span class="ver-tag">v2.0 Engine</span></h1>
-          <p class="subtitle">Zygisk API v4 · 虚拟句柄池 · memfd 文件盾</p>
+          <h1>蜃楼工坊 <span class="ver-tag">v4.0 Hypervisor</span></h1>
+          <p class="subtitle">Bionic 1:1 内存池 · Vulkan/GLES · 隐身 VFS · 探针闭环</p>
         </div>
       </div>
-      <div class="stat-pill" id="statusPill">就绪</div>
+      <div class="stat-pill" id="statusPill">初始化中</div>
     </header>
 
+    <!-- 四维导航栏 -->
     <nav class="tab-nav">
-      <button class="tab-btn active" data-tab="tab-templates">机型模板库</button>
-      <button class="tab-btn" data-tab="tab-parser">一键解析 .prop</button>
+      <button class="tab-btn active" data-tab="tab-templates">全息模板库</button>
+      <button class="tab-btn" data-tab="tab-parser">智能 .prop 炼金</button>
       <button class="tab-btn" data-tab="tab-apps">应用分流矩阵</button>
+      <button class="tab-btn" data-tab="tab-probe">📡 幻境探针</button>
     </nav>
 
-    <!-- 页面 1：机型模板库 -->
+    <!-- 页面 1：全息机型模板库 -->
     <main id="tab-templates" class="tab-panel active">
       <div class="section-header">
-        <h2>全息机型模板</h2>
-        <button class="btn-primary" id="btnNewTemplate">+ 新建全息模板</button>
+        <h2>全息硬件虚拟化模板</h2>
+        <div class="btn-group">
+          <button class="btn-secondary" id="btnExportJson">导出备份</button>
+          <button class="btn-primary" id="btnNewTemplate">+ 铸造新机型</button>
+        </div>
       </div>
       <div id="templateList" class="card-grid"></div>
     </main>
 
-    <!-- 页面 2：一键解析 .prop -->
+    <!-- 页面 2：智能 .prop 炼金台 -->
     <main id="tab-parser" class="tab-panel">
       <div class="glass-card">
-        <h2>深度解析 build.prop (支持全量属性穿透)</h2>
-        <p class="hint-text">上传或粘贴任意 ROM 提取的 <code>build.prop</code>，引擎会自动提取机型、SoC、安全补丁、指纹，并将剩余所有厂商专属属性（如 <code>ro.miui.*</code>、<code>ro.oplus.*</code>）自动归入底层附加属性池。</p>
+        <h2>智能 build.prop 炼金解析器 (v4.0 全拓扑推导)</h2>
+        <p class="hint-text">上传或粘贴提取自任意 ROM 的 <code>build.prop</code>，炼金引擎将自动提取机型、指纹、安全补丁，并根据平台代号（如 <code>sun</code>/<code>pineapple</code>/<code>mt6991</code>）自动推导配套的 <b>Vulkan/GLES GPU 渲染器</b>、<b>SoC ID</b>、<b>CPU 最高主频</b> 及全量跨品牌私有属性。</p>
         
         <div class="upload-zone" id="uploadZone">
           <input type="file" id="propFileInput" accept=".prop,.txt,.conf,*/*" hidden />
-          <div class="upload-icon">🧬</div>
-          <div class="upload-title">点击导入本地 .prop 文件</div>
-          <div class="upload-sub">自动识别 system / vendor / odm / product 多分区属性</div>
+          <div class="upload-icon">🔮</div>
+          <div class="upload-title">点击选择本地 .prop 文件导入</div>
+          <div class="upload-sub">支持 system / vendor / odm / product 分区提取文件</div>
         </div>
 
-        <textarea id="propRawText" rows="8" placeholder="在此粘贴 build.prop 内容...&#10;ro.product.brand=Xiaomi&#10;ro.product.model=2410DPN6CC&#10;ro.soc.manufacturer=Qualcomm&#10;ro.soc.model=SM8750-AB&#10;ro.build.version.release=15&#10;ro.build.version.sdk=35"></textarea>
+        <textarea id="propRawText" rows="8" placeholder="在此粘贴 build.prop 内容，例如：&#10;ro.product.brand=Xiaomi&#10;ro.product.model=2410DPN6CC&#10;ro.board.platform=sun&#10;ro.soc.model=SM8750-AB&#10;ro.miui.ui.version.name=V816"></textarea>
 
         <div class="action-row">
-          <button class="btn-secondary" id="btnClearProp">清空</button>
-          <button class="btn-primary" id="btnParseProp">⚡ 深度解析并生成模板</button>
+          <button class="btn-secondary" id="btnClearProp">清空文本</button>
+          <button class="btn-primary" id="btnParseProp">⚡ 立即炼成 v4.0 全息模板</button>
         </div>
       </div>
     </main>
 
-    <!-- 页面 3：应用分流绑定 -->
+    <!-- 页面 3：应用分流矩阵 (支持应用图标、真实名称与 4 维独立引擎开关) -->
     <main id="tab-apps" class="tab-panel">
       <div class="filter-bar glass-card">
-        <input type="text" id="appSearchInput" placeholder="🔍 搜索应用包名 (如 com.tencent.tmgp.sgame)..." />
+        <input type="text" id="appSearchInput" placeholder="🔍 搜索应用名称或包名 (如 王者荣耀 / com.tencent.tmgp.sgame)..." />
         <div class="filter-chips">
           <button class="chip active" data-filter="all">全部应用</button>
           <button class="chip" data-filter="configured">仅已伪装</button>
-          <button class="chip" id="btnRefreshApps">🔄 刷新包列表</button>
+          <button class="chip" id="btnToggleSysApps">系统应用: 关</button>
+          <button class="chip" id="btnRefreshApps">🔄 刷新列表</button>
         </div>
       </div>
       <div id="appList" class="app-list"></div>
     </main>
+
+    <!-- 页面 4：幻境探针实时审计与一键捕获入库 -->
+    <main id="tab-probe" class="tab-panel">
+      <div class="glass-card">
+        <div class="section-header">
+          <div>
+            <h2>📡 幻境探针 · 实时硬件嗅探雷达与一键入库</h2>
+            <p class="hint-text">为应用点亮 <b>[📡 探针]</b> 开关并启动后，下方将实时列出其底层调用的 Bionic 属性、Vulkan/GLES 查询与 VFS 路径。遇到标红的 <code>UNMAPPED</code> 未映射属性时，点击右侧 <b>「+ 捕获入库」</b> 即可直接将其加入对应模板！</p>
+          </div>
+        </div>
+        <div class="probe-toolbar">
+          <input type="text" id="probeFilterInput" placeholder="过滤包名、属性名或类别 (如 UNMAPPED / VULKAN / VFS)..." />
+          <div class="btn-group">
+            <button class="btn-danger" id="btnClearProbe">清空雷达</button>
+            <button class="btn-primary" id="btnRefreshProbe">🔄 扫描最新日志</button>
+          </div>
+        </div>
+        <div id="probeLogList" class="probe-list">
+          <div class="probe-empty">点击「扫描最新日志」捕获目标应用的底层硬件探测行为...</div>
+        </div>
+      </div>
+    </main>
   </div>
 
-  <!-- 机型编辑/新建弹窗 -->
+  <!-- 全息机型模板编辑弹窗 -->
   <div class="modal-backdrop" id="templateModal">
     <div class="modal-card">
-      <h3 id="modalTitle">编辑全息机型模板</h3>
+      <h3 id="modalTitle">铸造 v4.0 全息硬件模板</h3>
       <input type="hidden" id="tplId" />
+
+      <div class="modal-section-title">一、身份标识与 ART/Bionic 反射层 (Build & SystemProperties)</div>
       <div class="form-grid">
-        <label class="full-width">模板显示名称 *
-          <input type="text" id="tplName" placeholder="例如：Xiaomi 15 Pro (澎湃 OS 2)" />
+        <label class="full-width">模板名称 *
+          <input type="text" id="tplName" placeholder="例如：Xiaomi 15 Pro (骁龙8至尊版)" />
         </label>
         <label>手机型号 (MODEL) *
           <input type="text" id="tplModel" placeholder="2410DPN6CC" />
@@ -91,7 +122,7 @@
         <label>设备代号 (DEVICE)
           <input type="text" id="tplDevice" placeholder="haotian" />
         </label>
-        <label>产品名称 (PRODUCT)
+        <label>产品名 (PRODUCT)
           <input type="text" id="tplProduct" placeholder="haotian" />
         </label>
         <label>主板平台 (BOARD)
@@ -100,14 +131,20 @@
         <label>硬件标识 (HARDWARE)
           <input type="text" id="tplHardware" placeholder="qcom" />
         </label>
-        <label>SoC 制造商 (SOC_MANUFACTURER)
+        <label>SoC 制造商
           <input type="text" id="tplSocMan" placeholder="Qualcomm" />
         </label>
         <label>SoC 型号 (SOC_MODEL)
           <input type="text" id="tplSocModel" placeholder="SM8750-AB" />
         </label>
-        <label>版本号 (BUILD_ID)
+        <label>SUPPORTED_ABIS
+          <input type="text" id="tplAbis" placeholder="arm64-v8a,armeabi-v7a,armeabi" />
+        </label>
+        <label>构建号 (BUILD_ID)
           <input type="text" id="tplBuildId" placeholder="AP3A.240905.015.A2" />
+        </label>
+        <label>发版时间戳 (BUILD_TIME ms)
+          <input type="text" id="tplBuildTime" placeholder="1736899200000" />
         </label>
         <label>Android 版本 (RELEASE)
           <input type="text" id="tplRelease" placeholder="15" />
@@ -115,22 +152,61 @@
         <label>API 级别 (SDK_INT)
           <input type="text" id="tplSdk" placeholder="35" />
         </label>
-        <label class="full-width">安全补丁日期 (SECURITY_PATCH)
+        <label>安全补丁 (SECURITY_PATCH)
           <input type="text" id="tplPatch" placeholder="2025-02-01" />
         </label>
-        <label class="full-width">设备指纹 (FINGERPRINT)
+        <label class="full-width">完整设备指纹 (FINGERPRINT)
           <input type="text" id="tplFingerprint" placeholder="Xiaomi/haotian/haotian:15/..." />
         </label>
-        <label class="full-width">
-          <span><input type="checkbox" id="tplMemfd" checked /> 启用 <code>memfd_create</code> 虚拟 <code>/system/build.prop</code> 文件重定向盾</span>
+      </div>
+
+      <div class="modal-section-title">二、OpenGL ES + Vulkan 双管线 GPU 幻化 (同步修改 VkPhysicalDeviceProperties)</div>
+      <div class="form-grid">
+        <label>GPU 厂商 (GL_VENDOR / PCI Vendor)
+          <input type="text" id="tplGlVendor" placeholder="Qualcomm (0x5143) 或 ARM (0x13B5)" />
         </label>
-        <label class="full-width">附加底层属性池 (KEY=VALUE 每行一条，由虚拟 prop_info 句柄注入)
+        <label>GPU 渲染器名 (GL_RENDERER / Vulkan DeviceName)
+          <input type="text" id="tplGlRenderer" placeholder="Adreno (TM) 830" />
+        </label>
+        <label class="full-width">OpenGL 版本驱动号 (GL_VERSION)
+          <input type="text" id="tplGlVersion" placeholder="OpenGL ES 3.2 V@0800.0" />
+        </label>
+      </div>
+
+      <div class="modal-section-title">三、VFS 隐身节点与 Syscall 一致性拓扑 (/proc & /sys & sysinfo/sysconf/uname)</div>
+      <div class="form-grid">
+        <label class="full-width">/proc/cpuinfo Hardware 描述
+          <input type="text" id="tplCpuHw" placeholder="Qualcomm Technologies, Inc SM8750" />
+        </label>
+        <label>虚拟 CPU 核心数 (_SC_NPROCESSORS)
+          <input type="text" id="tplCpuCores" placeholder="8" />
+        </label>
+        <label>CPU 最高主频 (kHz)
+          <input type="text" id="tplCpuFreq" placeholder="4320000" />
+        </label>
+        <label>虚拟物理运存 (RAM GB, 联动 sysinfo)
+          <input type="text" id="tplRamGb" placeholder="16 或 24" />
+        </label>
+        <label>/sys/devices/soc0/soc_id
+          <input type="text" id="tplSocId" placeholder="618" />
+        </label>
+        <label>/sys/devices/soc0/machine
+          <input type="text" id="tplSocMachine" placeholder="SM8750" />
+        </label>
+        <label>内核 Release (uname -r)
+          <input type="text" id="tplKernelRel" placeholder="6.6.30-android15-8-g94b8f12ab4c1" />
+        </label>
+        <label class="full-width">内核编译签名 (uname -v / /proc/version)
+          <input type="text" id="tplKernelVer" placeholder="#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025" />
+        </label>
+        <label class="full-width">附加跨品牌属性池 (KEY=VALUE 每行一条，由 Bionic 1:1 内存池托管)
           <textarea id="tplCustomProps" rows="4" placeholder="ro.miui.ui.version.name=V816&#10;ro.product.marketname=Xiaomi 15 Pro"></textarea>
         </label>
       </div>
+
       <div class="modal-actions">
         <button class="btn-secondary" id="btnCancelModal">取消</button>
-        <button class="btn-primary" id="btnSaveTemplate">保存并重编译配置</button>
+        <button class="btn-primary" id="btnSaveTemplate">💾 保存并重编译底层配置</button>
       </div>
     </div>
   </div>
