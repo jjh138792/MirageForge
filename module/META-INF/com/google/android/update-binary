@@ -11,9 +11,9 @@ ui_print() {
 }
 
 require_new_magisk() {
-  ui_print "**********************************"
-  ui_print " 请安装 Magisk v24.0+ 或 KernelSU / APatch "
-  ui_print "**********************************"
+  ui_print "******************************************"
+  ui_print " 请使用 Magisk v26.0+ / KernelSU / APatch "
+  ui_print "******************************************"
   exit 1
 }
 
@@ -22,18 +22,22 @@ ZIPFILE=$3
 
 mount /data 2>/dev/null
 
-# 1. 优先尝试加载 Magisk / KSU / APatch 标准安装函数库
+# 1. 优先调用宿主机标准安装框架
 if [ -f /data/adb/magisk/util_functions.sh ]; then
   . /data/adb/magisk/util_functions.sh
   install_module
   exit 0
-elif [ -f /data/adb/ksu/bin/busybox ]; then
+fi
+
+# 2. 兼容 KernelSU / APatch BusyBox 独立 Shell 模式与自定义 Recovery
+if [ -f /data/adb/ksu/bin/busybox ]; then
+  export ASH_STANDALONE=1
   export PATH="/data/adb/ksu/bin:$PATH"
 elif [ -f /data/adb/ap/bin/busybox ]; then
+  export ASH_STANDALONE=1
   export PATH="/data/adb/ap/bin:$PATH"
 fi
 
-# 2. 独立安装引擎（兼容无 util_functions.sh 的 KSU/APatch 环境与 TWRP Recovery）
 rm -rf $TMPDIR 2>/dev/null
 mkdir -p $TMPDIR
 
@@ -48,23 +52,22 @@ abort() {
 }
 
 set_perm() {
-  chown $2:$3 $1 || return 1
-  chmod $4 $1 || return 1
+  chown $2:$3 "$1" || return 1
+  chmod $4 "$1" || return 1
   local CON=$5
-  [ -z $CON ] && CON=u:object_r:system_file:s0
-  chcon $CON $1 2>/dev/null
+  [ -z "$CON" ] && CON=u:object_r:system_file:s0
+  chcon "$CON" "$1" 2>/dev/null
 }
 
 set_perm_recursive() {
-  find $1 -type d 2>/dev/null | while read dir; do
-    set_perm $dir $2 $3 $4 $6
+  find "$1" -type d 2>/dev/null | while read -r dir; do
+    set_perm "$dir" $2 $3 $4 $6
   done
-  find $1 -type f -o -type l 2>/dev/null | while read file; do
-    set_perm $file $2 $3 $5 $6
+  find "$1" -type f -o -type l 2>/dev/null | while read -r file; do
+    set_perm "$file" $2 $3 $5 $6
   done
 }
 
-# 获取系统架构与 API 版本
 ABI=$(getprop ro.product.cpu.abi)
 case "$ABI" in
   arm64*) ARCH=arm64; IS64BIT=true ;;
@@ -92,7 +95,7 @@ unzip -o "$ZIPFILE" "customize.sh" -d "$TMPDIR" >&2
 if [ -f "$TMPDIR/customize.sh" ]; then
   . "$TMPDIR/customize.sh"
 else
-  abort "! 安装包损坏：缺失 customize.sh"
+  abort "! 刷入包损坏：缺失 customize.sh"
 fi
 
 if $BOOTMODE; then
