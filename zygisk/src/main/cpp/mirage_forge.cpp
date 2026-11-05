@@ -4,83 +4,33 @@
 #include <cinttypes>
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <unordered_set>
 #include <set>
 #include <fstream>
-#include <sstream>
-#include <mutex>
-#include <unistd.h>
-#include <fcntl.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
-#include <sys/utsname.h>
-#include <sys/syscall.h>
-#include <sys/system_properties.h>
-#include <linux/memfd.h>
-#include <android/log.h>
 
 #include "zygisk.hpp"
-
-#define LOG_TAG "MirageForge"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#include "mirage_protocol.hpp"
+#include "vfs_synthesizer.hpp"
+#include "gl_spoof.hpp"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
+using namespace mirage;
 
 // ============================================================================
-// 全局进程内伪装状态池
-// ============================================================================
-static bool g_active = false;
-static bool g_memfd_shield = true;
-static std::unordered_map<std::string, std::string> g_prop_map;      // ro.* / persist.* 属性池
-static std::unordered_map<std::string, std::string> g_build_map;     // android.os.Build 字段池
-static std::unordered_map<std::string, std::string> g_version_map;   // android.os.Build$VERSION 字段池
-static std::string g_synthesized_build_prop;                         // 供 memfd 重定向读取的合成 build.prop 内容
-
-// 虚拟 prop_info 句柄结构：解决宿主机不存在对应 key 时 __system_property_find 返回 nullptr 的致命漏洞
-struct SyntheticProp {
-    std::string name;
-    std::string value;
-};
-
-static std::mutex g_syn_mutex;
-static std::unordered_map<std::string, SyntheticProp *> g_syn_by_name;
-static std::unordered_set<const void *> g_syn_ptrs;
-
-static const prop_info *get_or_create_synthetic_prop(const std::string &name, const std::string &val) {
-    std::lock_guard<std::mutex> lock(g_syn_mutex);
-    auto it = g_syn_by_name.find(name);
-    if (it != g_syn_by_name.end()) {
-        return reinterpret_cast<const prop_info *>(it->second);
-    }
-    auto *sp = new SyntheticProp{name, val};
-    g_syn_by_name[name] = sp;
-    g_syn_ptrs.insert(static_cast<const void *>(sp));
-    return reinterpret_cast<const prop_info *>(sp);
-}
-
-static const SyntheticProp *as_synthetic_prop(const prop_info *pi) {
-    if (!pi) return nullptr;
-    std::lock_guard<std::mutex> lock(g_syn_mutex);
-    if (g_syn_ptrs.count(reinterpret_cast<const void *>(pi)) > 0) {
-        return reinterpret_cast<const SyntheticProp *>(pi);
-    }
-    return nullptr;
-}
-
-// ============================================================================
-// 第 1 层：Bionic System Properties 四重底层拦截
+// Bionic System Properties 五维全量拦截 (含 foreach 全表枚举劫持)
 // ============================================================================
 using T_Callback = void (*)(void *cookie, const char *name, const char *value, uint32_t serial);
+using T_ForeachCallback = void (*)(const prop_info *pi, void *cookie);
 
 static const prop_info *(*orig_system_property_find)(const char *name) = nullptr;
 static void (*orig_system_property_read_callback)(const prop_info *pi, T_Callback callback, void *cookie) = nullptr;
 static int (*orig_system_property_read)(const prop_info *pi, char *name, char *value) = nullptr;
 static int (*orig_system_property_get)(const char *name, char *value) = nullptr;
+static int (*orig_system_property_foreach)(T_ForeachCallback propfn, void *cookie) = nullptr;
 
 struct PropCallbackContext {
     void *orig_cookie;
@@ -88,10 +38,16 @@ struct PropCallbackContext {
 };
 
 static const prop_info *hook_system_property_find(const char *name) {
-    if (name) {
-        auto it = g_prop_map.find(name);
-        if (it != g_prop_map.end()) {
+    if (name && g_profile.enable_build_props) {
+        auto it = g_profile.prop_map.find(name);
+        if (it != g_profile.prop_map.end()) {
+            record_probe_event("PROP", name, it->second);
             return get_or_create_synthetic_prop(it->first, it->second);
+        }
+        // 记录目标应用探测的敏感属性（即使未配置伪装也记录到探针中，方便用户发现）
+        if (g_profile.enable_probe &&
+            (strncmp(name, "ro.", 3) == 0 || strncmp(name, "persist.", 8) == 0 || strncmp(name, "gsm.", 4) == 0)) {
+            record_probe_event("PROP_MISS", name, "<real>");
         }
     }
     return orig_system_property_find ? orig_system_property_find(name) : nullptr;
@@ -101,9 +57,10 @@ static void modify_prop_callback(void *cookie, const char *name, const char *val
     auto *ctx = static_cast<PropCallbackContext *>(cookie);
     if (!ctx || !ctx->orig_callback) return;
 
-    if (name) {
-        auto it = g_prop_map.find(name);
-        if (it != g_prop_map.end()) {
+    if (name && g_profile.enable_build_props) {
+        auto it = g_profile.prop_map.find(name);
+        if (it != g_profile.prop_map.end()) {
+            record_probe_event("PROP", name, it->second);
             ctx->orig_callback(ctx->orig_cookie, name, it->second.c_str(), serial);
             return;
         }
@@ -113,7 +70,6 @@ static void modify_prop_callback(void *cookie, const char *name, const char *val
 
 static void hook_system_property_read_callback(const prop_info *pi, T_Callback callback, void *cookie) {
     if (!pi || !callback) return;
-    // 若是虚拟 prop_info 句柄，直接回调返回伪装值，不进入 Bionic 原生函数解引用
     if (const SyntheticProp *sp = as_synthetic_prop(pi)) {
         callback(cookie, sp->name.c_str(), sp->value.c_str(), 1);
         return;
@@ -139,9 +95,10 @@ static int hook_system_property_read(const prop_info *pi, char *name, char *valu
     }
     if (!orig_system_property_read) return 0;
     int len = orig_system_property_read(pi, name, value);
-    if (name && value) {
-        auto it = g_prop_map.find(name);
-        if (it != g_prop_map.end()) {
+    if (name && value && g_profile.enable_build_props) {
+        auto it = g_profile.prop_map.find(name);
+        if (it != g_profile.prop_map.end()) {
+            record_probe_event("PROP", name, it->second);
             strncpy(value, it->second.c_str(), PROP_VALUE_MAX - 1);
             value[PROP_VALUE_MAX - 1] = '\0';
             return static_cast<int>(strlen(value));
@@ -151,95 +108,87 @@ static int hook_system_property_read(const prop_info *pi, char *name, char *valu
 }
 
 static int hook_system_property_get(const char *name, char *value) {
-    if (name && value) {
-        auto it = g_prop_map.find(name);
-        if (it != g_prop_map.end()) {
+    if (name && value && g_profile.enable_build_props) {
+        auto it = g_profile.prop_map.find(name);
+        if (it != g_profile.prop_map.end()) {
+            record_probe_event("PROP", name, it->second);
             strncpy(value, it->second.c_str(), PROP_VALUE_MAX - 1);
             value[PROP_VALUE_MAX - 1] = '\0';
             return static_cast<int>(strlen(value));
+        }
+        if (g_profile.enable_probe && strncmp(name, "ro.", 3) == 0) {
+            record_probe_event("PROP_MISS", name, "<real>");
         }
     }
     return orig_system_property_get ? orig_system_property_get(name, value) : 0;
 }
 
-// ============================================================================
-// 第 2 层：VFS 内存匿名文件重定向 (memfd_create) 与 uname 伪装
-// ============================================================================
-static int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
-static int (*orig_open)(const char *pathname, int flags, mode_t mode) = nullptr;
-static FILE *(*orig_fopen)(const char *pathname, const char *mode) = nullptr;
-static int (*orig_uname)(struct utsname *buf) = nullptr;
+// 拦截 __system_property_foreach，确保遍历全表时也能看到所有虚拟跨品牌属性
+struct ForeachWrapCtx {
+    T_ForeachCallback user_fn;
+    void *user_cookie;
+    std::unordered_set<std::string> visited;
+};
 
-static bool is_target_build_prop_path(const char *path) {
-    if (!path || !g_memfd_shield) return false;
-    return strcmp(path, "/system/build.prop") == 0 ||
-           strcmp(path, "/system/etc/build.prop") == 0 ||
-           strcmp(path, "/vendor/build.prop") == 0 ||
-           strcmp(path, "/product/build.prop") == 0 ||
-           strcmp(path, "/product/etc/build.prop") == 0 ||
-           strcmp(path, "/odm/etc/build.prop") == 0;
-}
+static void foreach_interceptor(const prop_info *pi, void *cookie) {
+    auto *ctx = static_cast<ForeachWrapCtx *>(cookie);
+    if (!ctx || !ctx->user_fn || !pi) return;
 
-static int create_synthetic_build_prop_fd() {
-    int memfd = static_cast<int>(syscall(__NR_memfd_create, "build.prop", MFD_CLOEXEC));
-    if (memfd < 0) return -1;
-    if (!g_synthesized_build_prop.empty()) {
-        write(memfd, g_synthesized_build_prop.data(), g_synthesized_build_prop.size());
-        lseek(memfd, 0, SEEK_SET);
-    }
-    return memfd;
-}
-
-static int hook_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
-    if (is_target_build_prop_path(pathname)) {
-        int fake_fd = create_synthetic_build_prop_fd();
-        if (fake_fd >= 0) return fake_fd;
-    }
-    return orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
-}
-
-static int hook_open(const char *pathname, int flags, mode_t mode) {
-    if (is_target_build_prop_path(pathname)) {
-        int fake_fd = create_synthetic_build_prop_fd();
-        if (fake_fd >= 0) return fake_fd;
-    }
-    return orig_open ? orig_open(pathname, flags, mode) : -1;
-}
-
-static FILE *hook_fopen(const char *pathname, const char *mode) {
-    if (is_target_build_prop_path(pathname)) {
-        int fake_fd = create_synthetic_build_prop_fd();
-        if (fake_fd >= 0) {
-            FILE *fp = fdopen(fake_fd, "r");
-            if (fp) return fp;
-            close(fake_fd);
+    // 读取真实属性的 key 名称以判断是否已被伪装表覆盖
+    if (orig_system_property_read_callback) {
+        std::string prop_name;
+        auto extract_name = [](void *c, const char *name, const char *, uint32_t) {
+            if (name) *static_cast<std::string *>(c) = name;
+        };
+        orig_system_property_read_callback(pi, extract_name, &prop_name);
+        if (!prop_name.empty()) {
+            ctx->visited.insert(prop_name);
+            auto it = g_profile.prop_map.find(prop_name);
+            if (it != g_profile.prop_map.end()) {
+                const prop_info *syn = get_or_create_synthetic_prop(it->first, it->second);
+                ctx->user_fn(syn, ctx->user_cookie);
+                return;
+            }
         }
     }
-    return orig_fopen ? orig_fopen(pathname, mode) : nullptr;
+    ctx->user_fn(pi, ctx->user_cookie);
 }
 
-static int hook_uname(struct utsname *buf) {
-    int ret = orig_uname ? orig_uname(buf) : uname(buf);
-    if (ret == 0 && buf) {
-        auto it = g_prop_map.find("ro.product.cpu.abi");
-        if (it != g_prop_map.end() && it->second.find("arm64") != std::string::npos) {
-            strncpy(buf->machine, "aarch64", sizeof(buf->machine) - 1);
-            buf->machine[sizeof(buf->machine) - 1] = '\0';
+static int hook_system_property_foreach(T_ForeachCallback propfn, void *cookie) {
+    if (!propfn) return -1;
+    if (!g_profile.enable_build_props || !orig_system_property_foreach) {
+        return orig_system_property_foreach ? orig_system_property_foreach(propfn, cookie) : -1;
+    }
+
+    ForeachWrapCtx ctx{propfn, cookie, {}};
+    int res = orig_system_property_foreach(foreach_interceptor, &ctx);
+
+    // 追加遍历宿主机原本不存在但模板中新增的跨厂商属性
+    for (const auto &kv : g_profile.prop_map) {
+        if (ctx.visited.find(kv.first) == ctx.visited.end()) {
+            const prop_info *syn = get_or_create_synthetic_prop(kv.first, kv.second);
+            propfn(syn, cookie);
         }
     }
-    return ret;
+    record_probe_event("PROP", "__system_property_foreach", "Full Table Synthesized");
+    return res;
 }
 
 // ============================================================================
-// 第 3 层：JNI RegisterNatives 直接接管 android.os.SystemProperties
+// JNI RegisterNatives 接管 android.os.SystemProperties
 // ============================================================================
 static std::string query_property_internal(const char *key, const char *def_val) {
     if (!key) return def_val ? def_val : "";
-    auto it = g_prop_map.find(key);
-    if (it != g_prop_map.end()) {
-        return it->second;
+    if (g_profile.enable_build_props) {
+        auto it = g_profile.prop_map.find(key);
+        if (it != g_profile.prop_map.end()) {
+            record_probe_event("JNI_PROP", key, it->second);
+            return it->second;
+        }
+        if (g_profile.enable_probe && strncmp(key, "ro.", 3) == 0) {
+            record_probe_event("PROP_MISS", key, "<real>");
+        }
     }
-    // 未命中伪装池时回退至底层原厂属性读取
     char buf[PROP_VALUE_MAX] = {0};
     if (orig_system_property_get && orig_system_property_get(key, buf) > 0) {
         return std::string(buf);
@@ -248,8 +197,8 @@ static std::string query_property_internal(const char *key, const char *def_val)
         const prop_info *pi = orig_system_property_find(key);
         if (pi) {
             std::string out;
-            auto cb = [](void *cookie, const char *, const char *val, uint32_t) {
-                if (val) *static_cast<std::string *>(cookie) = val;
+            auto cb = [](void *c, const char *, const char *val, uint32_t) {
+                if (val) *static_cast<std::string *>(c) = val;
             };
             orig_system_property_read_callback(pi, cb, &out);
             if (!out.empty()) return out;
@@ -302,24 +251,7 @@ static jboolean JNICALL jni_native_get_boolean(JNIEnv *env, jclass, jstring keyJ
 }
 
 // ============================================================================
-// Socket IPC 辅助函数
-// ============================================================================
-static void write_string(int fd, const std::string &str) {
-    uint32_t len = static_cast<uint32_t>(str.size());
-    write(fd, &len, sizeof(len));
-    if (len > 0) write(fd, str.data(), len);
-}
-
-static std::string read_string(int fd) {
-    uint32_t len = 0;
-    if (read(fd, &len, sizeof(len)) != sizeof(len) || len == 0 || len > 131072) return "";
-    std::string str(len, '\0');
-    if (read(fd, &str[0], len) != static_cast<ssize_t>(len)) return "";
-    return str;
-}
-
-// ============================================================================
-// Zygisk 模块主类 (适配 Zygisk API v4)
+// Zygisk 模块主类
 // ============================================================================
 class MirageForgeModule : public zygisk::ModuleBase {
 public:
@@ -327,7 +259,6 @@ public:
         this->api = api;
         this->env = env;
 
-        // 预先通过 dlsym 兜底获取 Bionic / Libc 原始函数指针
         orig_system_property_find = reinterpret_cast<decltype(orig_system_property_find)>(
             dlsym(RTLD_DEFAULT, "__system_property_find"));
         orig_system_property_read_callback = reinterpret_cast<decltype(orig_system_property_read_callback)>(
@@ -336,10 +267,17 @@ public:
             dlsym(RTLD_DEFAULT, "__system_property_read"));
         orig_system_property_get = reinterpret_cast<decltype(orig_system_property_get)>(
             dlsym(RTLD_DEFAULT, "__system_property_get"));
+        orig_system_property_foreach = reinterpret_cast<decltype(orig_system_property_foreach)>(
+            dlsym(RTLD_DEFAULT, "__system_property_foreach"));
+
         orig_openat = reinterpret_cast<decltype(orig_openat)>(dlsym(RTLD_DEFAULT, "openat"));
+        orig_openat_2 = reinterpret_cast<decltype(orig_openat_2)>(dlsym(RTLD_DEFAULT, "__openat_2"));
         orig_open = reinterpret_cast<decltype(orig_open)>(dlsym(RTLD_DEFAULT, "open"));
         orig_fopen = reinterpret_cast<decltype(orig_fopen)>(dlsym(RTLD_DEFAULT, "fopen"));
+        orig_fopen64 = reinterpret_cast<decltype(orig_fopen64)>(dlsym(RTLD_DEFAULT, "fopen64"));
+        orig_popen = reinterpret_cast<decltype(orig_popen)>(dlsym(RTLD_DEFAULT, "popen"));
         orig_uname = reinterpret_cast<decltype(orig_uname)>(dlsym(RTLD_DEFAULT, "uname"));
+        orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(dlsym(RTLD_DEFAULT, "glGetString"));
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
@@ -356,7 +294,6 @@ public:
         std::string pkg_name(raw_pkg);
         env->ReleaseStringUTFChars(args->nice_name, raw_pkg);
 
-        // 剥离多进程后缀 (如 com.tencent.mobileqq:MSF -> com.tencent.mobileqq)
         size_t colon_pos = pkg_name.find(':');
         if (colon_pos != std::string::npos) {
             pkg_name = pkg_name.substr(0, colon_pos);
@@ -368,53 +305,79 @@ public:
             return;
         }
 
+        uint8_t action = static_cast<uint8_t>(IpcAction::QUERY_CONFIG);
+        write_exact(fd, &action, sizeof(action));
         write_string(fd, pkg_name);
+
         uint8_t has_config = 0;
-        if (read(fd, &has_config, sizeof(has_config)) != sizeof(has_config) || !has_config) {
+        if (!read_exact(fd, &has_config, sizeof(has_config)) || !has_config) {
             close(fd);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
+        g_profile.pkg_name = pkg_name;
         uint32_t count = 0;
-        read(fd, &count, sizeof(count));
-        std::ostringstream prop_stream;
-        prop_stream << "# Generated by MirageForge Virtual VFS Engine\n";
+        read_exact(fd, &count, sizeof(count));
 
         for (uint32_t i = 0; i < count; ++i) {
             std::string key = read_string(fd);
             std::string val = read_string(fd);
             if (key.empty() || val.empty()) continue;
 
-            if (key == "META:MEMFD_SHIELD") {
-                g_memfd_shield = (val == "1" || val == "true");
+            if (key == "META:ENABLE_BUILD") {
+                g_profile.enable_build_props = (val == "1");
+            } else if (key == "META:ENABLE_GL") {
+                g_profile.enable_gl_spoof = (val == "1");
+            } else if (key == "META:ENABLE_VFS") {
+                g_profile.enable_vfs_shield = (val == "1");
+            } else if (key == "META:ENABLE_PROBE") {
+                g_profile.enable_probe = (val == "1");
+            } else if (key == "GLES:VENDOR") {
+                g_profile.gl_vendor = val;
+            } else if (key == "GLES:RENDERER") {
+                g_profile.gl_renderer = val;
+            } else if (key == "GLES:VERSION") {
+                g_profile.gl_version = val;
+            } else if (key == "VFS:CPU_HARDWARE") {
+                g_profile.cpu_hardware = val;
+            } else if (key == "VFS:CPU_ARCH") {
+                g_profile.cpu_arch = val;
+            } else if (key == "VFS:CPU_CORES") {
+                g_profile.cpu_cores = atoi(val.c_str());
+            } else if (key == "VFS:RAM_GB") {
+                g_profile.ram_gb = atoi(val.c_str());
+            } else if (key == "VFS:KERNEL_VERSION") {
+                g_profile.kernel_version = val;
             } else if (key.rfind("BUILD:", 0) == 0) {
-                g_build_map[key.substr(6)] = val;
+                g_profile.build_map[key.substr(6)] = val;
             } else if (key.rfind("VERSION:", 0) == 0) {
-                g_version_map[key.substr(8)] = val;
+                g_profile.version_map[key.substr(8)] = val;
             } else {
-                g_prop_map[key] = val;
-                prop_stream << key << "=" << val << "\n";
+                g_profile.prop_map[key] = val;
             }
         }
         close(fd);
 
-        g_synthesized_build_prop = prop_stream.str();
-        g_active = true;
+        synthesize_vfs_nodes();
+        g_profile.active = true;
 
-        LOGI("MirageForge v2.0 Activated -> %s [Build:%zu, Ver:%zu, Props:%zu, MemfdShield:%d]",
-             pkg_name.c_str(), g_build_map.size(), g_version_map.size(), g_prop_map.size(), g_memfd_shield);
+        LOGI("MirageForge v3.0 Forging Mirage for %s [Props:%zu, GL:%s, VFS:%d, Probe:%d]",
+             pkg_name.c_str(), g_profile.prop_map.size(),
+             g_profile.gl_renderer.c_str(), g_profile.enable_vfs_shield, g_profile.enable_probe);
 
-        // 执行第一阶段全栈劫持
-        applyJavaBuildReflection();
-        hijackSystemPropertiesJni();
+        if (g_profile.enable_build_props) {
+            applyJavaBuildReflection();
+            hijackSystemPropertiesJni();
+        }
         registerPltHooksFromMaps();
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
-        if (!g_active) return;
-        // 第二阶段加固：防止特种框架在 Specialize 期间重置静态字段或加载新库
-        applyJavaBuildReflection();
+        if (!g_profile.active) return;
+        if (g_profile.enable_build_props) {
+            applyJavaBuildReflection();
+        }
         registerPltHooksFromMaps();
     }
 
@@ -427,26 +390,25 @@ private:
     JNIEnv *env = nullptr;
     std::set<std::pair<dev_t, ino_t>> hooked_inodes;
 
-    // 扫描 /proc/self/maps 获取 (dev_t, ino_t) 并调用 Zygisk API v4 5 参数 pltHookRegister
     void registerPltHooksFromMaps() {
         FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : fopen("/proc/self/maps", "r");
         if (!fp) return;
 
         char line[1024];
-        bool committed_needed = false;
+        bool need_commit = false;
 
         while (fgets(line, sizeof(line), fp)) {
-            uintptr_t start, end, offset;
+            uintptr_t start = 0, end = 0, offset = 0;
             unsigned int dev_major = 0, dev_minor = 0;
-            ino_t inode = 0;
+            unsigned long inode_ul = 0;
             char perms[8] = {0};
             int path_off = 0;
 
             if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %" SCNxPTR " %x:%x %lu %n",
-                       &start, &end, perms, &offset, &dev_major, &dev_minor, &inode, &path_off) < 7) {
+                       &start, &end, perms, &offset, &dev_major, &dev_minor, &inode_ul, &path_off) < 7) {
                 continue;
             }
-            if (inode == 0) continue;
+            if (inode_ul == 0) continue;
 
             char *path = line + path_off;
             while (*path == ' ' || *path == '\t') ++path;
@@ -455,52 +417,70 @@ private:
                 path[--len] = '\0';
             }
 
-            // 跳过匿名映射、libc 自身以及本模块自身
             if (path[0] != '/' || strstr(path, "/libc.so") != nullptr || strstr(path, "mirage_forge") != nullptr) {
                 continue;
             }
 
             dev_t dev = makedev(dev_major, dev_minor);
+            ino_t inode = static_cast<ino_t>(inode_ul);
             auto key = std::make_pair(dev, inode);
             if (hooked_inodes.find(key) != hooked_inodes.end()) {
                 continue;
             }
             hooked_inodes.insert(key);
-            committed_needed = true;
+            need_commit = true;
 
-            // Zygisk API v4 严格 5 参数签名：(dev_t, ino_t, symbol, newFunc, oldFunc)
-            api->pltHookRegister(dev, inode, "__system_property_find",
-                                 reinterpret_cast<void *>(hook_system_property_find),
-                                 reinterpret_cast<void **>(&orig_system_property_find));
-            api->pltHookRegister(dev, inode, "__system_property_read_callback",
-                                 reinterpret_cast<void *>(hook_system_property_read_callback),
-                                 reinterpret_cast<void **>(&orig_system_property_read_callback));
-            api->pltHookRegister(dev, inode, "__system_property_read",
-                                 reinterpret_cast<void *>(hook_system_property_read),
-                                 reinterpret_cast<void **>(&orig_system_property_read));
-            api->pltHookRegister(dev, inode, "__system_property_get",
-                                 reinterpret_cast<void *>(hook_system_property_get),
-                                 reinterpret_cast<void **>(&orig_system_property_get));
+            if (g_profile.enable_build_props || g_profile.enable_probe) {
+                api->pltHookRegister(dev, inode, "__system_property_find",
+                                     reinterpret_cast<void *>(hook_system_property_find),
+                                     reinterpret_cast<void **>(&orig_system_property_find));
+                api->pltHookRegister(dev, inode, "__system_property_read_callback",
+                                     reinterpret_cast<void *>(hook_system_property_read_callback),
+                                     reinterpret_cast<void **>(&orig_system_property_read_callback));
+                api->pltHookRegister(dev, inode, "__system_property_read",
+                                     reinterpret_cast<void *>(hook_system_property_read),
+                                     reinterpret_cast<void **>(&orig_system_property_read));
+                api->pltHookRegister(dev, inode, "__system_property_get",
+                                     reinterpret_cast<void *>(hook_system_property_get),
+                                     reinterpret_cast<void **>(&orig_system_property_get));
+                api->pltHookRegister(dev, inode, "__system_property_foreach",
+                                     reinterpret_cast<void *>(hook_system_property_foreach),
+                                     reinterpret_cast<void **>(&orig_system_property_foreach));
+                api->pltHookRegister(dev, inode, "popen",
+                                     reinterpret_cast<void *>(hook_popen),
+                                     reinterpret_cast<void **>(&orig_popen));
+            }
 
-            if (g_memfd_shield) {
+            if (g_profile.enable_vfs_shield) {
                 api->pltHookRegister(dev, inode, "openat",
                                      reinterpret_cast<void *>(hook_openat),
                                      reinterpret_cast<void **>(&orig_openat));
+                api->pltHookRegister(dev, inode, "__openat_2",
+                                     reinterpret_cast<void *>(hook_openat_2),
+                                     reinterpret_cast<void **>(&orig_openat_2));
                 api->pltHookRegister(dev, inode, "open",
                                      reinterpret_cast<void *>(hook_open),
                                      reinterpret_cast<void **>(&orig_open));
                 api->pltHookRegister(dev, inode, "fopen",
                                      reinterpret_cast<void *>(hook_fopen),
                                      reinterpret_cast<void **>(&orig_fopen));
+                api->pltHookRegister(dev, inode, "fopen64",
+                                     reinterpret_cast<void *>(hook_fopen64),
+                                     reinterpret_cast<void **>(&orig_fopen64));
+                api->pltHookRegister(dev, inode, "uname",
+                                     reinterpret_cast<void *>(hook_uname),
+                                     reinterpret_cast<void **>(&orig_uname));
             }
 
-            api->pltHookRegister(dev, inode, "uname",
-                                 reinterpret_cast<void *>(hook_uname),
-                                 reinterpret_cast<void **>(&orig_uname));
+            if (g_profile.enable_gl_spoof) {
+                api->pltHookRegister(dev, inode, "glGetString",
+                                     reinterpret_cast<void *>(hook_glGetString),
+                                     reinterpret_cast<void **>(&orig_glGetString));
+            }
         }
         fclose(fp);
 
-        if (committed_needed) {
+        if (need_commit) {
             api->pltHookCommit();
         }
     }
@@ -529,11 +509,56 @@ private:
         }
     }
 
+    void setStaticLongField(jclass cls, const char *field_name, long long val) {
+        jfieldID fid = env->GetStaticFieldID(cls, field_name, "J");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            return;
+        }
+        if (fid) {
+            env->SetStaticLongField(cls, fid, static_cast<jlong>(val));
+        }
+    }
+
+    void setStaticStringArrayField(jclass cls, const char *field_name, const std::vector<std::string> &items) {
+        if (items.empty()) return;
+        jfieldID fid = env->GetStaticFieldID(cls, field_name, "[Ljava/lang/String;");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            return;
+        }
+        jclass str_cls = env->FindClass("java/lang/String");
+        if (!str_cls) {
+            env->ExceptionClear();
+            return;
+        }
+        jobjectArray arr = env->NewObjectArray(static_cast<jsize>(items.size()), str_cls, nullptr);
+        if (arr) {
+            for (size_t i = 0; i < items.size(); ++i) {
+                jstring s = env->NewStringUTF(items[i].c_str());
+                env->SetObjectArrayElement(arr, static_cast<jsize>(i), s);
+                env->DeleteLocalRef(s);
+            }
+            env->SetStaticObjectField(cls, fid, arr);
+            env->DeleteLocalRef(arr);
+        }
+        env->DeleteLocalRef(str_cls);
+    }
+
     void applyJavaBuildReflection() {
         jclass build_cls = env->FindClass("android/os/Build");
         if (build_cls) {
-            for (const auto &kv : g_build_map) {
-                setStaticStringField(build_cls, kv.first.c_str(), kv.second);
+            for (const auto &kv : g_profile.build_map) {
+                if (kv.first == "TIME") {
+                    long long t = atoll(kv.second.c_str());
+                    if (t > 0) setStaticLongField(build_cls, "TIME", t);
+                } else if (kv.first == "SUPPORTED_ABIS" ||
+                           kv.first == "SUPPORTED_64_BIT_ABIS" ||
+                           kv.first == "SUPPORTED_32_BIT_ABIS") {
+                    setStaticStringArrayField(build_cls, kv.first.c_str(), split_csv(kv.second, ','));
+                } else {
+                    setStaticStringField(build_cls, kv.first.c_str(), kv.second);
+                }
             }
             env->DeleteLocalRef(build_cls);
         } else {
@@ -542,7 +567,7 @@ private:
 
         jclass ver_cls = env->FindClass("android/os/Build$VERSION");
         if (ver_cls) {
-            for (const auto &kv : g_version_map) {
+            for (const auto &kv : g_profile.version_map) {
                 if (kv.first == "SDK_INT" || kv.first == "DEVICE_INITIAL_SDK_INT") {
                     int sdk = atoi(kv.second.c_str());
                     if (sdk > 0) setStaticIntField(ver_cls, kv.first.c_str(), sdk);
@@ -577,50 +602,55 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程：读取 /data/adb/mirage_forge/apps/<pkg>.conf
+// Root Companion 守护进程
 // ============================================================================
 static void companion_handler(int fd) {
-    std::string pkg_name = read_string(fd);
-    if (pkg_name.empty() || pkg_name.find('/') != std::string::npos) {
-        uint8_t zero = 0;
-        write(fd, &zero, sizeof(zero));
-        return;
-    }
+    uint8_t action = 0;
+    if (!read_exact(fd, &action, sizeof(action))) return;
 
-    std::string conf_path = "/data/adb/mirage_forge/apps/" + pkg_name + ".conf";
-    std::ifstream ifs(conf_path);
-    if (!ifs.is_open()) {
-        uint8_t zero = 0;
-        write(fd, &zero, sizeof(zero));
-        return;
-    }
-
-    std::unordered_map<std::string, std::string> entries;
-    std::string line;
-    while (std::getline(ifs, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        std::string k = line.substr(0, eq);
-        std::string v = line.substr(eq + 1);
-        if (!k.empty() && !v.empty()) {
-            entries[k] = v;
+    if (action == static_cast<uint8_t>(IpcAction::QUERY_CONFIG)) {
+        std::string pkg_name = read_string(fd);
+        if (pkg_name.empty() || pkg_name.find('/') != std::string::npos) {
+            uint8_t zero = 0;
+            write_exact(fd, &zero, sizeof(zero));
+            return;
         }
-    }
 
-    if (entries.empty()) {
-        uint8_t zero = 0;
-        write(fd, &zero, sizeof(zero));
-        return;
-    }
+        std::string conf_path = "/data/adb/mirage_forge/apps/" + pkg_name + ".conf";
+        std::ifstream ifs(conf_path);
+        if (!ifs.is_open()) {
+            uint8_t zero = 0;
+            write_exact(fd, &zero, sizeof(zero));
+            return;
+        }
 
-    uint8_t one = 1;
-    write(fd, &one, sizeof(one));
-    uint32_t count = static_cast<uint32_t>(entries.size());
-    write(fd, &count, sizeof(count));
-    for (const auto &kv : entries) {
-        write_string(fd, kv.first);
-        write_string(fd, kv.second);
+        std::unordered_map<std::string, std::string> entries;
+        std::string line;
+        while (std::getline(ifs, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string k = line.substr(0, eq);
+            std::string v = line.substr(eq + 1);
+            if (!k.empty() && !v.empty()) {
+                entries[k] = v;
+            }
+        }
+
+        if (entries.empty()) {
+            uint8_t zero = 0;
+            write_exact(fd, &zero, sizeof(zero));
+            return;
+        }
+
+        uint8_t one = 1;
+        write_exact(fd, &one, sizeof(one));
+        uint32_t count = static_cast<uint32_t>(entries.size());
+        write_exact(fd, &count, sizeof(count));
+        for (const auto &kv : entries) {
+            write_string(fd, kv.first);
+            write_string(fd, kv.second);
+        }
     }
 }
 
