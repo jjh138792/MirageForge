@@ -1,6 +1,6 @@
 id=mirage_forge
 name=蜃楼工坊 (MirageForge)
-version=v2.0
-versionCode=20
+version=1.0.0
+versionCode=100
 author=jjh138792
 description=千面万象，一念幻化 —— 基于 Zygisk 的应用级多机型伪装引擎，支持 .prop 一键解析与 KSU WebUI 精细化分流。
