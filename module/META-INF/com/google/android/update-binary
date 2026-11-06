@@ -22,14 +22,12 @@ ZIPFILE=$3
 
 mount /data 2>/dev/null
 
-# 1. 优先调用宿主机标准安装框架
 if [ -f /data/adb/magisk/util_functions.sh ]; then
   . /data/adb/magisk/util_functions.sh
   install_module
   exit 0
 fi
 
-# 2. 兼容 KernelSU / APatch BusyBox 独立 Shell 模式与自定义 Recovery
 if [ -f /data/adb/ksu/bin/busybox ]; then
   export ASH_STANDALONE=1
   export PATH="/data/adb/ksu/bin:$PATH"
