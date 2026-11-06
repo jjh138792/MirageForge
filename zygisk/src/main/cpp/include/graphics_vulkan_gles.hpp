@@ -18,21 +18,9 @@ using GLubyte = unsigned char;
 using GLuint = unsigned int;
 using __eglMustCastToProperFunctionPointerType = void (*)(void);
 
-// Khronos Vulkan 标准 ABI 结构内联定义（零外部头文件依赖）
+// Khronos Vulkan 标准 ABI 结构内联定义
 constexpr uint32_t VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256U;
 constexpr uint32_t VK_UUID_SIZE = 16U;
-
-struct VkPhysicalDeviceLimitsLite {
-    uint8_t opaque[504]; // 占位对齐，我们只修改头部字段
-};
-
-struct VkPhysicalDeviceSparsePropertiesLite {
-    uint32_t residencyStandard2DBlockShape;
-    uint32_t residencyStandard2DMultisampleBlockShape;
-    uint32_t residencyStandard3DBlockShape;
-    uint32_t residencyAlignedMipSize;
-    uint32_t residencyNonResidentStrict;
-};
 
 struct VkPhysicalDevicePropertiesCompat {
     uint32_t apiVersion;
@@ -55,13 +43,17 @@ using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction (*)(void *instance, const c
 using PFN_vkGetPhysicalDeviceProperties = void (*)(void *physicalDevice, VkPhysicalDevicePropertiesCompat *pProperties);
 using PFN_vkGetPhysicalDeviceProperties2 = void (*)(void *physicalDevice, VkPhysicalDeviceProperties2Compat *pProperties);
 
+// Native MediaDrm (libmediandk.so) 签名定义
+using media_status_t = int32_t;
+using PFN_AMediaDrm_getPropertyString = media_status_t (*)(void *drm, const char *propertyName, const char **propertyValue);
+
 inline const GLubyte *(*orig_glGetString)(GLenum name) = nullptr;
-inline const GLubyte *(*orig_glGetStringi)(GLenum name, GLuint index) = nullptr;
 inline __eglMustCastToProperFunctionPointerType (*orig_eglGetProcAddress)(const char *procname) = nullptr;
 
 inline PFN_vkGetInstanceProcAddr orig_vkGetInstanceProcAddr = nullptr;
 inline PFN_vkGetPhysicalDeviceProperties orig_vkGetPhysicalDeviceProperties = nullptr;
 inline PFN_vkGetPhysicalDeviceProperties2 orig_vkGetPhysicalDeviceProperties2 = nullptr;
+inline PFN_AMediaDrm_getPropertyString orig_AMediaDrm_getPropertyString = nullptr;
 
 inline const GLubyte *hook_glGetString(GLenum name) {
     if (g_ctx.enable_gl_vulkan) {
@@ -96,7 +88,6 @@ inline const GLubyte *hook_glGetString(GLenum name) {
     return orig_glGetString ? orig_glGetString(name) : nullptr;
 }
 
-// 拦截 eglGetProcAddress，防止引擎通过动态寻址绕过 libGLESv2 PLT
 inline __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char *procname) {
     if (procname && g_ctx.enable_gl_vulkan) {
         if (std::strcmp(procname, "glGetString") == 0) {
@@ -106,7 +97,6 @@ inline __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const cha
     return orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
 }
 
-// Vulkan 物理设备属性篡改
 inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
     if (!props || !g_ctx.enable_gl_vulkan) return;
     if (!g_ctx.gl_renderer.empty()) {
@@ -152,6 +142,26 @@ inline PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void *instance, const char 
         return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties2);
     }
     return real_fn;
+}
+
+// 拦截 libmediandk.so 的 AMediaDrm_getPropertyString
+inline media_status_t hook_AMediaDrm_getPropertyString(void *drm, const char *propertyName, const char **propertyValue) {
+    media_status_t st = orig_AMediaDrm_getPropertyString
+                            ? orig_AMediaDrm_getPropertyString(drm, propertyName, propertyValue)
+                            : -1;
+    if (st == 0 && propertyName && propertyValue && g_ctx.enable_build_props) {
+        if (std::strcmp(propertyName, "vendor") == 0) {
+            auto it = g_ctx.build_map.find("BRAND");
+            if (it != g_ctx.build_map.end() && !it->second.empty()) {
+                *propertyValue = it->second.c_str();
+                emit_probe("MEDIADRM", "vendor", it->second);
+            }
+        } else if (std::strcmp(propertyName, "description") == 0 && !g_ctx.soc_machine.empty()) {
+            *propertyValue = g_ctx.soc_machine.c_str();
+            emit_probe("MEDIADRM", "description", g_ctx.soc_machine);
+        }
+    }
+    return st;
 }
 
 } // namespace mirage

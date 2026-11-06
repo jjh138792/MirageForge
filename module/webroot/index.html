@@ -3,21 +3,21 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>蜃楼工坊 · MirageForge v4.0</title>
+  <title>蜃楼工坊 · MirageForge v1.0.0</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <div class="app-container">
-    <!-- 顶部全息状态栏 -->
+    <!-- 顶部状态栏 -->
     <header class="top-bar">
       <div class="brand-wrap">
         <div class="logo-badge">蜃</div>
         <div>
-          <h1>蜃楼工坊 <span class="ver-tag">v4.0 Hypervisor</span></h1>
-          <p class="subtitle">Bionic 1:1 内存池 · Vulkan/GLES · 隐身 VFS · 探针闭环</p>
+          <h1>蜃楼工坊 <span class="ver-tag">v1.0.0 CLI-Core</span></h1>
+          <p class="subtitle">mirageforge_cli 驱动 · Vulkan/GLES · 隐身 VFS · 探针雷达</p>
         </div>
       </div>
-      <div class="stat-pill" id="statusPill">初始化中</div>
+      <div class="stat-pill" id="statusPill">连接 CLI 中...</div>
     </header>
 
     <!-- 四维导航栏 -->
@@ -25,7 +25,7 @@
       <button class="tab-btn active" data-tab="tab-templates">全息模板库</button>
       <button class="tab-btn" data-tab="tab-parser">智能 .prop 炼金</button>
       <button class="tab-btn" data-tab="tab-apps">应用分流矩阵</button>
-      <button class="tab-btn" data-tab="tab-probe">📡 幻境探针</button>
+      <button class="tab-btn" data-tab="tab-probe">📡 探针与遥测</button>
     </nav>
 
     <!-- 页面 1：全息机型模板库 -->
@@ -40,29 +40,29 @@
       <div id="templateList" class="card-grid"></div>
     </main>
 
-    <!-- 页面 2：智能 .prop 炼金台 -->
+    <!-- 页面 2：智能 .prop 炼金台 (调用 C++ mirageforge_cli parse-prop) -->
     <main id="tab-parser" class="tab-panel">
       <div class="glass-card">
-        <h2>智能 build.prop 炼金解析器 (v4.0 全拓扑推导)</h2>
-        <p class="hint-text">上传或粘贴提取自任意 ROM 的 <code>build.prop</code>，炼金引擎将自动提取机型、指纹、安全补丁，并根据平台代号（如 <code>sun</code>/<code>pineapple</code>/<code>mt6991</code>）自动推导配套的 <b>Vulkan/GLES GPU 渲染器</b>、<b>SoC ID</b>、<b>CPU 最高主频</b> 及全量跨品牌私有属性。</p>
+        <h2>C++ 原生 build.prop 炼金引擎 (mirageforge_cli parse-prop)</h2>
+        <p class="hint-text">上传或粘贴提取自任意 ROM 的 <code>build.prop</code>，底层 <code>mirageforge_cli</code> 将自动提取机型、指纹、安全补丁，并根据平台代号自动推导配套的 <b>Vulkan/GLES GPU 渲染器</b>、<b>SoC ID</b>、<b>CPU 最高主频</b> 及全量跨品牌私有属性。</p>
         
         <div class="upload-zone" id="uploadZone">
           <input type="file" id="propFileInput" accept=".prop,.txt,.conf,*/*" hidden />
           <div class="upload-icon">🔮</div>
           <div class="upload-title">点击选择本地 .prop 文件导入</div>
-          <div class="upload-sub">支持 system / vendor / odm / product 分区提取文件</div>
+          <div class="upload-sub">交由 mirageforge_cli 引擎进行原生硬件拓扑推导</div>
         </div>
 
         <textarea id="propRawText" rows="8" placeholder="在此粘贴 build.prop 内容，例如：&#10;ro.product.brand=Xiaomi&#10;ro.product.model=2410DPN6CC&#10;ro.board.platform=sun&#10;ro.soc.model=SM8750-AB&#10;ro.miui.ui.version.name=V816"></textarea>
 
         <div class="action-row">
           <button class="btn-secondary" id="btnClearProp">清空文本</button>
-          <button class="btn-primary" id="btnParseProp">⚡ 立即炼成 v4.0 全息模板</button>
+          <button class="btn-primary" id="btnParseProp">⚡ 调用 CLI 立即炼成模板</button>
         </div>
       </div>
     </main>
 
-    <!-- 页面 3：应用分流矩阵 (支持应用图标、真实名称与 4 维独立引擎开关) -->
+    <!-- 页面 3：应用分流矩阵 -->
     <main id="tab-apps" class="tab-panel">
       <div class="filter-bar glass-card">
         <input type="text" id="appSearchInput" placeholder="🔍 搜索应用名称或包名 (如 王者荣耀 / com.tencent.tmgp.sgame)..." />
@@ -76,24 +76,37 @@
       <div id="appList" class="app-list"></div>
     </main>
 
-    <!-- 页面 4：幻境探针实时审计与一键捕获入库 -->
+    <!-- 页面 4：幻境探针与注入遥测 -->
     <main id="tab-probe" class="tab-panel">
+      <!-- 注入遥测卡片 -->
+      <div class="glass-card">
+        <div class="section-header">
+          <h2>🚀 Zygisk 实时注入遥测 (launch_history)</h2>
+          <button class="btn-secondary" id="btnClearTelemetry">清空遥测</button>
+        </div>
+        <div id="telemetryList" class="probe-list" style="max-height: 150px;">
+          <div class="probe-empty">暂无应用启动遥测记录...</div>
+        </div>
+      </div>
+
+      <!-- 硬件嗅探雷达卡片 -->
       <div class="glass-card">
         <div class="section-header">
           <div>
-            <h2>📡 幻境探针 · 实时硬件嗅探雷达与一键入库</h2>
-            <p class="hint-text">为应用点亮 <b>[📡 探针]</b> 开关并启动后，下方将实时列出其底层调用的 Bionic 属性、Vulkan/GLES 查询与 VFS 路径。遇到标红的 <code>UNMAPPED</code> 未映射属性时，点击右侧 <b>「+ 捕获入库」</b> 即可直接将其加入对应模板！</p>
+            <h2>📡 幻境探针 · 硬件嗅探审计与一键入库</h2>
+            <p class="hint-text">由 <code>mirageforge_cli probe list --json</code> 实时驱动。遇到标黄的 <code>UNMAPPED</code> 未映射敏感属性时，点击右侧 <b>「+ 捕获入库」</b> 即可调用 <code>mirageforge_cli probe capture</code> 将其写入对应模板！</p>
           </div>
         </div>
         <div class="probe-toolbar">
-          <input type="text" id="probeFilterInput" placeholder="过滤包名、属性名或类别 (如 UNMAPPED / VULKAN / VFS)..." />
+          <input type="text" id="probeFilterInput" placeholder="过滤包名或属性名..." />
           <div class="btn-group">
+            <button class="chip" id="btnToggleUnmapped">仅看未映射</button>
             <button class="btn-danger" id="btnClearProbe">清空雷达</button>
-            <button class="btn-primary" id="btnRefreshProbe">🔄 扫描最新日志</button>
+            <button class="btn-primary" id="btnRefreshProbe">🔄 刷新</button>
           </div>
         </div>
         <div id="probeLogList" class="probe-list">
-          <div class="probe-empty">点击「扫描最新日志」捕获目标应用的底层硬件探测行为...</div>
+          <div class="probe-empty">点击「刷新」通过 mirageforge_cli 扫描底层硬件探测行为...</div>
         </div>
       </div>
     </main>
@@ -102,7 +115,7 @@
   <!-- 全息机型模板编辑弹窗 -->
   <div class="modal-backdrop" id="templateModal">
     <div class="modal-card">
-      <h3 id="modalTitle">铸造 v4.0 全息硬件模板</h3>
+      <h3 id="modalTitle">铸造全息硬件模板</h3>
       <input type="hidden" id="tplId" />
 
       <div class="modal-section-title">一、身份标识与 ART/Bionic 反射层 (Build & SystemProperties)</div>
@@ -119,7 +132,7 @@
         <label>制造商 (MANUFACTURER)
           <input type="text" id="tplManufacturer" placeholder="Xiaomi" />
         </label>
-        <label>设备代号 (DEVICE)
+        <label>设备代号 (DEVICE / SKU)
           <input type="text" id="tplDevice" placeholder="haotian" />
         </label>
         <label>产品名 (PRODUCT)
@@ -160,10 +173,10 @@
         </label>
       </div>
 
-      <div class="modal-section-title">二、OpenGL ES + Vulkan 双管线 GPU 幻化 (同步修改 VkPhysicalDeviceProperties)</div>
+      <div class="modal-section-title">二、OpenGL ES + Vulkan + MediaDrm 渲染管线幻化</div>
       <div class="form-grid">
         <label>GPU 厂商 (GL_VENDOR / PCI Vendor)
-          <input type="text" id="tplGlVendor" placeholder="Qualcomm (0x5143) 或 ARM (0x13B5)" />
+          <input type="text" id="tplGlVendor" placeholder="Qualcomm 或 ARM" />
         </label>
         <label>GPU 渲染器名 (GL_RENDERER / Vulkan DeviceName)
           <input type="text" id="tplGlRenderer" placeholder="Adreno (TM) 830" />
@@ -173,7 +186,7 @@
         </label>
       </div>
 
-      <div class="modal-section-title">三、VFS 隐身节点与 Syscall 一致性拓扑 (/proc & /sys & sysinfo/sysconf/uname)</div>
+      <div class="modal-section-title">三、隐身 VFS 节点与 Syscall 一致性拓扑 (/proc & /sys & sysinfo/sysconf/uname)</div>
       <div class="form-grid">
         <label class="full-width">/proc/cpuinfo Hardware 描述
           <input type="text" id="tplCpuHw" placeholder="Qualcomm Technologies, Inc SM8750" />
@@ -199,14 +212,14 @@
         <label class="full-width">内核编译签名 (uname -v / /proc/version)
           <input type="text" id="tplKernelVer" placeholder="#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025" />
         </label>
-        <label class="full-width">附加跨品牌属性池 (KEY=VALUE 每行一条，由 Bionic 1:1 内存池托管)
+        <label class="full-width">附加跨品牌属性池 (KEY=VALUE 每行一条，支持 foreach 全表枚举)
           <textarea id="tplCustomProps" rows="4" placeholder="ro.miui.ui.version.name=V816&#10;ro.product.marketname=Xiaomi 15 Pro"></textarea>
         </label>
       </div>
 
       <div class="modal-actions">
         <button class="btn-secondary" id="btnCancelModal">取消</button>
-        <button class="btn-primary" id="btnSaveTemplate">💾 保存并重编译底层配置</button>
+        <button class="btn-primary" id="btnSaveTemplate">💾 提交至 mirageforge_cli 编译</button>
       </div>
     </div>
   </div>

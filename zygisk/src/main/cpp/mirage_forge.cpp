@@ -1,8 +1,12 @@
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
+#include <sstream>
 #include <fstream>
 #include <dlfcn.h>
+#include <sys/stat.h>
 
 #include "zygisk.hpp"
 #include "mirage_shared.hpp"
@@ -25,7 +29,6 @@ public:
         this->env = env;
         g_zygisk_api = api;
 
-        // 预先使用 RTLD_DEFAULT 解析原生符号基址，供 PLT 未覆盖路径及回退调用
         orig_dlopen = reinterpret_cast<decltype(orig_dlopen)>(dlsym(RTLD_DEFAULT, "dlopen"));
         orig_android_dlopen_ext = reinterpret_cast<decltype(orig_android_dlopen_ext)>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
         orig_dlsym = reinterpret_cast<decltype(orig_dlsym)>(dlsym(RTLD_DEFAULT, "dlsym"));
@@ -54,6 +57,7 @@ public:
         orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(dlsym(RTLD_DEFAULT, "glGetString"));
         orig_eglGetProcAddress = reinterpret_cast<decltype(orig_eglGetProcAddress)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
         orig_vkGetInstanceProcAddr = reinterpret_cast<decltype(orig_vkGetInstanceProcAddr)>(dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr"));
+        orig_AMediaDrm_getPropertyString = reinterpret_cast<decltype(orig_AMediaDrm_getPropertyString)>(dlsym(RTLD_DEFAULT, "AMediaDrm_getPropertyString"));
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
@@ -70,7 +74,6 @@ public:
         std::string pkg_name(raw_pkg);
         env->ReleaseStringUTFChars(args->nice_name, raw_pkg);
 
-        // 剥离多进程子名 (如 com.tencent.tmgp.sgame:unity -> com.tencent.tmgp.sgame)
         size_t colon = pkg_name.find(':');
         if (colon != std::string::npos) {
             pkg_name = pkg_name.substr(0, colon);
@@ -83,6 +86,9 @@ public:
         }
 
         write_str(fd, pkg_name);
+        int32_t app_pid = static_cast<int32_t>(getpid());
+        write_full(fd, &app_pid, sizeof(app_pid));
+
         uint8_t hit = 0;
         if (!read_full(fd, &hit, sizeof(hit)) || !hit) {
             if (orig_close) orig_close(fd); else close(fd);
@@ -109,9 +115,9 @@ public:
         build_vfs_topology();
 
         g_ctx.active = true;
-        LOGI("MirageForge v4.0 Hypervisor Online -> %s [Props:%zu, VFS:%zu, GPU:%s, Probe:%d]",
-             pkg_name.c_str(), g_ctx.prop_map.size(), g_ctx.vfs_files.size(),
-             g_ctx.gl_renderer.c_str(), g_ctx.enable_probe);
+        LOGI("MirageForge v%s Online (via mirageforge_cli) -> %s [Props:%zu, VFS:%zu, GPU:%s, Probe:%d]",
+             MIRAGE_ENGINE_VERSION, pkg_name.c_str(), g_ctx.prop_map.size(),
+             g_ctx.vfs_files.size(), g_ctx.gl_renderer.c_str(), g_ctx.enable_probe);
 
         // 3. 执行第一阶段 ART/JNI 与 PLT 全量劫持
         if (g_ctx.enable_build_props) {
@@ -144,14 +150,17 @@ private:
             g_ctx.enable_gl_vulkan = (v == "1");
         } else if (k == "META:ENABLE_VFS") {
             g_ctx.enable_vfs_shield = (v == "1");
+            g_ctx.enable_maps_cloak = (v == "1");
         } else if (k == "META:ENABLE_PROBE") {
             g_ctx.enable_probe = (v == "1");
         } else if (k == "GLES:VENDOR") {
             g_ctx.gl_vendor = v;
             if (v.find("ARM") != std::string::npos || v.find("Mali") != std::string::npos) {
-                g_ctx.vulkan_vendor_id = 0x13B5; // ARM PCI Vendor ID
+                g_ctx.vulkan_vendor_id = 0x13B5;
+                g_ctx.cpu_midr_el1 = "0x00000000410fd851"; // ARM Cortex-X925 MIDR
             } else {
-                g_ctx.vulkan_vendor_id = 0x5143; // Qualcomm PCI Vendor ID
+                g_ctx.vulkan_vendor_id = 0x5143;
+                g_ctx.cpu_midr_el1 = "0x00000000511f8000"; // Qualcomm Oryon MIDR
             }
         } else if (k == "GLES:RENDERER") {
             g_ctx.gl_renderer = v;
@@ -176,7 +185,12 @@ private:
         } else if (k == "VFS:KERNEL_VERSION") {
             g_ctx.kernel_version = v;
         } else if (k.rfind("BUILD:", 0) == 0) {
-            g_ctx.build_map[k.substr(6)] = v;
+            std::string b_field = k.substr(6);
+            g_ctx.build_map[b_field] = v;
+            if (b_field == "DEVICE") {
+                g_ctx.build_map["SKU"] = v;
+                g_ctx.build_map["ODM_SKU"] = v;
+            }
         } else if (k.rfind("VERSION:", 0) == 0) {
             g_ctx.version_map[k.substr(8)] = v;
         } else {
@@ -186,27 +200,105 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程：读取 /data/adb/mirage_forge/apps/<pkg>.conf 并下发
+// Root Companion 守护进程：深度接入 `/data/adb/modules/mirage_forge/bin/mirageforge_cli`
 // ============================================================================
+static bool is_valid_pkg_name(const std::string &s) {
+    if (s.empty() || s.size() > 128) return false;
+    for (char c : s) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '.')) {
+            return false;
+        }
+    }
+    return s.find("..") == std::string::npos;
+}
+
+// 检查 routes.db 是否比编译缓存更新，若是则调用 mirageforge_cli sync 自动重编译
+static void ensure_cli_synced_for_pkg(const std::string &conf_path) {
+    struct stat db_st{}, conf_st{};
+    if (stat(ROUTES_DB_PATH, &db_st) != 0) return;
+
+    bool need_sync = false;
+    if (stat(conf_path.c_str(), &conf_st) != 0) {
+        // 如果 routes.db 存在但可能还没生成 .conf，检查时间戳
+        static time_t last_sync_db_mtime = 0;
+        if (db_st.st_mtime > last_sync_db_mtime) {
+            need_sync = true;
+            last_sync_db_mtime = db_st.st_mtime;
+        }
+    } else if (db_st.st_mtime > conf_st.st_mtime) {
+        need_sync = true;
+    }
+
+    if (need_sync && access(CLI_BIN_PATH, X_OK) == 0) {
+        std::string sync_cmd = std::string(CLI_BIN_PATH) + " sync >/dev/null 2>&1";
+        std::system(sync_cmd.c_str());
+    }
+}
+
+// 通过 mirageforge_cli zygisk-fetch <pkg> 拉取配置（带直接读文件兜底）
+static std::string fetch_profile_via_cli(const std::string &pkg_name) {
+    std::string conf_path = std::string(APPS_CONF_DIR) + "/" + pkg_name + ".conf";
+    ensure_cli_synced_for_pkg(conf_path);
+
+    if (access(CLI_BIN_PATH, X_OK) == 0) {
+        std::string cmd = std::string(CLI_BIN_PATH) + " zygisk-fetch " + pkg_name + " 2>/dev/null";
+        FILE *fp = popen(cmd.c_str(), "r");
+        if (fp) {
+            std::ostringstream ss;
+            char buf[512];
+            while (std::fgets(buf, sizeof(buf), fp)) {
+                ss << buf;
+            }
+            int status = pclose(fp);
+            std::string out = ss.str();
+            if (status == 0 && !out.empty()) {
+                return out;
+            }
+        }
+    }
+
+    // 兜底通道：直接读取 mirageforge_cli 编译的原子 .conf 文件
+    std::ifstream ifs(conf_path);
+    if (!ifs.is_open()) return "";
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    return ss.str();
+}
+
+// 记录应用注入遥测日志至 /data/adb/mirage_forge/launch_history.log
+static void record_launch_telemetry(const std::string &pkg, int32_t pid, const std::string &model) {
+    FILE *fp = std::fopen(LAUNCH_LOG_PATH, "a");
+    if (!fp) return;
+    std::time_t now = std::time(nullptr);
+    std::fprintf(fp, "%lld|%s|%d|%s\n", static_cast<long long>(now), pkg.c_str(), pid, model.c_str());
+    std::fclose(fp);
+    chmod(LAUNCH_LOG_PATH, 0600);
+}
+
 static void companion_handler(int fd) {
     std::string pkg_name = read_str(fd);
-    if (pkg_name.empty() || pkg_name.find('/') != std::string::npos || pkg_name.find("..") != std::string::npos) {
+    int32_t app_pid = 0;
+    read_full(fd, &app_pid, sizeof(app_pid));
+
+    if (!is_valid_pkg_name(pkg_name)) {
         uint8_t zero = 0;
         write_full(fd, &zero, sizeof(zero));
         return;
     }
 
-    std::string conf_path = "/data/adb/mirage_forge/apps/" + pkg_name + ".conf";
-    std::ifstream ifs(conf_path);
-    if (!ifs.is_open()) {
+    std::string raw_conf = fetch_profile_via_cli(pkg_name);
+    if (raw_conf.empty()) {
         uint8_t zero = 0;
         write_full(fd, &zero, sizeof(zero));
         return;
     }
 
     std::unordered_map<std::string, std::string> entries;
+    std::istringstream iss(raw_conf);
     std::string line;
-    while (std::getline(ifs, line)) {
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
@@ -231,6 +323,9 @@ static void companion_handler(int fd) {
         write_str(fd, kv.first);
         write_str(fd, kv.second);
     }
+
+    auto m_it = entries.find("BUILD:MODEL");
+    record_launch_telemetry(pkg_name, app_pid, (m_it != entries.end()) ? m_it->second : "Custom");
 }
 
 REGISTER_ZYGISK_MODULE(MirageForgeModule)

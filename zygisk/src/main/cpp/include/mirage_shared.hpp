@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -20,6 +23,13 @@
 
 namespace mirage {
 
+constexpr const char *MIRAGE_ENGINE_VERSION = "1.0.0";
+constexpr const char *CLI_BIN_PATH          = "/data/adb/modules/mirage_forge/bin/mirageforge_cli";
+constexpr const char *DATA_ROOT_DIR         = "/data/adb/mirage_forge";
+constexpr const char *ROUTES_DB_PATH        = "/data/adb/mirage_forge/routes.db";
+constexpr const char *APPS_CONF_DIR         = "/data/adb/mirage_forge/apps";
+constexpr const char *LAUNCH_LOG_PATH       = "/data/adb/mirage_forge/launch_history.log";
+
 // 编译期与运行期 FNV-1a 64位高速哈希
 constexpr uint64_t fnv1a_64(const char *str, size_t len) noexcept {
     uint64_t hash = 14695981039346656037ULL;
@@ -34,14 +44,11 @@ inline uint64_t hash_str(const std::string &s) noexcept {
     return fnv1a_64(s.data(), s.size());
 }
 
-// ============================================================================
-// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构
-// 防止风控 SDK 直接通过 `(const char*)pi + 4` 或 `(const char*)pi + 96` 裸读内存导致崩溃或穿帮
-// ============================================================================
+// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构 (标准 POD 布局)
 struct alignas(4) BionicPropInfoCompat {
-    std::atomic<uint32_t> serial; // 偏移 0..3 (偶数表示稳定状态)
+    uint32_t serial;              // 偏移 0..3 (偶数表示稳定状态)
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
-    char name[1];                 // 偏移 96..N (柔性数组起始位，存放以 '\0' 结尾的属性名)
+    char name[1];                 // 偏移 96..N (柔性数组起始位)
 };
 
 class SyntheticPropArena {
@@ -54,13 +61,12 @@ public:
             return reinterpret_cast<const prop_info *>(it->second);
         }
 
-        // 分配真实 Bionic 布局尺寸: sizeof(serial) + 92 + name.size() + 1 + 额外保存长字符串的扩展区
         size_t alloc_sz = offsetof(BionicPropInfoCompat, name) + name.size() + 1;
         void *raw = std::calloc(1, alloc_sz);
         if (!raw) return nullptr;
 
         auto *pi = static_cast<BionicPropInfoCompat *>(raw);
-        pi->serial.store(0x02000000u, std::memory_order_relaxed); // 偶数序列号
+        __atomic_store_n(&pi->serial, 0x02000000u, __ATOMIC_RELAXED);
         std::strncpy(pi->value, val.c_str(), PROP_VALUE_MAX - 1);
         pi->value[PROP_VALUE_MAX - 1] = '\0';
         std::memcpy(pi->name, name.data(), name.size());
@@ -108,44 +114,40 @@ private:
 
 inline SyntheticPropArena g_prop_arena;
 
-// ============================================================================
-// 全局进程内全息配置上下文
-// ============================================================================
 struct MirageContext {
     bool active = false;
     bool enable_build_props = true;
     bool enable_gl_vulkan = true;
     bool enable_vfs_shield = true;
+    bool enable_maps_cloak = true;
     bool enable_probe = false;
 
     std::string pkg_name;
 
-    // GPU & Vulkan 伪装参数
+    // GPU / Vulkan / MediaDrm 参数
     std::string gl_vendor = "Qualcomm";
     std::string gl_renderer = "Adreno (TM) 830";
     std::string gl_version = "OpenGL ES 3.2 V@0800.0 (GIT@8f4b2a1, I9b3d7e6c1a, 1731000000)";
     std::string gl_glsl_version = "OpenGL ES GLSL ES 3.20";
-    uint32_t vulkan_vendor_id = 0x5143; // 0x5143 = Qualcomm, 0x13B5 = ARM
+    uint32_t vulkan_vendor_id = 0x5143;
     uint32_t vulkan_device_id = 0x43050000;
 
-    // VFS & Syscall (sysinfo/sysconf/uname) 硬件参数
+    // VFS & Syscall 硬件参数
     std::string cpu_hardware = "Qualcomm Technologies, Inc SM8750";
     std::string cpu_arch = "aarch64";
     std::string soc_id = "618";
     std::string soc_family = "Snapdragon";
     std::string soc_machine = "SM8750";
+    std::string cpu_midr_el1 = "0x00000000511f8000"; // Qualcomm Oryon / Cortex-X925 MIDR
     int cpu_cores = 8;
     int cpu_max_freq_khz = 4320000;
     int ram_gb = 16;
     std::string kernel_release = "6.6.30-android15-8-g94b8f12ab4c1";
     std::string kernel_version = "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025";
 
-    // 属性与反射映射表
     std::unordered_map<std::string, std::string> prop_map;
     std::unordered_map<std::string, std::string> build_map;
     std::unordered_map<std::string, std::string> version_map;
-
-    // 预合成的 VFS 节点文本
     std::unordered_map<std::string, std::string> vfs_files;
 };
 
@@ -165,11 +167,13 @@ inline void emit_probe(const char *domain, const std::string &key, const std::st
     LOGI("[PROBE][%s][%s] %s => %s", g_ctx.pkg_name.c_str(), domain, key.c_str(), val.c_str());
 }
 
-// IPC Socket 读写工具
 inline bool write_full(int fd, const void *buf, size_t len) {
     const auto *p = static_cast<const uint8_t *>(buf);
     while (len > 0) {
-        ssize_t n = TEMP_FAILURE_RETRY(write(fd, p, len));
+        ssize_t n;
+        do {
+            n = write(fd, p, len);
+        } while (n == -1 && errno == EINTR);
         if (n <= 0) return false;
         p += n;
         len -= static_cast<size_t>(n);
@@ -180,7 +184,10 @@ inline bool write_full(int fd, const void *buf, size_t len) {
 inline bool read_full(int fd, void *buf, size_t len) {
     auto *p = static_cast<uint8_t *>(buf);
     while (len > 0) {
-        ssize_t n = TEMP_FAILURE_RETRY(read(fd, p, len));
+        ssize_t n;
+        do {
+            n = read(fd, p, len);
+        } while (n == -1 && errno == EINTR);
         if (n <= 0) return false;
         p += n;
         len -= static_cast<size_t>(n);
