@@ -7,7 +7,11 @@ description: README.md
 license: GPL-3.0-only
 homepage: https://github.com/jjh138792/MirageForge
 support: https://github.com/jjh138792/MirageForge/issues
-tags: [Zygisk] [spoofing] [tweaks]
+tags: 
+  - spoofing
+  - tweaks
+  - webui
+  - zygisk
 metamodule: false
 compatibility:
   androidMinApi: 26
