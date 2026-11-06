@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/KernelSU-Modules/tools/main/schemas/module.schema.json
+schemaVersion: 1
+id: mirage_forge
+name: 蜃楼工坊 (MirageForge)
+summary: 千面万象，一念幻化 —— 基于 Zygisk 的应用级多机型伪装引擎。
+description: README.md
+license: GPL-3.0-only
+homepage: https://github.com/jjh138792/MirageForge
+support: https://github.com/jjh138792/MirageForge/issues
+tags: [Zygisk] [spoofing] [tweaks]
+metamodule: false
+compatibility:
+  androidMinApi: 26
+authors:
+  - name: jjh138792
+    url: https://jjh138792.com
+
+release:
+  assetPattern: "MirageForge-Zygisk-*.zip"
