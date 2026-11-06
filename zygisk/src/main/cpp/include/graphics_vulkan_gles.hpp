@@ -45,7 +45,7 @@ using PFN_vkGetPhysicalDeviceProperties2 = void (*)(void *physicalDevice, VkPhys
 
 // Native MediaDrm (libmediandk.so) 签名定义
 using media_status_t = int32_t;
-using PFN_AMediaDrm_getPropertyString = media_status_t (*)(void *drm, const char *propertyName, const char ** propertyValue);
+using PFN_AMediaDrm_getPropertyString = media_status_t (*)(void *drm, const char *propertyName, const char **propertyValue);
 
 inline const GLubyte *(*orig_glGetString)(GLenum name) = nullptr;
 inline __eglMustCastToProperFunctionPointerType (*orig_eglGetProcAddress)(const char *procname) = nullptr;
@@ -101,7 +101,7 @@ inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
     if (!props || !g_ctx.enable_gl_vulkan) return;
     if (!g_ctx.gl_renderer.empty()) {
         std::strncpy(props->deviceName, g_ctx.gl_renderer.c_str(), VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
-        props->deviceName[VK_MAX_PHYSICAL_DEVICE_DEVICE_NAME_SIZE_FIX: VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1] = '\0';
+        props->deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1] = '\0';
     }
     if (g_ctx.vulkan_vendor_id != 0) {
         props->vendorID = g_ctx.vulkan_vendor_id;
