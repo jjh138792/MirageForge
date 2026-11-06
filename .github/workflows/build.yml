@@ -1,4 +1,4 @@
-name: Build MirageForge v4.0 Hypervisor
+name: Build MirageForge v1.0.0 (Zygisk + CLI)
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-zygisk-v4:
+  build-mirageforge:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -24,36 +24,56 @@ jobs:
       - name: Fetch Official zygisk.hpp (API v4)
         run: |
           mkdir -p zygisk/src/main/cpp/include
-          if [ ! -f "zygisk/src/main/cpp/include/zygisk.hpp" ]; then
-            curl -sSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
-              -o zygisk/src/main/cpp/include/zygisk.hpp
-          fi
+          curl -sSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
+            -o zygisk/src/main/cpp/include/zygisk.hpp
+          cp -f zygisk/src/main/cpp/include/zygisk.hpp zygisk/src/main/cpp/zygisk.hpp
 
-      - name: Build Native Hypervisor Libraries (All 4 ABIs)
+      - name: Compile Zygisk Engine & mirageforge_cli (All 4 ABIs)
         run: |
-          mkdir -p module/zygisk
+          mkdir -p module/zygisk module/bin
           ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
+          TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake"
+
           for ABI in "${ABIS[@]}"; do
-            echo ">>> Compiling MirageForge v4.0 for $ABI..."
-            cmake -B build/$ABI \
-              -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            echo "=========================================="
+            echo ">>> [1/2] Building Zygisk Library ($ABI)"
+            echo "=========================================="
+            cmake -B build/zygisk_$ABI \
+              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
               -DANDROID_ABI=$ABI \
               -DANDROID_PLATFORM=android-26 \
               -DCMAKE_BUILD_TYPE=Release \
               zygisk/src/main/cpp
-            cmake --build build/$ABI --config Release --parallel $(nproc)
-            cp -f build/$ABI/libmirage_forge.so module/zygisk/$ABI.so
+            cmake --build build/zygisk_$ABI --config Release --parallel $(nproc)
+            cp -f build/zygisk_$ABI/libmirage_forge.so module/zygisk/$ABI.so
+
+            echo "=========================================="
+            echo ">>> [2/2] Building mirageforge_cli ($ABI)"
+            echo "=========================================="
+            cmake -B build/cli_$ABI \
+              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+              -DANDROID_ABI=$ABI \
+              -DANDROID_PLATFORM=android-26 \
+              -DCMAKE_BUILD_TYPE=Release \
+              cli/src/main/cpp
+            cmake --build build/cli_$ABI --config Release --parallel $(nproc)
+            mkdir -p module/bin/$ABI
+            cp -f build/cli_$ABI/mirageforge_cli module/bin/$ABI/mirageforge_cli
           done
 
-      - name: Package Flashable Module Zip (Manager + Recovery)
+          # 默认在 /bin/mirageforge_cli 放置主流 arm64-v8a 二进制，customize.sh 安装时会自动按设备 $ABI 精确替换
+          cp -f module/bin/arm64-v8a/mirageforge_cli module/bin/mirageforge_cli
+
+      - name: Package Flashable Zip (Magisk / KSU / APatch / Recovery)
         run: |
           chmod +x module/META-INF/com/google/android/update-binary
           chmod +x module/customize.sh module/action.sh module/uninstall.sh
+          chmod +x module/bin/mirageforge_cli module/bin/*/mirageforge_cli
           cd module
-          zip -r9 ../MirageForge-Zygisk-v4.0.0.zip . -x "*.DS_Store"
+          zip -r9 ../MirageForge-Zygisk-v1.0.0.zip . -x "*.DS_Store"
 
-      - name: Upload Artifact
+      - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MirageForge-Zygisk-v4.0.0
-          path: MirageForge-Zygisk-v4.0.0.zip
+          name: MirageForge-Zygisk-v1.0.0
+          path: MirageForge-Zygisk-v1.0.0.zip
