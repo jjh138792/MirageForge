@@ -1,24 +1,27 @@
 #!/system/bin/sh
-DATA_DIR="/data/adb/mirage_forge"
-APPS_DIR="$DATA_DIR/apps"
+CLI="/data/adb/modules/mirage_forge/bin/mirageforge_cli"
+LAUNCH_LOG="/data/adb/mirage_forge/launch_history.log"
 
-echo "=========================================="
-echo "   蜃楼工坊 · MirageForge 状态自检   "
-echo "=========================================="
-COUNT=$(ls -1 "$APPS_DIR"/*.conf 2>/dev/null | wc -l)
-echo "- 当前已编译生效的应用分流数: $COUNT 款"
-
-if [ "$COUNT" -gt 0 ]; then
-  for f in "$APPS_DIR"/*.conf; do
-    PKG=$(basename "$f" .conf)
-    MODEL=$(grep "^BUILD:MODEL=" "$f" | cut -d'=' -f2)
-    GPU=$(grep "^GLES:RENDERER=" "$f" | cut -d'=' -f2)
-    PROBE=$(grep "^META:ENABLE_PROBE=" "$f" | cut -d'=' -f2)
-    echo "  * $PKG -> [$MODEL | $GPU | 探针:$PROBE]"
-  done
+if [ -x "$CLI" ]; then
+  "$CLI" status
+else
+  echo "! 错误：未找到可执行的 $CLI"
+  exit 1
 fi
 
 echo "------------------------------------------"
-echo "- 最近 10 条幻境探针拦截记录:"
-logcat -d -s MirageForge:I | grep "\[PROBE\]" | tail -n 10
+echo "- 最近 8 次应用注入遥测 (launch_history):"
+if [ -f "$LAUNCH_LOG" ]; then
+  tail -n 8 "$LAUNCH_LOG" | while IFS='|' read -r ts pkg pid model; do
+    echo "  [PID:$pid] $pkg => 伪装机型: $model"
+  done
+else
+  echo "  (暂无注入记录，启动已配置的目标应用后自动生成)"
+fi
+
+echo "------------------------------------------"
+echo "- 最近 8 条幻境探针拦截记录:"
+if [ -x "$CLI" ]; then
+  "$CLI" probe list --limit 8
+fi
 echo "=========================================="
