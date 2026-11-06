@@ -21,12 +21,12 @@ jobs:
           ndk-version: r26d
           add-to-path: true
 
-      - name: Fetch Official zygisk.hpp (API v4)
+      - name: Fetch Official zygisk.hpp (Single Canonical Path)
         run: |
+          rm -f zygisk/src/main/cpp/zygisk.hpp
           mkdir -p zygisk/src/main/cpp/include
           curl -sSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
             -o zygisk/src/main/cpp/include/zygisk.hpp
-          cp -f zygisk/src/main/cpp/include/zygisk.hpp zygisk/src/main/cpp/zygisk.hpp
 
       - name: Compile Zygisk Engine & mirageforge_cli (All 4 ABIs)
         run: |
@@ -61,7 +61,6 @@ jobs:
             cp -f build/cli_$ABI/mirageforge_cli module/bin/$ABI/mirageforge_cli
           done
 
-          # 默认在 /bin/mirageforge_cli 放置主流 arm64-v8a 二进制，customize.sh 安装时会自动按设备 $ABI 精确替换
           cp -f module/bin/arm64-v8a/mirageforge_cli module/bin/mirageforge_cli
 
       - name: Package Flashable Zip (Magisk / KSU / APatch / Recovery)
