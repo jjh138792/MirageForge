@@ -23,10 +23,8 @@ inline void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
 inline void *(*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
 inline void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
 
-// 前向声明
 inline void scan_and_commit_plt_hooks();
 
-// 拦截 dlsym 动态符号查找，封死绕过 PLT 直接调用 libc/libGLESv2/libvulkan 导出函数的路径
 inline void *hook_dlsym(void *handle, const char *symbol) {
     if (symbol) {
         if (g_ctx.enable_build_props) {
@@ -36,6 +34,7 @@ inline void *hook_dlsym(void *handle, const char *symbol) {
             if (std::strcmp(symbol, "__system_property_get") == 0) return reinterpret_cast<void *>(hook_system_property_get);
             if (std::strcmp(symbol, "__system_property_foreach") == 0) return reinterpret_cast<void *>(hook_system_property_foreach);
             if (std::strcmp(symbol, "popen") == 0) return reinterpret_cast<void *>(hook_popen);
+            if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
         }
         if (g_ctx.enable_vfs_shield) {
             if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
@@ -78,7 +77,6 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
     return handle;
 }
 
-// 增量扫描 /proc/self/maps 并向 Zygisk API v4 提交 PLT Hook
 inline void scan_and_commit_plt_hooks() {
     if (!g_zygisk_api) return;
     std::lock_guard<std::mutex> lock(g_maps_mtx);
@@ -109,7 +107,6 @@ inline void scan_and_commit_plt_hooks() {
             path[--len] = '\0';
         }
 
-        // 跳过非文件路径、Bionic libc/libdl/linker 自身以及本模块自身
         if (path[0] != '/' ||
             std::strstr(path, "/libc.so") != nullptr ||
             std::strstr(path, "/libdl.so") != nullptr ||
@@ -122,7 +119,7 @@ inline void scan_and_commit_plt_hooks() {
         ino_t inode = static_cast<ino_t>(inode_ul);
         auto id_pair = std::make_pair(dev, inode);
         if (!g_hooked_elves.insert(id_pair).second) {
-            continue; // 已经 Hook 过的 ELF 镜像直接跳过
+            continue;
         }
         dirty = true;
 
@@ -130,12 +127,10 @@ inline void scan_and_commit_plt_hooks() {
             g_zygisk_api->pltHookRegister(dev, inode, sym, new_fn, old_fn);
         };
 
-        // 1. 动态加载器与符号解析追踪
         reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
         reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
         reg("dlsym", reinterpret_cast<void *>(hook_dlsym), reinterpret_cast<void **>(&orig_dlsym));
 
-        // 2. Bionic System Properties 全家桶
         if (g_ctx.enable_build_props || g_ctx.enable_probe) {
             reg("__system_property_find", reinterpret_cast<void *>(hook_system_property_find), reinterpret_cast<void **>(&orig_system_property_find));
             reg("__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read_callback), reinterpret_cast<void **>(&orig_system_property_read_callback));
@@ -144,9 +139,9 @@ inline void scan_and_commit_plt_hooks() {
             reg("__system_property_foreach", reinterpret_cast<void *>(hook_system_property_foreach), reinterpret_cast<void **>(&orig_system_property_foreach));
             reg("__system_property_find_nth", reinterpret_cast<void *>(hook_system_property_find_nth), reinterpret_cast<void **>(&orig_system_property_find_nth));
             reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
+            reg("AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString));
         }
 
-        // 3. VFS 隐身盾与 Syscall 硬件一致性
         if (g_ctx.enable_vfs_shield) {
             reg("openat", reinterpret_cast<void *>(hook_openat), reinterpret_cast<void **>(&orig_openat));
             reg("__openat_2", reinterpret_cast<void *>(hook_openat_2), reinterpret_cast<void **>(&orig_openat_2));
@@ -162,7 +157,6 @@ inline void scan_and_commit_plt_hooks() {
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
         }
 
-        // 4. OpenGL ES & Vulkan 渲染管线
         if (g_ctx.enable_gl_vulkan) {
             reg("glGetString", reinterpret_cast<void *>(hook_glGetString), reinterpret_cast<void **>(&orig_glGetString));
             reg("eglGetProcAddress", reinterpret_cast<void *>(hook_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
@@ -171,11 +165,7 @@ inline void scan_and_commit_plt_hooks() {
             reg("vkGetPhysicalDeviceProperties2", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties2));
         }
     }
-    if (orig_close) {
-        std::fclose(fp);
-    } else {
-        std::fclose(fp);
-    }
+    std::fclose(fp);
 
     if (dirty) {
         g_zygisk_api->pltHookCommit();
