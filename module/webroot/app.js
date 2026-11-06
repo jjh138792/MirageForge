@@ -1,16 +1,15 @@
-const DATA_DIR = "/data/adb/mirage_forge";
-const CONFIG_FILE = `${DATA_DIR}/config.json`;
-const APPS_DIR = `${DATA_DIR}/apps`;
+const CLI_BIN = "/data/adb/modules/mirage_forge/bin/mirageforge_cli";
+const LAUNCH_LOG = "/data/adb/mirage_forge/launch_history.log";
 
 let appState = {
+  version: "1.0.0",
   templates: {},
-  // appRoutes: { "com.pkg": { tplId, build, gl, vfs, probe } }
   appRoutes: {},
-  // installedApps: [{ packageName, appLabel, versionName, isSystem, uid }]
   installedApps: [],
   includeSystemApps: false,
   filterMode: "all",
-  searchQuery: ""
+  searchQuery: "",
+  unmappedOnly: false
 };
 
 let cbCounter = 0;
@@ -24,8 +23,8 @@ function ksuExec(command) {
       };
       ksu.exec(command, "{}", cbName);
     } else {
-      console.log("[Mock Exec]", command);
-      resolve({ errno: 0, stdout: "", stderr: "" });
+      console.log("[CLI Mock]", command);
+      resolve({ errno: 0, stdout: "{}", stderr: "" });
     }
   });
 }
@@ -42,181 +41,26 @@ function toBase64(str) {
   return btoa(unescape(encodeURIComponent(str)));
 }
 
-function normalizeRoute(routeVal) {
-  if (!routeVal) return null;
-  if (typeof routeVal === "string") {
-    return { tplId: routeVal, build: true, gl: true, vfs: true, probe: false };
-  }
-  if (typeof routeVal === "object" && routeVal.tplId) {
-    return {
-      tplId: routeVal.tplId,
-      build: routeVal.build !== false,
-      gl: routeVal.gl !== false,
-      vfs: routeVal.vfs !== false,
-      probe: Boolean(routeVal.probe)
-    };
-  }
-  return null;
-}
-
-// 编译单应用 v4.0 全息运行态配置文件 (.conf)，严格对齐 C++ parse_config_kv 协议
-function buildRuntimeConf(tpl, route) {
-  const abis = tpl.SUPPORTED_ABIS || "arm64-v8a,armeabi-v7a,armeabi";
-  const lines = [
-    `META:ENABLE_BUILD=${route.build ? "1" : "0"}`,
-    `META:ENABLE_GL=${route.gl ? "1" : "0"}`,
-    `META:ENABLE_VFS=${route.vfs ? "1" : "0"}`,
-    `META:ENABLE_PROBE=${route.probe ? "1" : "0"}`,
-    // OpenGL ES & Vulkan 双管线参数
-    `GLES:VENDOR=${tpl.GL_VENDOR || "Qualcomm"}`,
-    `GLES:RENDERER=${tpl.GL_RENDERER || "Adreno (TM) 830"}`,
-    `GLES:VERSION=${tpl.GL_VERSION || "OpenGL ES 3.2 V@0800.0"}`,
-    // VFS 隐身节点与 Syscall (sysinfo/sysconf/uname) 参数
-    `VFS:CPU_HARDWARE=${tpl.CPU_HARDWARE || "Qualcomm Technologies, Inc SM8750"}`,
-    `VFS:CPU_ARCH=aarch64`,
-    `VFS:CPU_CORES=${tpl.CPU_CORES || 8}`,
-    `VFS:CPU_MAX_FREQ=${tpl.CPU_MAX_FREQ || 4320000}`,
-    `VFS:RAM_GB=${tpl.RAM_GB || 16}`,
-    `VFS:SOC_ID=${tpl.SOC_ID || "618"}`,
-    `VFS:SOC_MACHINE=${tpl.SOC_MACHINE || tpl.SOC_MODEL || "SM8750"}`,
-    `VFS:KERNEL_RELEASE=${tpl.KERNEL_RELEASE || "6.6.30-android15-8-g94b8f12ab4c1"}`,
-    `VFS:KERNEL_VERSION=${tpl.KERNEL_VERSION || "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025"}`,
-    // Java android.os.Build 全类型反射池
-    `BUILD:MODEL=${tpl.MODEL || ""}`,
-    `BUILD:BRAND=${tpl.BRAND || ""}`,
-    `BUILD:MANUFACTURER=${tpl.MANUFACTURER || ""}`,
-    `BUILD:DEVICE=${tpl.DEVICE || ""}`,
-    `BUILD:PRODUCT=${tpl.PRODUCT || ""}`,
-    `BUILD:HARDWARE=${tpl.HARDWARE || "qcom"}`,
-    `BUILD:BOARD=${tpl.BOARD || ""}`,
-    `BUILD:BOOTLOADER=${tpl.BOOTLOADER || "unknown"}`,
-    `BUILD:SOC_MANUFACTURER=${tpl.SOC_MANUFACTURER || "Qualcomm"}`,
-    `BUILD:SOC_MODEL=${tpl.SOC_MODEL || ""}`,
-    `BUILD:ID=${tpl.BUILD_ID || ""}`,
-    `BUILD:FINGERPRINT=${tpl.FINGERPRINT || ""}`,
-    `BUILD:SUPPORTED_ABIS=${abis}`,
-    `BUILD:SUPPORTED_64_BIT_ABIS=arm64-v8a`,
-    `BUILD:SUPPORTED_32_BIT_ABIS=armeabi-v7a,armeabi`,
-    `BUILD:TAGS=release-keys`,
-    `BUILD:TYPE=user`,
-    `BUILD:TIME=${tpl.BUILD_TIME || "1736899200000"}`,
-    // Java android.os.Build$VERSION 反射池
-    `VERSION:RELEASE=${tpl.RELEASE || "15"}`,
-    `VERSION:SDK_INT=${tpl.SDK_INT || "35"}`,
-    `VERSION:DEVICE_INITIAL_SDK_INT=${tpl.SDK_INT || "35"}`,
-    `VERSION:PREVIEW_SDK_INT=0`,
-    `VERSION:SECURITY_PATCH=${tpl.SECURITY_PATCH || "2025-02-01"}`,
-    // Bionic 1:1 内存池多分区 SystemProperties 映射
-    `ro.product.model=${tpl.MODEL || ""}`,
-    `ro.product.system.model=${tpl.MODEL || ""}`,
-    `ro.product.vendor.model=${tpl.MODEL || ""}`,
-    `ro.product.odm.model=${tpl.MODEL || ""}`,
-    `ro.product.product.model=${tpl.MODEL || ""}`,
-    `ro.product.brand=${tpl.BRAND || ""}`,
-    `ro.product.system.brand=${tpl.BRAND || ""}`,
-    `ro.product.vendor.brand=${tpl.BRAND || ""}`,
-    `ro.product.odm.brand=${tpl.BRAND || ""}`,
-    `ro.product.manufacturer=${tpl.MANUFACTURER || ""}`,
-    `ro.product.system.manufacturer=${tpl.MANUFACTURER || ""}`,
-    `ro.product.vendor.manufacturer=${tpl.MANUFACTURER || ""}`,
-    `ro.product.odm.manufacturer=${tpl.MANUFACTURER || ""}`,
-    `ro.product.device=${tpl.DEVICE || ""}`,
-    `ro.product.system.device=${tpl.DEVICE || ""}`,
-    `ro.product.vendor.device=${tpl.DEVICE || ""}`,
-    `ro.product.odm.device=${tpl.DEVICE || ""}`,
-    `ro.build.product=${tpl.DEVICE || ""}`,
-    `ro.product.name=${tpl.PRODUCT || ""}`,
-    `ro.product.system.name=${tpl.PRODUCT || ""}`,
-    `ro.product.vendor.name=${tpl.PRODUCT || ""}`,
-    `ro.product.board=${tpl.BOARD || ""}`,
-    `ro.board.platform=${tpl.BOARD || ""}`,
-    `ro.hardware=${tpl.HARDWARE || "qcom"}`,
-    `ro.boot.hardware=${tpl.HARDWARE || "qcom"}`,
-    `ro.soc.manufacturer=${tpl.SOC_MANUFACTURER || ""}`,
-    `ro.soc.model=${tpl.SOC_MODEL || ""}`,
-    `ro.product.cpu.abi=arm64-v8a`,
-    `ro.product.cpu.abilist=${abis}`,
-    `ro.product.cpu.abilist64=arm64-v8a`,
-    `ro.product.cpu.abilist32=armeabi-v7a,armeabi`,
-    `ro.build.id=${tpl.BUILD_ID || ""}`,
-    `ro.build.date.utc=${Math.floor(Number(tpl.BUILD_TIME || 1736899200000) / 1000)}`,
-    `ro.build.version.release=${tpl.RELEASE || "15"}`,
-    `ro.build.version.sdk=${tpl.SDK_INT || "35"}`,
-    `ro.build.version.security_patch=${tpl.SECURITY_PATCH || ""}`,
-    `ro.build.fingerprint=${tpl.FINGERPRINT || ""}`,
-    `ro.product.build.fingerprint=${tpl.FINGERPRINT || ""}`,
-    `ro.system.build.fingerprint=${tpl.FINGERPRINT || ""}`,
-    `ro.vendor.build.fingerprint=${tpl.FINGERPRINT || ""}`,
-    `ro.odm.build.fingerprint=${tpl.FINGERPRINT || ""}`,
-    `ro.build.tags=release-keys`,
-    `ro.build.type=user`,
-    `ro.boot.vbmeta.device_state=locked`,
-    `ro.boot.verifiedbootstate=green`,
-    `ro.boot.flash.locked=1`,
-    `ro.boot.veritymode=enforcing`,
-    `ro.debuggable=0`,
-    `ro.secure=1`
-  ];
-
-  if (tpl.CUSTOM_PROPS) {
-    tpl.CUSTOM_PROPS.split(/\r?\n/).forEach(raw => {
-      const line = raw.trim();
-      if (line && !line.startsWith("#") && line.includes("=")) {
-        lines.push(line);
-      }
-    });
-  }
-
-  return lines.filter(l => !l.endsWith("=")).join("\n") + "\n";
-}
-
-async function saveAndSyncConfig() {
-  const payload = JSON.stringify({
-    templates: appState.templates,
-    appRoutes: appState.appRoutes
-  }, null, 2);
-
-  const b64Config = toBase64(payload);
-  let script = `mkdir -p "${APPS_DIR}" && echo "${b64Config}" | base64 -d > "${CONFIG_FILE}" && rm -f "${APPS_DIR}"/*.conf\n`;
-
-  let activeCount = 0;
-  for (const [pkg, rawRoute] of Object.entries(appState.appRoutes)) {
-    const route = normalizeRoute(rawRoute);
-    if (!route) continue;
-    const tpl = appState.templates[route.tplId];
-    if (tpl && /^[a-zA-Z0-9._]+$/.test(pkg)) {
-      activeCount++;
-      const confB64 = toBase64(buildRuntimeConf(tpl, route));
-      script += `echo "${confB64}" | base64 -d > "${APPS_DIR}/${pkg}.conf"\n`;
-    }
-  }
-  script += `chmod 0700 "${DATA_DIR}" "${APPS_DIR}" && chmod 0600 "${CONFIG_FILE}" "${APPS_DIR}"/*.conf 2>/dev/null\n`;
-
-  await ksuExec(script);
-  document.getElementById("statusPill").textContent = `已伪装 ${activeCount} 款应用`;
-}
-
-async function loadConfig() {
-  const res = await ksuExec(`cat "${CONFIG_FILE}"`);
+// 从 mirageforge_cli state --json 同步全局权威状态
+async function syncStateFromCli() {
+  const res = await ksuExec(`"${CLI_BIN}" state --json`);
   if (res.errno === 0 && res.stdout.trim()) {
     try {
-      const parsed = JSON.parse(res.stdout);
-      appState.templates = parsed.templates || {};
-      const rawRoutes = parsed.appRoutes || {};
-      appState.appRoutes = {};
-      for (const [k, v] of Object.entries(rawRoutes)) {
-        const norm = normalizeRoute(v);
-        if (norm) appState.appRoutes[k] = norm;
-      }
+      const data = JSON.parse(res.stdout);
+      appState.version = data.version || "1.0.0";
+      appState.templates = data.templates || {};
+      appState.appRoutes = data.appRoutes || {};
+      const activeCount = Object.keys(appState.appRoutes).length;
+      document.getElementById("statusPill").textContent = `v${appState.version} · 已伪装 ${activeCount} 款应用`;
     } catch (e) {
-      console.error("Config parse error:", e);
+      console.error("Failed to parse CLI state JSON:", e);
     }
   }
   renderTemplates();
-  await saveAndSyncConfig();
+  renderAppList();
 }
 
-// 调用 KernelSU 原生 listPackages + getPackagesInfo 接口读取真实应用名与图标
+// 读取已安装应用列表并结合 KSU 原生图标与名称 API
 async function loadInstalledPackages() {
   let pkgNames = [];
   const pkgType = appState.includeSystemApps ? "all" : "user";
@@ -255,8 +99,7 @@ async function loadInstalledPackages() {
     return {
       packageName: pkg,
       appLabel: meta.appLabel || pkg,
-      versionName: meta.versionName || "",
-      uid: meta.uid || ""
+      versionName: meta.versionName || ""
     };
   }).sort((a, b) => {
     const aConf = Boolean(appState.appRoutes[a.packageName]);
@@ -301,142 +144,11 @@ function renderTemplates() {
   container.querySelectorAll(".btn-del").forEach(btn => {
     btn.onclick = async () => {
       const id = btn.dataset.id;
-      delete appState.templates[id];
-      for (const [pkg, route] of Object.entries(appState.appRoutes)) {
-        if (route.tplId === id) delete appState.appRoutes[pkg];
-      }
-      await saveAndSyncConfig();
-      renderTemplates();
-      renderAppList();
-      toast("模板已删除");
+      await ksuExec(`"${CLI_BIN}" template delete "${id}" --json`);
+      await syncStateFromCli();
+      toast("已通过 CLI 删除模板并同步路由");
     };
   });
-}
-
-// v4.0 智能 SoC / GPU / VFS 参数推导矩阵
-function inferHardwareTopology(board, socModel) {
-  const token = `${board} ${socModel}`.toLowerCase();
-  if (token.includes("sun") || token.includes("sm8750")) {
-    return {
-      glVendor: "Qualcomm", glRenderer: "Adreno (TM) 830",
-      cpuHw: "Qualcomm Technologies, Inc SM8750", socId: "618", socMachine: "SM8750", maxFreq: 4320000
-    };
-  }
-  if (token.includes("pineapple") || token.includes("sm8650")) {
-    return {
-      glVendor: "Qualcomm", glRenderer: "Adreno (TM) 750",
-      cpuHw: "Qualcomm Technologies, Inc SM8650", socId: "557", socMachine: "SM8650", maxFreq: 3300000
-    };
-  }
-  if (token.includes("kalama") || token.includes("sm8550")) {
-    return {
-      glVendor: "Qualcomm", glRenderer: "Adreno (TM) 740",
-      cpuHw: "Qualcomm Technologies, Inc SM8550", socId: "519", socMachine: "SM8550", maxFreq: 3190000
-    };
-  }
-  if (token.includes("mt6991")) {
-    return {
-      glVendor: "ARM", glRenderer: "Immortalis-G925 MC12",
-      cpuHw: "MT6991", socId: "6991", socMachine: "MT6991", maxFreq: 3620000
-    };
-  }
-  if (token.includes("mt6989")) {
-    return {
-      glVendor: "ARM", glRenderer: "Immortalis-G720 MC12",
-      cpuHw: "MT6989", socId: "6989", socMachine: "MT6989", maxFreq: 3250000
-    };
-  }
-  return {
-    glVendor: "Qualcomm", glRenderer: "Adreno (TM) 830",
-    cpuHw: `Qualcomm Technologies, Inc ${socModel || board || "SM8750"}`,
-    socId: "618", socMachine: socModel || "SM8750", maxFreq: 4320000
-  };
-}
-
-function parseBuildPropText(rawText) {
-  const map = {};
-  rawText.split(/\r?\n/).forEach(line => {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) return;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) return;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim();
-    if (key && val) map[key] = val;
-  });
-
-  const consumed = new Set();
-  const pick = (...keys) => {
-    for (const k of keys) {
-      consumed.add(k);
-      if (map[k]) return map[k];
-    }
-    return "";
-  };
-
-  const model = pick("ro.product.model", "ro.product.vendor.model", "ro.product.odm.model", "ro.product.system.model");
-  const brand = pick("ro.product.brand", "ro.product.vendor.brand", "ro.product.odm.brand", "ro.product.system.brand");
-  const manufacturer = pick("ro.product.manufacturer", "ro.product.vendor.manufacturer", "ro.product.odm.manufacturer", "ro.product.system.manufacturer", brand);
-  const device = pick("ro.product.device", "ro.product.vendor.device", "ro.product.odm.device", "ro.product.system.device", "ro.build.product");
-  const product = pick("ro.product.name", "ro.product.vendor.name", "ro.product.odm.name", "ro.product.system.name");
-  const board = pick("ro.board.platform", "ro.product.board");
-  const hardware = pick("ro.hardware", "ro.boot.hardware");
-  const socMan = pick("ro.soc.manufacturer");
-  const socModel = pick("ro.soc.model", "ro.mediatek.platform");
-  const abis = pick("ro.product.cpu.abilist", "ro.system.product.cpu.abilist") || "arm64-v8a,armeabi-v7a,armeabi";
-  const buildId = pick("ro.build.id", "ro.product.build.id");
-  const utcSec = pick("ro.build.date.utc");
-  const release = pick("ro.build.version.release", "ro.product.build.version.release");
-  const sdk = pick("ro.build.version.sdk", "ro.product.build.version.sdk");
-  const patch = pick("ro.build.version.security_patch");
-  const fingerprint = pick("ro.build.fingerprint", "ro.product.build.fingerprint", "ro.vendor.build.fingerprint", "ro.system.build.fingerprint");
-
-  if (!model && !brand && !fingerprint) {
-    toast("未识别到有效的 build.prop 属性！");
-    return null;
-  }
-
-  const hw = inferHardwareTopology(board, socModel);
-  const extraLines = [];
-  for (const [k, v] of Object.entries(map)) {
-    if (!consumed.has(k) && (k.startsWith("ro.") || k.startsWith("persist."))) {
-      extraLines.push(`${k}=${v}`);
-    }
-  }
-
-  return {
-    id: `tpl_${Date.now()}`,
-    name: `${brand ? brand + " " : ""}${map["ro.product.marketname"] || model || device}`,
-    MODEL: model,
-    BRAND: brand,
-    MANUFACTURER: manufacturer || brand,
-    DEVICE: device,
-    PRODUCT: product || device,
-    BOARD: board,
-    HARDWARE: hardware || "qcom",
-    BOOTLOADER: "unknown",
-    SOC_MANUFACTURER: socMan || (hw.glVendor === "ARM" ? "Mediatek" : "Qualcomm"),
-    SOC_MODEL: socModel || hw.socMachine,
-    SUPPORTED_ABIS: abis,
-    BUILD_ID: buildId || "AP3A.240905.015.A2",
-    BUILD_TIME: utcSec ? String(Number(utcSec) * 1000) : "1736899200000",
-    RELEASE: release || "15",
-    SDK_INT: sdk || "35",
-    SECURITY_PATCH: patch || "2025-02-01",
-    FINGERPRINT: fingerprint,
-    GL_VENDOR: hw.glVendor,
-    GL_RENDERER: hw.glRenderer,
-    GL_VERSION: "OpenGL ES 3.2 V@0800.0",
-    CPU_HARDWARE: hw.cpuHw,
-    CPU_CORES: 8,
-    CPU_MAX_FREQ: hw.maxFreq,
-    RAM_GB: 16,
-    SOC_ID: hw.socId,
-    SOC_MACHINE: hw.socMachine,
-    KERNEL_RELEASE: "6.6.30-android15-8-g94b8f12ab4c1",
-    KERNEL_VERSION: "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025",
-    CUSTOM_PROPS: extraLines.slice(0, 100).join("\n")
-  };
 }
 
 function renderAppList() {
@@ -465,7 +177,7 @@ function renderAppList() {
 
   filtered.forEach(app => {
     const pkg = app.packageName;
-    const route = normalizeRoute(appState.appRoutes[pkg]);
+    const route = appState.appRoutes[pkg] || null;
     const currentTpl = route ? route.tplId : "";
     const row = document.createElement("div");
     row.className = "app-item";
@@ -475,8 +187,8 @@ function renderAppList() {
       switchesHtml = `
         <div class="app-switches">
           <span class="sw-pill ${route.build ? "on" : ""}" data-sw="build">🧬 Bionic/ART属性: ${route.build ? "开" : "关"}</span>
-          <span class="sw-pill ${route.gl ? "on" : ""}" data-sw="gl">🎮 Vulkan/GLES: ${route.gl ? "开" : "关"}</span>
-          <span class="sw-pill ${route.vfs ? "on" : ""}" data-sw="vfs">🛡️ 隐身VFS/Syscall: ${route.vfs ? "开" : "关"}</span>
+          <span class="sw-pill ${route.gl ? "on" : ""}" data-sw="gl">🎮 Vulkan/GLES/DRM: ${route.gl ? "开" : "关"}</span>
+          <span class="sw-pill ${route.vfs ? "on" : ""}" data-sw="vfs">🛡️ 隐身VFS/Maps净化: ${route.vfs ? "开" : "关"}</span>
           <span class="sw-pill ${route.probe ? "probe-on" : ""}" data-sw="probe">📡 幻境探针: ${route.probe ? "嗅探中" : "关"}</span>
         </div>
       `;
@@ -502,37 +214,43 @@ function renderAppList() {
 
     const selectEl = row.querySelector("select");
     selectEl.value = currentTpl;
+
+    const pushRouteToCli = async (tplId, b, g, v, p, restart = false) => {
+      const cmd = `"${CLI_BIN}" route set "${pkg}" "${tplId}" --build ${b ? 1 : 0} --gl ${g ? 1 : 0} --vfs ${v ? 1 : 0} --probe ${p ? 1 : 0} ${restart ? "--restart" : ""}`;
+      await ksuExec(cmd);
+      await syncStateFromCli();
+    };
+
     selectEl.onchange = async (e) => {
       const val = e.target.value;
       if (val) {
-        appState.appRoutes[pkg] = {
-          tplId: val,
-          build: route ? route.build : true,
-          gl: route ? route.gl : true,
-          vfs: route ? route.vfs : true,
-          probe: route ? route.probe : false
-        };
+        await pushRouteToCli(
+          val,
+          route ? route.build : true,
+          route ? route.gl : true,
+          route ? route.vfs : true,
+          route ? route.probe : false,
+          false
+        );
+        toast(`已为 ${app.appLabel} 挂载全息引擎`);
       } else {
-        delete appState.appRoutes[pkg];
+        await ksuExec(`"${CLI_BIN}" route remove "${pkg}"`);
+        await syncStateFromCli();
+        toast(`已解除 ${app.appLabel} 伪装`);
       }
-      await saveAndSyncConfig();
-      renderAppList();
-      toast(val ? `已为 ${app.appLabel} 挂载虚拟引擎` : `已恢复 ${app.appLabel} 原生环境`);
     };
 
     row.querySelector(".btn-kill").onclick = async () => {
       await ksuExec(`am force-stop "${pkg}"`);
-      toast(`已强行停止 ${app.appLabel}，重新打开即可生效`);
+      toast(`已重启 ${app.appLabel}`);
     };
 
     row.querySelectorAll(".sw-pill").forEach(pill => {
       pill.onclick = async () => {
+        if (!route) return;
         const key = pill.dataset.sw;
-        if (appState.appRoutes[pkg]) {
-          appState.appRoutes[pkg][key] = !appState.appRoutes[pkg][key];
-          await saveAndSyncConfig();
-          renderAppList();
-        }
+        const nextRoute = { ...route, [key]: !route[key] };
+        await pushRouteToCli(nextRoute.tplId, nextRoute.build, nextRoute.gl, nextRoute.vfs, nextRoute.probe, false);
       };
     });
 
@@ -540,69 +258,90 @@ function renderAppList() {
   });
 }
 
-// 扫描幻境探针日志，并提供「+ 捕获入库」一键写入模板能力
-async function refreshProbeLogs() {
-  const res = await ksuExec(`logcat -d -s MirageForge:I | grep "\\[PROBE\\]" | tail -n 150`);
+// 刷新注入遥测与幻境探针雷达 (调用 mirageforge_cli probe list --json)
+async function refreshProbeAndTelemetry() {
+  // 1. 读取最近注入遥测
+  const teleRes = await ksuExec(`tail -n 25 "${LAUNCH_LOG}" 2>/dev/null`);
+  const teleEl = document.getElementById("telemetryList");
+  teleEl.innerHTML = "";
+  const teleLines = (teleRes.stdout || "").split(/\r?\n/).filter(Boolean).reverse();
+  if (teleLines.length === 0) {
+    teleEl.innerHTML = `<div class="probe-empty">暂无注入记录。启动任何已绑定模板的目标应用后会自动在此显示。</div>`;
+  } else {
+    teleLines.forEach(line => {
+      const [ts, pkg, pid, model] = line.split("|");
+      if (!pkg) return;
+      const dateStr = ts ? new Date(Number(ts) * 1000).toLocaleTimeString() : "";
+      const row = document.createElement("div");
+      row.className = "probe-row";
+      row.innerHTML = `
+        <div>
+          <span class="probe-tag">INJECTED</span>
+          <b style="color:#00e5ff;margin-left:6px;">${pkg}</b>
+          <span style="color:#8b949e;margin-left:6px;">(PID: ${pid})</span>
+          <span style="color:#56d364;margin-left:8px;">➔ 伪装为: ${model}</span>
+        </div>
+        <span style="color:#8b949e;font-size:10px;">${dateStr}</span>
+      `;
+      teleEl.appendChild(row);
+    });
+  }
+
+  // 2. 调用 mirageforge_cli probe list --json 获取结构化探针日志
+  const filterVal = document.getElementById("probeFilterInput").value.trim();
+  const unmappedFlag = appState.unmappedOnly ? "--unmapped" : "";
+  const pkgOpt = filterVal ? `--pkg "${filterVal.replace(/"/g, "")}"` : "";
+  const res = await ksuExec(`"${CLI_BIN}" probe list ${pkgOpt} ${unmappedFlag} --limit 150 --json`);
+
   const listEl = document.getElementById("probeLogList");
   listEl.innerHTML = "";
 
-  const filterText = document.getElementById("probeFilterInput").value.trim().toLowerCase();
-  const lines = (res.stdout || "").split(/\r?\n/).filter(Boolean).reverse();
+  let events = [];
+  if (res.errno === 0 && res.stdout.trim()) {
+    try {
+      events = JSON.parse(res.stdout);
+    } catch (e) {}
+  }
 
-  const matched = lines.filter(l => !filterText || l.toLowerCase().includes(filterText));
-  if (matched.length === 0) {
-    listEl.innerHTML = `<div class="probe-empty">暂无匹配的探针日志。请在「应用分流矩阵」中点亮目标应用的 [📡 幻境探针]，运行目标应用后再点击刷新。</div>`;
+  if (!Array.isArray(events) || events.length === 0) {
+    listEl.innerHTML = `<div class="probe-empty">暂无匹配的探针审计记录。请先在「应用分流矩阵」中点亮目标应用的 [📡 幻境探针] 并启动该应用。</div>`;
     return;
   }
 
-  matched.forEach(line => {
-    const m = line.match(/\[PROBE\]\[([^\]]+)\]\[([^\]]+)\]\s*(.+?)\s*=>\s*(.+)$/);
+  events.forEach(ev => {
     const row = document.createElement("div");
     row.className = "probe-row";
+    const actionBtnHtml = ev.unmapped
+      ? `<button class="btn-capture" data-pkg="${ev.pkg}" data-key="${ev.key}">+ 捕获入库</button>`
+      : "";
 
-    if (m) {
-      const [, pkg, domain, key, val] = m;
-      const isUnmapped = domain.includes("UNMAPPED");
-      const actionBtnHtml = isUnmapped
-        ? `<button class="btn-capture" data-pkg="${pkg}" data-key="${key}">+ 捕获入库</button>`
-        : "";
+    row.innerHTML = `
+      <div style="min-width:0;word-break:break-all;">
+        <span class="probe-tag ${ev.unmapped ? "unmapped" : ""}">${ev.domain}</span>
+        <b style="color:#00e5ff;margin-left:6px;">${ev.pkg}</b>
+        <span style="margin-left:8px;color:#f0f6fc;">${ev.key}</span>
+        <span style="color:#8b949e;"> ➔ ${ev.value}</span>
+      </div>
+      ${actionBtnHtml}
+    `;
 
-      row.innerHTML = `
-        <div style="min-width:0;word-break:break-all;">
-          <span class="probe-tag ${isUnmapped ? "unmapped" : ""}">${domain}</span>
-          <b style="color:#00e5ff;margin-left:6px;">${pkg}</b>
-          <span style="margin-left:8px;color:#f0f6fc;">${key}</span>
-          <span style="color:#8b949e;"> ➔ ${val}</span>
-        </div>
-        ${actionBtnHtml}
-      `;
-
-      const capBtn = row.querySelector(".btn-capture");
-      if (capBtn) {
-        capBtn.onclick = async () => {
-          const route = normalizeRoute(appState.appRoutes[pkg]);
-          if (!route || !appState.templates[route.tplId]) {
-            toast(`未找到 ${pkg} 绑定的模板`);
-            return;
-          }
-          const tpl = appState.templates[route.tplId];
-          const customVal = prompt(`为模板 [${tpl.name}] 设置属性 ${key} 的伪装值：`, "1");
-          if (customVal === null) return;
-          const newEntry = `${key}=${customVal.trim()}`;
-          tpl.CUSTOM_PROPS = tpl.CUSTOM_PROPS ? `${tpl.CUSTOM_PROPS}\n${newEntry}` : newEntry;
-          await saveAndSyncConfig();
-          toast(`已将 ${newEntry} 写入模板 [${tpl.name}]`);
-        };
-      }
-    } else {
-      row.textContent = line;
+    const capBtn = row.querySelector(".btn-capture");
+    if (capBtn) {
+      capBtn.onclick = async () => {
+        const customVal = prompt(`为 [${ev.pkg}] 所绑定的模板设置属性 ${ev.key} 的伪装值：`, "1");
+        if (customVal === null) return;
+        const safeVal = customVal.trim().replace(/"/g, "");
+        await ksuExec(`"${CLI_BIN}" probe capture "${ev.pkg}" "${ev.key}" "${safeVal}"`);
+        await syncStateFromCli();
+        toast(`已通过 CLI 将 ${ev.key}=${safeVal} 捕获入库！`);
+      };
     }
     listEl.appendChild(row);
   });
 }
 
 function openTemplateModal(tpl = null) {
-  document.getElementById("modalTitle").textContent = tpl ? "编辑 v4.0 全息硬件模板" : "铸造 v4.0 全息硬件模板";
+  document.getElementById("modalTitle").textContent = tpl ? "编辑全息硬件模板" : "铸造全息硬件模板";
   document.getElementById("tplId").value = tpl ? tpl.id : `tpl_${Date.now()}`;
   document.getElementById("tplName").value = tpl ? tpl.name : "";
   document.getElementById("tplModel").value = tpl ? tpl.MODEL : "";
@@ -636,6 +375,27 @@ function openTemplateModal(tpl = null) {
   document.getElementById("templateModal").classList.add("show");
 }
 
+// 调用 C++ mirageforge_cli parse-prop - 解析 build.prop 文本
+async function parsePropViaCli(rawText) {
+  if (!rawText || !rawText.trim()) {
+    toast("请先粘贴或导入 build.prop 内容");
+    return;
+  }
+  const b64 = toBase64(rawText);
+  const res = await ksuExec(`echo "${b64}" | base64 -d | "${CLI_BIN}" parse-prop -`);
+  if (res.errno === 0 && res.stdout.trim()) {
+    try {
+      const parsed = JSON.parse(res.stdout);
+      if (parsed && parsed.MODEL) {
+        openTemplateModal(parsed);
+        toast("mirageforge_cli 炼金解析成功！");
+        return;
+      }
+    } catch (e) {}
+  }
+  toast("未识别到有效的 build.prop 属性字段");
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll(".tab-btn").forEach(btn => {
     btn.onclick = () => {
@@ -643,7 +403,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(btn.dataset.tab).classList.add("active");
-      if (btn.dataset.tab === "tab-probe") refreshProbeLogs();
+      if (btn.dataset.tab === "tab-probe") refreshProbeAndTelemetry();
     };
   });
 
@@ -653,13 +413,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
 
   document.getElementById("btnExportJson").onclick = async () => {
-    const outPath = "/sdcard/Download/MirageForge_v4_Backup.json";
-    await ksuExec(`cp -f "${CONFIG_FILE}" "${outPath}"`);
-    toast(`已导出全息配置至 ${outPath}`);
+    const outPath = "/sdcard/Download/MirageForge_v1.0.0_Backup.json";
+    await ksuExec(`"${CLI_BIN}" export "${outPath}"`);
+    toast(`已通过 CLI 导出备份至 ${outPath}`);
   };
 
+  // 通过 Base64 管道将模板 JSON 提交给 mirageforge_cli template set-stdin
   document.getElementById("btnSaveTemplate").onclick = async () => {
-    const id = document.getElementById("tplId").value;
+    const id = document.getElementById("tplId").value.trim();
     const name = document.getElementById("tplName").value.trim();
     const MODEL = document.getElementById("tplModel").value.trim();
     const BRAND = document.getElementById("tplBrand").value.trim();
@@ -667,7 +428,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       toast("请填写模板名称与手机型号 (MODEL)");
       return;
     }
-    appState.templates[id] = {
+
+    const tplObj = {
       id,
       name,
       MODEL,
@@ -691,20 +453,21 @@ document.addEventListener("DOMContentLoaded", async () => {
       GL_RENDERER: document.getElementById("tplGlRenderer").value.trim(),
       GL_VERSION: document.getElementById("tplGlVersion").value.trim(),
       CPU_HARDWARE: document.getElementById("tplCpuHw").value.trim(),
-      CPU_CORES: parseInt(document.getElementById("tplCpuCores").value, 10) || 8,
-      CPU_MAX_FREQ: parseInt(document.getElementById("tplCpuFreq").value, 10) || 4320000,
-      RAM_GB: parseInt(document.getElementById("tplRamGb").value, 10) || 16,
+      CPU_CORES: String(parseInt(document.getElementById("tplCpuCores").value, 10) || 8),
+      CPU_MAX_FREQ: String(parseInt(document.getElementById("tplCpuFreq").value, 10) || 4320000),
+      RAM_GB: String(parseInt(document.getElementById("tplRamGb").value, 10) || 16),
       SOC_ID: document.getElementById("tplSocId").value.trim() || "618",
       SOC_MACHINE: document.getElementById("tplSocMachine").value.trim() || "SM8750",
       KERNEL_RELEASE: document.getElementById("tplKernelRel").value.trim(),
       KERNEL_VERSION: document.getElementById("tplKernelVer").value.trim(),
       CUSTOM_PROPS: document.getElementById("tplCustomProps").value.trim()
     };
-    await saveAndSyncConfig();
-    renderTemplates();
-    renderAppList();
+
+    const b64Json = toBase64(JSON.stringify(tplObj));
+    await ksuExec(`echo "${b64Json}" | base64 -d | "${CLI_BIN}" template set-stdin`);
+    await syncStateFromCli();
     document.getElementById("templateModal").classList.remove("show");
-    toast("v4.0 全息模板已保存并下发至底层引擎");
+    toast("已通过 mirageforge_cli 原子编译并保存模板");
   };
 
   const uploadZone = document.getElementById("uploadZone");
@@ -716,16 +479,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     const reader = new FileReader();
     reader.onload = (ev) => {
       document.getElementById("propRawText").value = ev.target.result;
-      const parsed = parseBuildPropText(ev.target.result);
-      if (parsed) openTemplateModal(parsed);
+      parsePropViaCli(ev.target.result);
     };
     reader.readAsText(file);
   };
 
   document.getElementById("btnParseProp").onclick = () => {
-    const raw = document.getElementById("propRawText").value;
-    const parsed = parseBuildPropText(raw);
-    if (parsed) openTemplateModal(parsed);
+    parsePropViaCli(document.getElementById("propRawText").value);
   };
 
   document.getElementById("btnClearProp").onclick = () => {
@@ -758,14 +518,27 @@ document.addEventListener("DOMContentLoaded", async () => {
     toast("已刷新应用列表");
   };
 
-  document.getElementById("btnRefreshProbe").onclick = () => refreshProbeLogs();
-  document.getElementById("probeFilterInput").oninput = () => refreshProbeLogs();
-  document.getElementById("btnClearProbe").onclick = async () => {
-    await ksuExec("logcat -c");
-    refreshProbeLogs();
-    toast("已清空探针日志缓存");
+  document.getElementById("btnToggleUnmapped").onclick = (e) => {
+    appState.unmappedOnly = !appState.unmappedOnly;
+    e.target.classList.toggle("active", appState.unmappedOnly);
+    refreshProbeAndTelemetry();
   };
 
-  await loadConfig();
+  document.getElementById("btnRefreshProbe").onclick = () => refreshProbeAndTelemetry();
+  document.getElementById("probeFilterInput").oninput = () => refreshProbeAndTelemetry();
+
+  document.getElementById("btnClearProbe").onclick = async () => {
+    await ksuExec(`"${CLI_BIN}" probe clear`);
+    refreshProbeAndTelemetry();
+    toast("已清空探针日志");
+  };
+
+  document.getElementById("btnClearTelemetry").onclick = async () => {
+    await ksuExec(`rm -f "${LAUNCH_LOG}"`);
+    refreshProbeAndTelemetry();
+    toast("已清空注入遥测记录");
+  };
+
+  await syncStateFromCli();
   await loadInstalledPackages();
 });
