@@ -1,166 +1,201 @@
 #pragma once
 
-#include <cstdlib>
-#include <jni.h>
+#include <cstdio>
+#include <cstring>
+#include <cinttypes>
+#include <set>
+#include <mutex>
+#include <dlfcn.h>
+#include <sys/sysmacros.h>
+#include "zygisk.hpp"
 #include "mirage_shared.hpp"
 #include "bionic_prop_engine.hpp"
+#include "vfs_sysinfo_engine.hpp"
+#include "graphics_vulkan_gles.hpp"
 
 namespace mirage {
 
-inline std::string query_prop_for_jni(const char *key, const char *def_val) {
-    if (!key) return def_val ? def_val : "";
-    if (g_ctx.enable_build_props) {
-        auto it = g_ctx.prop_map.find(key);
-        if (it != g_ctx.prop_map.end()) {
-            emit_probe("JNI_PROP", key, it->second);
-            return it->second;
+inline zygisk::Api *g_zygisk_api = nullptr;
+inline std::mutex g_maps_mtx;
+inline std::set<std::pair<dev_t, ino_t>> g_hooked_elves;
+
+inline void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
+inline void *(*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
+inline void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
+
+inline void scan_and_commit_plt_hooks();
+
+inline void *hook_dlsym(void *handle, const char *symbol) {
+    if (symbol && !g_tls_in_hook) {
+        if (g_ctx.enable_build_props) {
+            if (std::strcmp(symbol, "__system_property_find") == 0) return reinterpret_cast<void *>(hook_system_property_find);
+            if (std::strcmp(symbol, "__system_property_read_callback") == 0) return reinterpret_cast<void *>(hook_system_property_read_callback);
+            if (std::strcmp(symbol, "__system_property_read") == 0) return reinterpret_cast<void *>(hook_system_property_read);
+            if (std::strcmp(symbol, "__system_property_get") == 0) return reinterpret_cast<void *>(hook_system_property_get);
+            if (std::strcmp(symbol, "__system_property_foreach") == 0) return reinterpret_cast<void *>(hook_system_property_foreach);
+            if (std::strcmp(symbol, "popen") == 0) return reinterpret_cast<void *>(hook_popen);
+            if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
         }
-        if (g_ctx.enable_probe && std::strncmp(key, "ro.", 3) == 0) {
-            emit_probe("JNI_PROP_UNMAPPED", key, "<passthrough>");
+        if (g_ctx.enable_vfs_shield) {
+            if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
+            if (std::strcmp(symbol, "__openat_2") == 0) return reinterpret_cast<void *>(hook_openat_2);
+            if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
+            if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
+            if (std::strcmp(symbol, "readlink") == 0) return reinterpret_cast<void *>(hook_readlink);
+            if (std::strcmp(symbol, "readlinkat") == 0) return reinterpret_cast<void *>(hook_readlinkat);
+            if (std::strcmp(symbol, "fstat") == 0) return reinterpret_cast<void *>(hook_fstat);
+            if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
+            if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
+            if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
+        }
+        if (g_ctx.enable_gl_vulkan) {
+            if (std::strcmp(symbol, "glGetString") == 0) return reinterpret_cast<void *>(hook_glGetString);
+            if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hook_eglGetProcAddress);
+            if (std::strcmp(symbol, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<void *>(hook_vkGetInstanceProcAddr);
+            if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties") == 0) return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties);
+            if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties2") == 0) return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2);
         }
     }
-    char buf[PROP_VALUE_MAX] = {0};
-    if (orig_system_property_get && orig_system_property_get(key, buf) > 0) {
-        return std::string(buf);
+    return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
+}
+
+// 判断动态加载的库是否需要触发增量 PLT 扫描（跳过早已在 Zygote 中扫描过的系统基础库，消除启动卡顿）
+inline bool should_rescan_on_dlopen(const char *filename) {
+    if (!filename) return false;
+    if (std::strncmp(filename, "/system/", 8) == 0 ||
+        std::strncmp(filename, "/apex/", 6) == 0) {
+        return false;
     }
-    return def_val ? def_val : "";
+    return true;
 }
 
-inline jstring JNICALL jni_native_get(JNIEnv *env, jclass, jstring keyJ, jstring defJ) {
-    if (!keyJ) return defJ;
-    const char *key = env->GetStringUTFChars(keyJ, nullptr);
-    const char *def = defJ ? env->GetStringUTFChars(defJ, nullptr) : nullptr;
-    std::string res = query_prop_for_jni(key, def);
-    if (key) env->ReleaseStringUTFChars(keyJ, key);
-    if (defJ && def) env->ReleaseStringUTFChars(defJ, def);
-    return env->NewStringUTF(res.c_str());
+inline void *hook_dlopen(const char *filename, int flags) {
+    void *handle = orig_dlopen ? orig_dlopen(filename, flags) : nullptr;
+    if (handle && should_rescan_on_dlopen(filename)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            emit_probe("DLOPEN", filename, "Incremental PLT Hook");
+            scan_and_commit_plt_hooks();
+        }
+    }
+    return handle;
 }
 
-inline jint JNICALL jni_native_get_int(JNIEnv *env, jclass, jstring keyJ, jint defV) {
-    if (!keyJ) return defV;
-    const char *key = env->GetStringUTFChars(keyJ, nullptr);
-    std::string res = query_prop_for_jni(key, "");
-    if (key) env->ReleaseStringUTFChars(keyJ, key);
-    if (res.empty()) return defV;
-    char *end = nullptr;
-    long v = std::strtol(res.c_str(), &end, 0);
-    return (end != res.c_str()) ? static_cast<jint>(v) : defV;
+inline void *hook_android_dlopen_ext(const char *filename, int flags, const void *extinfo) {
+    void *handle = orig_android_dlopen_ext ? orig_android_dlopen_ext(filename, flags, extinfo) : nullptr;
+    if (handle && should_rescan_on_dlopen(filename)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            emit_probe("DLOPEN_EXT", filename, "Incremental PLT Hook");
+            scan_and_commit_plt_hooks();
+        }
+    }
+    return handle;
 }
 
-inline jlong JNICALL jni_native_get_long(JNIEnv *env, jclass, jstring keyJ, jlong defV) {
-    if (!keyJ) return defV;
-    const char *key = env->GetStringUTFChars(keyJ, nullptr);
-    std::string res = query_prop_for_jni(key, "");
-    if (key) env->ReleaseStringUTFChars(keyJ, key);
-    if (res.empty()) return defV;
-    char *end = nullptr;
-    long long v = std::strtoll(res.c_str(), &end, 0);
-    return (end != res.c_str()) ? static_cast<jlong>(v) : defV;
-}
+inline void scan_and_commit_plt_hooks() {
+    if (!g_zygisk_api) return;
+    if (!g_maps_mtx.try_lock()) return; // 使用 try_lock 避免多线程并发 dlopen 阻塞主线程
 
-inline jboolean JNICALL jni_native_get_boolean(JNIEnv *env, jclass, jstring keyJ, jboolean defV) {
-    if (!keyJ) return defV;
-    const char *key = env->GetStringUTFChars(keyJ, nullptr);
-    std::string res = query_prop_for_jni(key, "");
-    if (key) env->ReleaseStringUTFChars(keyJ, key);
-    if (res.empty()) return defV;
-    if (res == "1" || res == "true" || res == "y" || res == "yes" || res == "on") return JNI_TRUE;
-    if (res == "0" || res == "false" || res == "n" || res == "no" || res == "off") return JNI_FALSE;
-    return defV;
-}
-
-inline void register_system_properties_natives(JNIEnv *env) {
-    jclass sp_cls = env->FindClass("android/os/SystemProperties");
-    if (!sp_cls) {
-        env->ExceptionClear();
+    FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
+    if (!fp) {
+        g_maps_mtx.unlock();
         return;
     }
-    JNINativeMethod methods[] = {
-        {"native_get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(jni_native_get)},
-        {"native_get_int", "(Ljava/lang/String;I)I", reinterpret_cast<void *>(jni_native_get_int)},
-        {"native_get_long", "(Ljava/lang/String;J)J", reinterpret_cast<void *>(jni_native_get_long)},
-        {"native_get_boolean", "(Ljava/lang/String;Z)Z", reinterpret_cast<void *>(jni_native_get_boolean)}
-    };
-    env->RegisterNatives(sp_cls, methods, sizeof(methods) / sizeof(methods[0]));
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    env->DeleteLocalRef(sp_cls);
-}
 
-inline void reflect_java_build_fields(JNIEnv *env) {
-    auto set_str = [&](jclass cls, const char *name, const std::string &val) {
-        jfieldID fid = env->GetStaticFieldID(cls, name, "Ljava/lang/String;");
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
-        if (fid) {
-            jstring jstr = env->NewStringUTF(val.c_str());
-            env->SetStaticObjectField(cls, fid, jstr);
-            env->DeleteLocalRef(jstr);
+    char line[1024];
+    bool dirty = false;
+
+    while (std::fgets(line, sizeof(line), fp)) {
+        uintptr_t start = 0, end = 0, offset = 0;
+        unsigned int dev_maj = 0, dev_min = 0;
+        unsigned long inode_ul = 0;
+        char perms[8] = {0};
+        int path_pos = 0;
+
+        if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %" SCNxPTR " %x:%x %lu %n",
+                        &start, &end, perms, &offset, &dev_maj, &dev_min, &inode_ul, &path_pos) < 7) {
+            continue;
         }
-    };
+        if (inode_ul == 0) continue;
 
-    auto set_int = [&](jclass cls, const char *name, int val) {
-        jfieldID fid = env->GetStaticFieldID(cls, name, "I");
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
-        if (fid) env->SetStaticIntField(cls, fid, static_cast<jint>(val));
-    };
-
-    auto set_long = [&](jclass cls, const char *name, long long val) {
-        jfieldID fid = env->GetStaticFieldID(cls, name, "J");
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
-        if (fid) env->SetStaticLongField(cls, fid, static_cast<jlong>(val));
-    };
-
-    auto set_str_arr = [&](jclass cls, const char *name, const std::vector<std::string> &items) {
-        if (items.empty()) return;
-        jfieldID fid = env->GetStaticFieldID(cls, name, "[Ljava/lang/String;");
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
-        jclass str_cls = env->FindClass("java/lang/String");
-        if (!str_cls) { env->ExceptionClear(); return; }
-        jobjectArray arr = env->NewObjectArray(static_cast<jsize>(items.size()), str_cls, nullptr);
-        if (arr) {
-            for (size_t i = 0; i < items.size(); ++i) {
-                jstring s = env->NewStringUTF(items[i].c_str());
-                env->SetObjectArrayElement(arr, static_cast<jsize>(i), s);
-                env->DeleteLocalRef(s);
-            }
-            env->SetStaticObjectField(cls, fid, arr);
-            env->DeleteLocalRef(arr);
+        char *path = line + path_pos;
+        while (*path == ' ' || *path == '\t') ++path;
+        size_t len = std::strlen(path);
+        while (len > 0 && (path[len - 1] == '\n' || path[len - 1] == '\r')) {
+            path[--len] = '\0';
         }
-        env->DeleteLocalRef(str_cls);
-    };
 
-    jclass build_cls = env->FindClass("android/os/Build");
-    if (build_cls) {
-        for (const auto &kv : g_ctx.build_map) {
-            if (kv.first == "TIME") {
-                long long t = std::atoll(kv.second.c_str());
-                if (t > 0) set_long(build_cls, "TIME", t);
-            } else if (kv.first == "SUPPORTED_ABIS" ||
-                       kv.first == "SUPPORTED_64_BIT_ABIS" ||
-                       kv.first == "SUPPORTED_32_BIT_ABIS") {
-                set_str_arr(build_cls, kv.first.c_str(), split_str(kv.second, ','));
-            } else {
-                set_str(build_cls, kv.first.c_str(), kv.second);
-            }
+        // 只扫描真实 ELF 动态库 (.so)，跳过 .dex/.vdex/.art/.apk/.jar/字体/资源映射，大幅提速！
+        if (path[0] != '/' ||
+            std::strstr(path, ".so") == nullptr ||
+            std::strstr(path, "/libc.so") != nullptr ||
+            std::strstr(path, "/libdl.so") != nullptr ||
+            std::strstr(path, "/libart.so") != nullptr ||
+            std::strstr(path, "/linker") != nullptr ||
+            std::strstr(path, "mirage_forge") != nullptr) {
+            continue;
         }
-        env->DeleteLocalRef(build_cls);
-    } else {
-        env->ExceptionClear();
+
+        dev_t dev = makedev(dev_maj, dev_min);
+        ino_t inode = static_cast<ino_t>(inode_ul);
+        auto id_pair = std::make_pair(dev, inode);
+        if (!g_hooked_elves.insert(id_pair).second) {
+            continue;
+        }
+        dirty = true;
+
+        // 关键修复：若 orig_fn 已在 onLoad 中通过 dlsym 拿到真实地址，则传入 dummy 槽位，绝不覆写 orig_fn！
+        auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
+            void *dummy_old = nullptr;
+            void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &dummy_old;
+            g_zygisk_api->pltHookRegister(dev, inode, sym, new_fn, target_old);
+        };
+
+        reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
+        reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
+        reg("dlsym", reinterpret_cast<void *>(hook_dlsym), reinterpret_cast<void **>(&orig_dlsym));
+
+        if (g_ctx.enable_build_props || g_ctx.enable_probe) {
+            reg("__system_property_find", reinterpret_cast<void *>(hook_system_property_find), reinterpret_cast<void **>(&orig_system_property_find));
+            reg("__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read_callback), reinterpret_cast<void **>(&orig_system_property_read_callback));
+            reg("__system_property_read", reinterpret_cast<void *>(hook_system_property_read), reinterpret_cast<void **>(&orig_system_property_read));
+            reg("__system_property_get", reinterpret_cast<void *>(hook_system_property_get), reinterpret_cast<void **>(&orig_system_property_get));
+            reg("__system_property_foreach", reinterpret_cast<void *>(hook_system_property_foreach), reinterpret_cast<void **>(&orig_system_property_foreach));
+            reg("__system_property_find_nth", reinterpret_cast<void *>(hook_system_property_find_nth), reinterpret_cast<void **>(&orig_system_property_find_nth));
+            reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
+            reg("AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString));
+        }
+
+        if (g_ctx.enable_vfs_shield) {
+            reg("openat", reinterpret_cast<void *>(hook_openat), reinterpret_cast<void **>(&orig_openat));
+            reg("__openat_2", reinterpret_cast<void *>(hook_openat_2), reinterpret_cast<void **>(&orig_openat_2));
+            reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
+            reg("fopen", reinterpret_cast<void *>(hook_fopen), reinterpret_cast<void **>(&orig_fopen));
+            reg("fopen64", reinterpret_cast<void *>(hook_fopen64), reinterpret_cast<void **>(&orig_fopen64));
+            reg("close", reinterpret_cast<void *>(hook_close), reinterpret_cast<void **>(&orig_close));
+            reg("readlink", reinterpret_cast<void *>(hook_readlink), reinterpret_cast<void **>(&orig_readlink));
+            reg("readlinkat", reinterpret_cast<void *>(hook_readlinkat), reinterpret_cast<void **>(&orig_readlinkat));
+            reg("fstat", reinterpret_cast<void *>(hook_fstat), reinterpret_cast<void **>(&orig_fstat));
+            reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo));
+            reg("sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf));
+            reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
+        }
+
+        if (g_ctx.enable_gl_vulkan) {
+            reg("glGetString", reinterpret_cast<void *>(hook_glGetString), reinterpret_cast<void **>(&orig_glGetString));
+            reg("eglGetProcAddress", reinterpret_cast<void *>(hook_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
+            reg("vkGetInstanceProcAddr", reinterpret_cast<void *>(hook_vkGetInstanceProcAddr), reinterpret_cast<void **>(&orig_vkGetInstanceProcAddr));
+            reg("vkGetPhysicalDeviceProperties", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties));
+            reg("vkGetPhysicalDeviceProperties2", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties2));
+        }
     }
+    std::fclose(fp);
 
-    jclass ver_cls = env->FindClass("android/os/Build$VERSION");
-    if (ver_cls) {
-        for (const auto &kv : g_ctx.version_map) {
-            if (kv.first == "SDK_INT" || kv.first == "DEVICE_INITIAL_SDK_INT" || kv.first == "PREVIEW_SDK_INT") {
-                int sdk = std::atoi(kv.second.c_str());
-                if (sdk >= 0) set_int(ver_cls, kv.first.c_str(), sdk);
-            } else {
-                set_str(ver_cls, kv.first.c_str(), kv.second);
-            }
-        }
-        env->DeleteLocalRef(ver_cls);
-    } else {
-        env->ExceptionClear();
+    if (dirty) {
+        g_zygisk_api->pltHookCommit();
     }
+    g_maps_mtx.unlock();
 }
 
 } // namespace mirage
