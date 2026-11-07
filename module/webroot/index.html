@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>蜃楼工坊 · MirageForge v1.0.0</title>
+  <title>蜃楼工坊 · MirageForge v1.0.1</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -13,8 +13,8 @@
       <div class="brand-wrap">
         <div class="logo-badge">蜃</div>
         <div>
-          <h1>蜃楼工坊 <span class="ver-tag">v1.0.0 CLI-Core</span></h1>
-          <p class="subtitle">mirageforge_cli 驱动 · Vulkan/GLES · 隐身 VFS · 探针雷达</p>
+          <h1>蜃楼工坊 <span class="ver-tag">v1.0.1 Hypervisor</span></h1>
+          <p class="subtitle">DDR 物理内存对称 · 调用栈回溯 · 崩溃诊断 · 隐身 VFS</p>
         </div>
       </div>
       <div class="stat-pill" id="statusPill">连接 CLI 中...</div>
@@ -25,7 +25,7 @@
       <button class="tab-btn active" data-tab="tab-templates">全息模板库</button>
       <button class="tab-btn" data-tab="tab-parser">智能 .prop 炼金</button>
       <button class="tab-btn" data-tab="tab-apps">应用分流矩阵</button>
-      <button class="tab-btn" data-tab="tab-probe">📡 探针与遥测</button>
+      <button class="tab-btn" data-tab="tab-probe">📡 探针与调用栈</button>
     </nav>
 
     <!-- 页面 1：全息机型模板库 -->
@@ -40,11 +40,11 @@
       <div id="templateList" class="card-grid"></div>
     </main>
 
-    <!-- 页面 2：智能 .prop 炼金台 (调用 C++ mirageforge_cli parse-prop) -->
+    <!-- 页面 2：智能 .prop 炼金台 -->
     <main id="tab-parser" class="tab-panel">
       <div class="glass-card">
         <h2>C++ 原生 build.prop 炼金引擎 (mirageforge_cli parse-prop)</h2>
-        <p class="hint-text">上传或粘贴提取自任意 ROM 的 <code>build.prop</code>，底层 <code>mirageforge_cli</code> 将自动提取机型、指纹、安全补丁，并根据平台代号自动推导配套的 <b>Vulkan/GLES GPU 渲染器</b>、<b>SoC ID</b>、<b>CPU 最高主频</b> 及全量跨品牌私有属性。</p>
+        <p class="hint-text">上传或粘贴提取自任意 ROM 的 <code>build.prop</code>，底层 <code>mirageforge_cli</code> 将自动提取机型、指纹、安全补丁，并根据平台代号自动推导配套的 <b>Vulkan/GLES GPU 渲染器</b>、<b>LPDDR 内存规格</b>、<b>SoC ID</b> 及全量跨品牌私有属性。</p>
         
         <div class="upload-zone" id="uploadZone">
           <input type="file" id="propFileInput" accept=".prop,.txt,.conf,*/*" hidden />
@@ -53,7 +53,7 @@
           <div class="upload-sub">交由 mirageforge_cli 引擎进行原生硬件拓扑推导</div>
         </div>
 
-        <textarea id="propRawText" rows="8" placeholder="在此粘贴 build.prop 内容，例如：&#10;ro.product.brand=Xiaomi&#10;ro.product.model=2410DPN6CC&#10;ro.board.platform=sun&#10;ro.soc.model=SM8750-AB&#10;ro.miui.ui.version.name=V816"></textarea>
+        <textarea id="propRawText" rows="8" placeholder="在此粘贴 build.prop 内容，例如：&#10;ro.product.brand=Xiaomi&#10;ro.product.model=2410DPN6CC&#10;ro.board.platform=sun&#10;ro.soc.model=SM8750-AB&#10;ro.boot.hardware.ddr=16GB,SKhynix,LPDDR5X"></textarea>
 
         <div class="action-row">
           <button class="btn-secondary" id="btnClearProp">清空文本</button>
@@ -76,37 +76,50 @@
       <div id="appList" class="app-list"></div>
     </main>
 
-    <!-- 页面 4：幻境探针与注入遥测 -->
+    <!-- 页面 4：幻境探针、调用栈回溯与崩溃诊断 -->
     <main id="tab-probe" class="tab-panel">
-      <!-- 注入遥测卡片 -->
+      <!-- 1. Native 崩溃信号现场诊断卡片 -->
+      <div class="glass-card crash-card" id="crashCard">
+        <div class="section-header">
+          <div>
+            <h2>💥 Native 崩溃信号现场捕获 (SIGSEGV / SIGABRT)</h2>
+            <p class="hint-text">当开启探针的应用发生底层闪退时，信号拦截器会自动捕获故障地址与崩溃调用栈。</p>
+          </div>
+        </div>
+        <div id="crashLogList" class="probe-list" style="max-height: 180px;">
+          <div class="probe-empty">运行正常，未捕获到任何应用 Native 崩溃信号。</div>
+        </div>
+      </div>
+
+      <!-- 2. 注入遥测卡片 -->
       <div class="glass-card">
         <div class="section-header">
-          <h2>🚀 Zygisk 实时注入遥测 (launch_history)</h2>
+          <h2>🚀 Zygisk 实时注入遥测 (probe telemetry)</h2>
           <button class="btn-secondary" id="btnClearTelemetry">清空遥测</button>
         </div>
-        <div id="telemetryList" class="probe-list" style="max-height: 150px;">
+        <div id="telemetryList" class="probe-list" style="max-height: 160px;">
           <div class="probe-empty">暂无应用启动遥测记录...</div>
         </div>
       </div>
 
-      <!-- 硬件嗅探雷达卡片 -->
+      <!-- 3. 硬件嗅探与调用栈回溯卡片 -->
       <div class="glass-card">
         <div class="section-header">
           <div>
-            <h2>📡 幻境探针 · 硬件嗅探审计与一键入库</h2>
-            <p class="hint-text">由 <code>mirageforge_cli probe list --json</code> 实时驱动。遇到标黄的 <code>UNMAPPED</code> 未映射敏感属性时，点击右侧 <b>「+ 捕获入库」</b> 即可调用 <code>mirageforge_cli probe capture</code> 将其写入对应模板！</p>
+            <h2>📡 幻境探针 · 硬件嗅探审计与 Native 调用栈回溯</h2>
+            <p class="hint-text">不仅记录应用读取了哪个属性或硬件节点，还通过 <code>_Unwind_Backtrace</code> + <code>dladdr</code> 实时还原调用者所在的 <code>.so!函数+偏移量</code>。点击 <b>「+ 捕获入库」</b> 可将未映射属性一键写入对应模板。</p>
           </div>
         </div>
         <div class="probe-toolbar">
-          <input type="text" id="probeFilterInput" placeholder="过滤包名或属性名..." />
+          <input type="text" id="probeFilterInput" placeholder="过滤包名、属性名或调用库 (如 libtersafe / UNMAPPED)..." />
           <div class="btn-group">
             <button class="chip" id="btnToggleUnmapped">仅看未映射</button>
-            <button class="btn-danger" id="btnClearProbe">清空雷达</button>
+            <button class="btn-danger" id="btnClearProbe">清空日志</button>
             <button class="btn-primary" id="btnRefreshProbe">🔄 刷新</button>
           </div>
         </div>
         <div id="probeLogList" class="probe-list">
-          <div class="probe-empty">点击「刷新」通过 mirageforge_cli 扫描底层硬件探测行为...</div>
+          <div class="probe-empty">点击「刷新」通过 mirageforge_cli 扫描底层硬件探测行为与调用栈...</div>
         </div>
       </div>
     </main>
@@ -121,7 +134,7 @@
       <div class="modal-section-title">一、身份标识与 ART/Bionic 反射层 (Build & SystemProperties)</div>
       <div class="form-grid">
         <label class="full-width">模板名称 *
-          <input type="text" id="tplName" placeholder="例如：Xiaomi 15 Pro (骁龙8至尊版)" />
+          <input type="text" id="tplName" placeholder="例如：Xiaomi 15 Pro (16GB LPDDR5X)" />
         </label>
         <label>手机型号 (MODEL) *
           <input type="text" id="tplModel" placeholder="2410DPN6CC" />
@@ -186,19 +199,25 @@
         </label>
       </div>
 
-      <div class="modal-section-title">三、隐身 VFS 节点与 Syscall 一致性拓扑 (/proc & /sys & sysinfo/sysconf/uname)</div>
+      <div class="modal-section-title">三、隐身 VFS 节点与物理内存 (DDR) 对称拓扑</div>
       <div class="form-grid">
         <label class="full-width">/proc/cpuinfo Hardware 描述
           <input type="text" id="tplCpuHw" placeholder="Qualcomm Technologies, Inc SM8750" />
         </label>
-        <label>虚拟 CPU 核心数 (_SC_NPROCESSORS)
+        <label>虚拟 CPU 核心数
           <input type="text" id="tplCpuCores" placeholder="8" />
         </label>
         <label>CPU 最高主频 (kHz)
           <input type="text" id="tplCpuFreq" placeholder="4320000" />
         </label>
-        <label>虚拟物理运存 (RAM GB, 联动 sysinfo)
+        <label>物理安装内存 (RAM GB)
           <input type="text" id="tplRamGb" placeholder="16 或 24" />
+        </label>
+        <label>内存代数规格 (DDR_TYPE)
+          <input type="text" id="tplDdrType" placeholder="LPDDR5X 或 LPDDR5T" />
+        </label>
+        <label>内存颗粒厂商 (DDR_VENDOR)
+          <input type="text" id="tplDdrVendor" placeholder="SKhynix / Samsung / Micron" />
         </label>
         <label>/sys/devices/soc0/soc_id
           <input type="text" id="tplSocId" placeholder="618" />
