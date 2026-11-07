@@ -34,7 +34,13 @@ inline int (*orig_uname)(struct utsname *buf) = nullptr;
 inline int (*orig_sysinfo)(struct sysinfo *info) = nullptr;
 inline long (*orig_sysconf)(int name) = nullptr;
 
-// 构建全息 VFS 静态节点映射表
+// 计算扣除硬件 Carveout (約 6.5% 预留给 Modem/GPU/TZ) 后的真实感 MemTotal (kB)
+// 确保系统信息 App 将“已安装物理内存”识别为 16GB，同时“可用内存”显示为合理的 ~9.2GB
+inline uint64_t calc_realistic_memtotal_kb(int ram_gb) {
+    uint64_t phys_kb = static_cast<uint64_t>(ram_gb > 0 ? ram_gb : 16) * 1024ULL * 1024ULL;
+    return (phys_kb * 935ULL) / 1000ULL;
+}
+
 inline void build_vfs_topology() {
     auto &files = g_ctx.vfs_files;
     files.clear();
@@ -92,21 +98,36 @@ inline void build_vfs_topology() {
         }
     }
 
-    // 3. /proc/meminfo
+    // 3. /proc/meminfo & 物理 DDR 硬件节点对称合成
     {
-        uint64_t total_kb = static_cast<uint64_t>(g_ctx.ram_gb > 0 ? g_ctx.ram_gb : 16) * 1024ULL * 1024ULL;
-        uint64_t free_kb = total_kb * 38ULL / 100ULL;
-        uint64_t avail_kb = total_kb * 64ULL / 100ULL;
+        int ram_gb = g_ctx.ram_gb > 0 ? g_ctx.ram_gb : 16;
+        uint64_t total_kb = calc_realistic_memtotal_kb(ram_gb);
+        uint64_t free_kb  = (total_kb * 24ULL) / 100ULL;
+        uint64_t avail_kb = (total_kb * 58ULL) / 100ULL; // ~58% 可用内存，符合真实 Android 负载
+        uint64_t cached_kb = (total_kb * 28ULL) / 100ULL;
+        uint64_t active_kb = (total_kb * 36ULL) / 100ULL;
+        uint64_t inactive_kb = (total_kb * 22ULL) / 100ULL;
+
         std::ostringstream ss;
         ss << "MemTotal:       " << total_kb << " kB\n"
            << "MemFree:        " << free_kb << " kB\n"
            << "MemAvailable:   " << avail_kb << " kB\n"
            << "Buffers:          184320 kB\n"
-           << "Cached:          4194304 kB\n"
+           << "Cached:         " << cached_kb << " kB\n"
            << "SwapCached:            0 kB\n"
+           << "Active:         " << active_kb << " kB\n"
+           << "Inactive:       " << inactive_kb << " kB\n"
            << "SwapTotal:       8388608 kB\n"
            << "SwapFree:        8126464 kB\n";
         files["/proc/meminfo"] = ss.str();
+
+        // 物理 DDR 规格节点（供 DevCheck / Device Info HW / AIDA64 / 系统设置读取“已安装内存: 16GB LPDDR5X”）
+        std::string ddr_desc = std::to_string(ram_gb) + "GB " + g_ctx.ddr_type + " (" + g_ctx.ddr_vendor + ")\n";
+        files["/proc/ddr_info"] = ddr_desc;
+        files["/sys/devices/system/chip-info/ddr_info"] = ddr_desc;
+        files["/sys/devices/system/chip-info/ddr_type"] = g_ctx.ddr_type + "\n";
+        files["/sys/devices/system/chip-info/ddr_size"] = std::to_string(ram_gb) + "GB\n";
+        files["/sys/firmware/devicetree/base/memory/ddr_device_type"] = g_ctx.ddr_type + "\n";
     }
 
     // 4. /proc/version & /proc/sys/kernel/osrelease
@@ -142,7 +163,6 @@ inline std::string normalize_vfs_path(const char *raw_path) {
     return out;
 }
 
-// 检查行内是否包含注入痕迹或 Root 挂载痕迹
 inline bool is_sensitive_proc_line(const char *line) {
     return std::strstr(line, "mirage_forge") != nullptr ||
            std::strstr(line, "zygisk") != nullptr ||
@@ -154,7 +174,6 @@ inline bool is_sensitive_proc_line(const char *line) {
            std::strstr(line, "lsposed") != nullptr;
 }
 
-// 实时读取并净化 /proc/self/maps、/proc/self/mountinfo、/proc/mounts
 inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *out_clean) {
     if (!g_ctx.enable_maps_cloak || !out_clean) return false;
 
@@ -167,7 +186,6 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
 
     if (!is_maps && !is_mounts) return false;
 
-    // 必须调用 orig_fopen 读取真实内核节点，绝不触发递归 Hook
     FILE *real_fp = orig_fopen ? orig_fopen(norm_path.c_str(), "r") : nullptr;
     if (!real_fp) return false;
 
@@ -192,7 +210,6 @@ inline int open_cloaked_vfs_fd(const char *raw_path) {
     if (!raw_path || !g_ctx.enable_vfs_shield) return -1;
     std::string norm = normalize_vfs_path(raw_path);
 
-    // 1. 优先匹配静态合成的硬件节点
     const std::string *target_content = nullptr;
     std::string dynamic_clean_content;
 
@@ -200,7 +217,6 @@ inline int open_cloaked_vfs_fd(const char *raw_path) {
     if (it != g_ctx.vfs_files.end()) {
         target_content = &it->second;
     } else if (sanitize_live_proc_file(norm, &dynamic_clean_content)) {
-        // 2. 匹配动态实时净化的 /proc/self/maps 或 mountinfo
         target_content = &dynamic_clean_content;
     } else {
         return -1;
@@ -220,30 +236,42 @@ inline int open_cloaked_vfs_fd(const char *raw_path) {
 }
 
 inline int hook_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
-    int fake_fd = open_cloaked_vfs_fd(pathname);
-    if (fake_fd >= 0) return fake_fd;
+    ScopedHookGuard guard;
+    if (guard) {
+        int fake_fd = open_cloaked_vfs_fd(pathname);
+        if (fake_fd >= 0) return fake_fd;
+    }
     return orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
 }
 
 inline int hook_openat_2(int dirfd, const char *pathname, int flags) {
-    int fake_fd = open_cloaked_vfs_fd(pathname);
-    if (fake_fd >= 0) return fake_fd;
+    ScopedHookGuard guard;
+    if (guard) {
+        int fake_fd = open_cloaked_vfs_fd(pathname);
+        if (fake_fd >= 0) return fake_fd;
+    }
     return orig_openat_2 ? orig_openat_2(dirfd, pathname, flags) : -1;
 }
 
 inline int hook_open(const char *pathname, int flags, mode_t mode) {
-    int fake_fd = open_cloaked_vfs_fd(pathname);
-    if (fake_fd >= 0) return fake_fd;
+    ScopedHookGuard guard;
+    if (guard) {
+        int fake_fd = open_cloaked_vfs_fd(pathname);
+        if (fake_fd >= 0) return fake_fd;
+    }
     return orig_open ? orig_open(pathname, flags, mode) : -1;
 }
 
 inline FILE *hook_fopen(const char *pathname, const char *mode) {
-    int fake_fd = open_cloaked_vfs_fd(pathname);
-    if (fake_fd >= 0) {
-        FILE *fp = fdopen(fake_fd, "r");
-        if (fp) return fp;
-        g_fd_cloak.unregister_fd(fake_fd);
-        if (orig_close) orig_close(fake_fd); else close(fake_fd);
+    ScopedHookGuard guard;
+    if (guard) {
+        int fake_fd = open_cloaked_vfs_fd(pathname);
+        if (fake_fd >= 0) {
+            FILE *fp = fdopen(fake_fd, "r");
+            if (fp) return fp;
+            g_fd_cloak.unregister_fd(fake_fd);
+            if (orig_close) orig_close(fake_fd); else close(fake_fd);
+        }
     }
     return orig_fopen ? orig_fopen(pathname, mode) : nullptr;
 }
@@ -258,8 +286,9 @@ inline int hook_close(int fd) {
 }
 
 inline ssize_t hook_readlink(const char *pathname, char *buf, size_t bufsiz) {
+    ScopedHookGuard guard;
     std::string cloaked_path;
-    if (g_ctx.enable_vfs_shield && buf && bufsiz > 0 &&
+    if (guard && g_ctx.enable_vfs_shield && buf && bufsiz > 0 &&
         g_fd_cloak.resolve_proc_fd_link(pathname, &cloaked_path)) {
         size_t copy_len = std::min(bufsiz, cloaked_path.size());
         std::memcpy(buf, cloaked_path.data(), copy_len);
@@ -270,8 +299,9 @@ inline ssize_t hook_readlink(const char *pathname, char *buf, size_t bufsiz) {
 }
 
 inline ssize_t hook_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
+    ScopedHookGuard guard;
     std::string cloaked_path;
-    if (g_ctx.enable_vfs_shield && buf && bufsiz > 0 &&
+    if (guard && g_ctx.enable_vfs_shield && buf && bufsiz > 0 &&
         g_fd_cloak.resolve_proc_fd_link(pathname, &cloaked_path)) {
         size_t copy_len = std::min(bufsiz, cloaked_path.size());
         std::memcpy(buf, cloaked_path.data(), copy_len);
@@ -288,20 +318,25 @@ inline int hook_fstat(int fd, struct stat *statbuf) {
     return orig_fstat ? orig_fstat(fd, statbuf) : -1;
 }
 
+// sysinfo() 严格对齐 Carveout 后的 MemTotal 与 MemAvailable
 inline int hook_sysinfo(struct sysinfo *info) {
     int ret = orig_sysinfo ? orig_sysinfo(info) : sysinfo(info);
-    if (ret == 0 && info && g_ctx.enable_vfs_shield && g_ctx.ram_gb > 0) {
-        uint64_t total_bytes = static_cast<uint64_t>(g_ctx.ram_gb) * 1024ULL * 1024ULL * 1024ULL;
+    ScopedHookGuard guard;
+    if (guard && ret == 0 && info && g_ctx.enable_vfs_shield && g_ctx.ram_gb > 0) {
+        uint64_t total_bytes = calc_realistic_memtotal_kb(g_ctx.ram_gb) * 1024ULL;
         uint32_t unit = info->mem_unit > 0 ? info->mem_unit : 1;
         info->totalram = static_cast<unsigned long>(total_bytes / unit);
-        info->freeram = info->totalram * 38UL / 100UL;
-        emit_probe("SYSINFO", "totalram", std::to_string(g_ctx.ram_gb) + "GB");
+        info->freeram  = (info->totalram * 58UL) / 100UL;
+        info->bufferram = (info->totalram * 4UL) / 100UL;
+        emit_probe("SYSINFO", "totalram", std::to_string(g_ctx.ram_gb) + "GB (" + g_ctx.ddr_type + ")");
     }
     return ret;
 }
 
+// sysconf(_SC_PHYS_PAGES) 严格对齐 Carveout 后的物理页数
 inline long hook_sysconf(int name) {
-    if (g_ctx.enable_vfs_shield) {
+    ScopedHookGuard guard;
+    if (guard && g_ctx.enable_vfs_shield) {
         if (name == _SC_NPROCESSORS_CONF || name == _SC_NPROCESSORS_ONLN) {
             emit_probe("SYSCONF", "_SC_NPROCESSORS", std::to_string(g_ctx.cpu_cores));
             return g_ctx.cpu_cores > 0 ? g_ctx.cpu_cores : 8;
@@ -309,7 +344,8 @@ inline long hook_sysconf(int name) {
         if (name == _SC_PHYS_PAGES && g_ctx.ram_gb > 0) {
             long page_sz = orig_sysconf ? orig_sysconf(_SC_PAGESIZE) : 4096;
             if (page_sz <= 0) page_sz = 4096;
-            uint64_t total_bytes = static_cast<uint64_t>(g_ctx.ram_gb) * 1024ULL * 1024ULL * 1024ULL;
+            uint64_t total_bytes = calc_realistic_memtotal_kb(g_ctx.ram_gb) * 1024ULL;
+            emit_probe("SYSCONF", "_SC_PHYS_PAGES", std::to_string(g_ctx.ram_gb) + "GB");
             return static_cast<long>(total_bytes / static_cast<uint64_t>(page_sz));
         }
     }
@@ -318,7 +354,8 @@ inline long hook_sysconf(int name) {
 
 inline int hook_uname(struct utsname *buf) {
     int ret = orig_uname ? orig_uname(buf) : uname(buf);
-    if (ret == 0 && buf && g_ctx.enable_vfs_shield) {
+    ScopedHookGuard guard;
+    if (guard && ret == 0 && buf && g_ctx.enable_vfs_shield) {
         if (!g_ctx.cpu_arch.empty()) {
             std::strncpy(buf->machine, g_ctx.cpu_arch.c_str(), sizeof(buf->machine) - 1);
             buf->machine[sizeof(buf->machine) - 1] = '\0';
@@ -337,7 +374,8 @@ inline int hook_uname(struct utsname *buf) {
 }
 
 inline FILE *hook_popen(const char *command, const char *type) {
-    if (command && g_ctx.enable_build_props) {
+    ScopedHookGuard guard;
+    if (guard && command && g_ctx.enable_build_props) {
         std::string cmd(command);
         size_t first = cmd.find_first_not_of(" \t");
         if (first != std::string::npos) cmd = cmd.substr(first);
