@@ -16,15 +16,35 @@ inline int (*orig_system_property_get)(const char *name, char *value) = nullptr;
 inline int (*orig_system_property_foreach)(T_ForeachCallback propfn, void *cookie) = nullptr;
 inline const prop_info *(*orig_system_property_find_nth)(unsigned n) = nullptr;
 
-// 预热整个属性池到 AOSP Bionic 兼容内存池中
+// 自动补齐物理内存规格 (DDR) 对称属性并预热到 AOSP 1:1 内存池
 inline void prewarm_bionic_prop_arena() {
+    int ram = g_ctx.ram_gb > 0 ? g_ctx.ram_gb : 16;
+    std::string ram_str = std::to_string(ram) + "GB";
+    std::string ram_mb_str = std::to_string(ram * 1024);
+    std::string ddr_full = ram_str + "," + g_ctx.ddr_vendor + "," + g_ctx.ddr_type;
+
+    // 覆盖各家 ROM (Xiaomi / Qualcomm / OPlus / Vivo / Asus) 用于展示“已安装物理内存”的底层属性
+    g_ctx.prop_map["ro.boot.hardware.ddr"]    = ddr_full;
+    g_ctx.prop_map["ro.boot.ddr_size"]        = ram_str;
+    g_ctx.prop_map["ro.boot.ddr_type"]        = g_ctx.ddr_type;
+    g_ctx.prop_map["ro.boot.ddr_info"]        = ddr_full;
+    g_ctx.prop_map["ro.boot.ramsize"]         = ram_str;
+    g_ctx.prop_map["ro.boot.memsize"]         = ram_str;
+    g_ctx.prop_map["ro.hardware.ddr"]         = ddr_full;
+    g_ctx.prop_map["ro.vendor.hw.ram"]        = ram_str;
+    g_ctx.prop_map["ro.product.ram"]          = ram_str;
+    g_ctx.prop_map["ro.config.ram_size"]      = ram_mb_str;
+    g_ctx.prop_map["ro.sys.ram_size"]         = ram_str;
+    g_ctx.prop_map["persist.sys.ram_size"]    = ram_str;
+
     for (const auto &kv : g_ctx.prop_map) {
         g_prop_arena.obtain(kv.first, kv.second);
     }
 }
 
 inline const prop_info *hook_system_property_find(const char *name) {
-    if (name && g_ctx.enable_build_props) {
+    ScopedHookGuard guard;
+    if (guard && name && g_ctx.enable_build_props) {
         auto it = g_ctx.prop_map.find(name);
         if (it != g_ctx.prop_map.end()) {
             emit_probe("PROP_FIND", name, it->second);
@@ -32,7 +52,7 @@ inline const prop_info *hook_system_property_find(const char *name) {
         }
         if (g_ctx.enable_probe &&
             (std::strncmp(name, "ro.", 3) == 0 || std::strncmp(name, "persist.", 8) == 0 ||
-             std::strncmp(name, "sys.", 4) == 0 || std::strncmp(name, "gsm.", 4) == 0)) {
+             std::strncmp(name, "sys.", 4) == 0 || std::strncmp(name, "dalvik.", 7) == 0)) {
             emit_probe("PROP_UNMAPPED", name, "<passthrough>");
         }
     }
@@ -51,7 +71,6 @@ inline void internal_read_cb_bridge(void *cookie, const char *name, const char *
     if (name && g_ctx.enable_build_props) {
         auto it = g_ctx.prop_map.find(name);
         if (it != g_ctx.prop_map.end()) {
-            emit_probe("PROP_CB", name, it->second);
             ctx->user_cb(ctx->user_cookie, name, it->second.c_str(), serial & ~1u);
             return;
         }
@@ -96,7 +115,6 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
     if (name && value && g_ctx.enable_build_props) {
         auto it = g_ctx.prop_map.find(name);
         if (it != g_ctx.prop_map.end()) {
-            emit_probe("PROP_READ", name, it->second);
             std::strncpy(value, it->second.c_str(), PROP_VALUE_MAX - 1);
             value[PROP_VALUE_MAX - 1] = '\0';
             return static_cast<int>(std::strlen(value));
@@ -106,7 +124,8 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 }
 
 inline int hook_system_property_get(const char *name, char *value) {
-    if (name && value && g_ctx.enable_build_props) {
+    ScopedHookGuard guard;
+    if (guard && name && value && g_ctx.enable_build_props) {
         auto it = g_ctx.prop_map.find(name);
         if (it != g_ctx.prop_map.end()) {
             emit_probe("PROP_GET", name, it->second);
