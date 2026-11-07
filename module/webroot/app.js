@@ -1,8 +1,7 @@
 const CLI_BIN = "/data/adb/modules/mirage_forge/bin/mirageforge_cli";
-const LAUNCH_LOG = "/data/adb/mirage_forge/launch_history.log";
 
 let appState = {
-  version: "1.0.0",
+  version: "1.0.1",
   templates: {},
   appRoutes: {},
   installedApps: [],
@@ -41,13 +40,12 @@ function toBase64(str) {
   return btoa(unescape(encodeURIComponent(str)));
 }
 
-// 从 mirageforge_cli state --json 同步全局权威状态
 async function syncStateFromCli() {
   const res = await ksuExec(`"${CLI_BIN}" state --json`);
   if (res.errno === 0 && res.stdout.trim()) {
     try {
       const data = JSON.parse(res.stdout);
-      appState.version = data.version || "1.0.0";
+      appState.version = data.version || "1.0.1";
       appState.templates = data.templates || {};
       appState.appRoutes = data.appRoutes || {};
       const activeCount = Object.keys(appState.appRoutes).length;
@@ -60,7 +58,6 @@ async function syncStateFromCli() {
   renderAppList();
 }
 
-// 读取已安装应用列表并结合 KSU 原生图标与名称 API
 async function loadInstalledPackages() {
   let pkgNames = [];
   const pkgType = appState.includeSystemApps ? "all" : "user";
@@ -116,6 +113,8 @@ function renderTemplates() {
   container.innerHTML = "";
 
   Object.values(appState.templates).forEach(tpl => {
+    const ddrType = tpl.DDR_TYPE || "LPDDR5X";
+    const ddrVendor = tpl.DDR_VENDOR || "SKhynix";
     const card = document.createElement("div");
     card.className = "tpl-card";
     card.innerHTML = `
@@ -126,7 +125,7 @@ function renderTemplates() {
       <div class="tpl-meta">
         <span>型号: <b>${tpl.MODEL || "-"}</b></span>
         <span>SoC: <b>${tpl.SOC_MACHINE || tpl.SOC_MODEL || "-"} (#${tpl.SOC_ID || "618"})</b></span>
-        <span>VFS 运存: <b>${tpl.RAM_GB || 16} GB</b></span>
+        <span>对称内存: <b>${tpl.RAM_GB || 16}GB ${ddrType} (${ddrVendor})</b></span>
         <span>CPU 拓扑: <b>${tpl.CPU_CORES || 8}核 @ ${((tpl.CPU_MAX_FREQ || 4320000) / 1e6).toFixed(2)}GHz</b></span>
       </div>
       <div class="tpl-actions">
@@ -188,8 +187,9 @@ function renderAppList() {
         <div class="app-switches">
           <span class="sw-pill ${route.build ? "on" : ""}" data-sw="build">🧬 Bionic/ART属性: ${route.build ? "开" : "关"}</span>
           <span class="sw-pill ${route.gl ? "on" : ""}" data-sw="gl">🎮 Vulkan/GLES/DRM: ${route.gl ? "开" : "关"}</span>
-          <span class="sw-pill ${route.vfs ? "on" : ""}" data-sw="vfs">🛡️ 隐身VFS/Maps净化: ${route.vfs ? "开" : "关"}</span>
-          <span class="sw-pill ${route.probe ? "probe-on" : ""}" data-sw="probe">📡 幻境探针: ${route.probe ? "嗅探中" : "关"}</span>
+          <span class="sw-pill ${route.vfs ? "on" : ""}" data-sw="vfs">🛡️ 对称内存/隐身VFS: ${route.vfs ? "开" : "关"}</span>
+          <span class="sw-pill ${route.probe ? "probe-on" : ""}" data-sw="probe">📡 探针与调用栈: ${route.probe ? "嗅探中" : "关"}</span>
+          <span class="sw-pill ${route.sdkSpoof ? "sdk-on" : ""}" data-sw="sdkSpoof" title="默认关闭以保护应用不因跨 Android 版本调错 API 闪退">⚠️ 强改SDK版本: ${route.sdkSpoof ? "开" : "关(安全)"}</span>
         </div>
       `;
     }
@@ -215,8 +215,8 @@ function renderAppList() {
     const selectEl = row.querySelector("select");
     selectEl.value = currentTpl;
 
-    const pushRouteToCli = async (tplId, b, g, v, p, restart = false) => {
-      const cmd = `"${CLI_BIN}" route set "${pkg}" "${tplId}" --build ${b ? 1 : 0} --gl ${g ? 1 : 0} --vfs ${v ? 1 : 0} --probe ${p ? 1 : 0} ${restart ? "--restart" : ""}`;
+    const pushRouteToCli = async (tplId, b, g, v, p, s, restart = false) => {
+      const cmd = `"${CLI_BIN}" route set "${pkg}" "${tplId}" --build ${b ? 1 : 0} --gl ${g ? 1 : 0} --vfs ${v ? 1 : 0} --probe ${p ? 1 : 0} --sdk ${s ? 1 : 0} ${restart ? "--restart" : ""}`;
       await ksuExec(cmd);
       await syncStateFromCli();
     };
@@ -230,6 +230,7 @@ function renderAppList() {
           route ? route.gl : true,
           route ? route.vfs : true,
           route ? route.probe : false,
+          route ? Boolean(route.sdkSpoof) : false,
           false
         );
         toast(`已为 ${app.appLabel} 挂载全息引擎`);
@@ -250,7 +251,15 @@ function renderAppList() {
         if (!route) return;
         const key = pill.dataset.sw;
         const nextRoute = { ...route, [key]: !route[key] };
-        await pushRouteToCli(nextRoute.tplId, nextRoute.build, nextRoute.gl, nextRoute.vfs, nextRoute.probe, false);
+        await pushRouteToCli(
+          nextRoute.tplId,
+          nextRoute.build,
+          nextRoute.gl,
+          nextRoute.vfs,
+          nextRoute.probe,
+          Boolean(nextRoute.sdkSpoof),
+          false
+        );
       };
     });
 
@@ -258,36 +267,69 @@ function renderAppList() {
   });
 }
 
-// 刷新注入遥测与幻境探针雷达 (调用 mirageforge_cli probe list --json)
+// 刷新崩溃现场、注入遥测与带调用栈的幻境探针雷达
 async function refreshProbeAndTelemetry() {
-  // 1. 读取最近注入遥测
-  const teleRes = await ksuExec(`tail -n 25 "${LAUNCH_LOG}" 2>/dev/null`);
+  // 1. 查询 Native 崩溃信号日志 (mirageforge_cli probe crashes --json)
+  const crashRes = await ksuExec(`"${CLI_BIN}" probe crashes --limit 25 --json`);
+  const crashEl = document.getElementById("crashLogList");
+  crashEl.innerHTML = "";
+  let crashes = [];
+  if (crashRes.errno === 0 && crashRes.stdout.trim()) {
+    try { crashes = JSON.parse(crashRes.stdout); } catch (e) {}
+  }
+
+  if (!Array.isArray(crashes) || crashes.length === 0) {
+    crashEl.innerHTML = `<div class="probe-empty">运行正常，未捕获到任何应用 Native 崩溃信号。</div>`;
+  } else {
+    crashes.forEach(c => {
+      const row = document.createElement("div");
+      row.className = "probe-row crash-row";
+      row.innerHTML = `
+        <div class="probe-row-head">
+          <div>
+            <span class="probe-tag crash">${c.signal}</span>
+            <b style="color:#ff8da3;margin-left:6px;">${c.pkg}</b>
+            <span style="color:#f0f6fc;margin-left:8px;">${c.detail}</span>
+          </div>
+        </div>
+        ${c.stack ? `<div class="stack-trace crash-stack">💥 Crash Stack: ${c.stack}</div>` : ""}
+      `;
+      crashEl.appendChild(row);
+    });
+  }
+
+  // 2. 查询注入遥测 (mirageforge_cli probe telemetry --json)
+  const teleRes = await ksuExec(`"${CLI_BIN}" probe telemetry --limit 25 --json`);
   const teleEl = document.getElementById("telemetryList");
   teleEl.innerHTML = "";
-  const teleLines = (teleRes.stdout || "").split(/\r?\n/).filter(Boolean).reverse();
-  if (teleLines.length === 0) {
+  let teleList = [];
+  if (teleRes.errno === 0 && teleRes.stdout.trim()) {
+    try { teleList = JSON.parse(teleRes.stdout); } catch (e) {}
+  }
+
+  if (!Array.isArray(teleList) || teleList.length === 0) {
     teleEl.innerHTML = `<div class="probe-empty">暂无注入记录。启动任何已绑定模板的目标应用后会自动在此显示。</div>`;
   } else {
-    teleLines.forEach(line => {
-      const [ts, pkg, pid, model] = line.split("|");
-      if (!pkg) return;
-      const dateStr = ts ? new Date(Number(ts) * 1000).toLocaleTimeString() : "";
+    teleList.forEach(t => {
+      const dateStr = t.timestamp ? new Date(Number(t.timestamp) * 1000).toLocaleTimeString() : "";
       const row = document.createElement("div");
       row.className = "probe-row";
       row.innerHTML = `
-        <div>
-          <span class="probe-tag">INJECTED</span>
-          <b style="color:#00e5ff;margin-left:6px;">${pkg}</b>
-          <span style="color:#8b949e;margin-left:6px;">(PID: ${pid})</span>
-          <span style="color:#56d364;margin-left:8px;">➔ 伪装为: ${model}</span>
+        <div class="probe-row-head">
+          <div>
+            <span class="probe-tag">INJECTED</span>
+            <b style="color:#00e5ff;margin-left:6px;">${t.pkg}</b>
+            <span style="color:#8b949e;margin-left:6px;">(PID: ${t.pid})</span>
+            <span style="color:#56d364;margin-left:8px;">➔ ${t.model} · ${t.gpu} · ${t.ram}</span>
+          </div>
+          <span style="color:#8b949e;font-size:10px;">${dateStr}</span>
         </div>
-        <span style="color:#8b949e;font-size:10px;">${dateStr}</span>
       `;
       teleEl.appendChild(row);
     });
   }
 
-  // 2. 调用 mirageforge_cli probe list --json 获取结构化探针日志
+  // 3. 查询带调用栈的探针日志 (mirageforge_cli probe list --json)
   const filterVal = document.getElementById("probeFilterInput").value.trim();
   const unmappedFlag = appState.unmappedOnly ? "--unmapped" : "";
   const pkgOpt = filterVal ? `--pkg "${filterVal.replace(/"/g, "")}"` : "";
@@ -298,13 +340,11 @@ async function refreshProbeAndTelemetry() {
 
   let events = [];
   if (res.errno === 0 && res.stdout.trim()) {
-    try {
-      events = JSON.parse(res.stdout);
-    } catch (e) {}
+    try { events = JSON.parse(res.stdout); } catch (e) {}
   }
 
   if (!Array.isArray(events) || events.length === 0) {
-    listEl.innerHTML = `<div class="probe-empty">暂无匹配的探针审计记录。请先在「应用分流矩阵」中点亮目标应用的 [📡 幻境探针] 并启动该应用。</div>`;
+    listEl.innerHTML = `<div class="probe-empty">暂无匹配的探针审计记录。请先在「应用分流矩阵」中点亮目标应用的 [📡 探针与调用栈] 并启动该应用。</div>`;
     return;
   }
 
@@ -315,14 +355,21 @@ async function refreshProbeAndTelemetry() {
       ? `<button class="btn-capture" data-pkg="${ev.pkg}" data-key="${ev.key}">+ 捕获入库</button>`
       : "";
 
+    const stackHtml = ev.stack
+      ? `<div class="stack-trace">↳ 调用栈: ${ev.stack}</div>`
+      : "";
+
     row.innerHTML = `
-      <div style="min-width:0;word-break:break-all;">
-        <span class="probe-tag ${ev.unmapped ? "unmapped" : ""}">${ev.domain}</span>
-        <b style="color:#00e5ff;margin-left:6px;">${ev.pkg}</b>
-        <span style="margin-left:8px;color:#f0f6fc;">${ev.key}</span>
-        <span style="color:#8b949e;"> ➔ ${ev.value}</span>
+      <div class="probe-row-head">
+        <div style="min-width:0;word-break:break-all;">
+          <span class="probe-tag ${ev.unmapped ? "unmapped" : ""}">${ev.domain}</span>
+          <b style="color:#00e5ff;margin-left:6px;">${ev.pkg}</b>
+          <span style="margin-left:8px;color:#f0f6fc;">${ev.key}</span>
+          <span style="color:#8b949e;"> ➔ ${ev.value}</span>
+        </div>
+        ${actionBtnHtml}
       </div>
-      ${actionBtnHtml}
+      ${stackHtml}
     `;
 
     const capBtn = row.querySelector(".btn-capture");
@@ -367,6 +414,8 @@ function openTemplateModal(tpl = null) {
   document.getElementById("tplCpuCores").value = tpl ? (tpl.CPU_CORES || 8) : 8;
   document.getElementById("tplCpuFreq").value = tpl ? (tpl.CPU_MAX_FREQ || 4320000) : 4320000;
   document.getElementById("tplRamGb").value = tpl ? (tpl.RAM_GB || 16) : 16;
+  document.getElementById("tplDdrType").value = tpl ? (tpl.DDR_TYPE || "LPDDR5X") : "LPDDR5X";
+  document.getElementById("tplDdrVendor").value = tpl ? (tpl.DDR_VENDOR || "SKhynix") : "SKhynix";
   document.getElementById("tplSocId").value = tpl ? (tpl.SOC_ID || "618") : "618";
   document.getElementById("tplSocMachine").value = tpl ? (tpl.SOC_MACHINE || "SM8750") : "SM8750";
   document.getElementById("tplKernelRel").value = tpl ? (tpl.KERNEL_RELEASE || "6.6.30-android15-8-g94b8f12ab4c1") : "6.6.30-android15-8-g94b8f12ab4c1";
@@ -375,7 +424,6 @@ function openTemplateModal(tpl = null) {
   document.getElementById("templateModal").classList.add("show");
 }
 
-// 调用 C++ mirageforge_cli parse-prop - 解析 build.prop 文本
 async function parsePropViaCli(rawText) {
   if (!rawText || !rawText.trim()) {
     toast("请先粘贴或导入 build.prop 内容");
@@ -413,12 +461,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
 
   document.getElementById("btnExportJson").onclick = async () => {
-    const outPath = "/sdcard/Download/MirageForge_v1.0.0_Backup.json";
+    const outPath = "/sdcard/Download/MirageForge_v1.0.1_Backup.json";
     await ksuExec(`"${CLI_BIN}" export "${outPath}"`);
     toast(`已通过 CLI 导出备份至 ${outPath}`);
   };
 
-  // 通过 Base64 管道将模板 JSON 提交给 mirageforge_cli template set-stdin
   document.getElementById("btnSaveTemplate").onclick = async () => {
     const id = document.getElementById("tplId").value.trim();
     const name = document.getElementById("tplName").value.trim();
@@ -456,6 +503,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       CPU_CORES: String(parseInt(document.getElementById("tplCpuCores").value, 10) || 8),
       CPU_MAX_FREQ: String(parseInt(document.getElementById("tplCpuFreq").value, 10) || 4320000),
       RAM_GB: String(parseInt(document.getElementById("tplRamGb").value, 10) || 16),
+      DDR_TYPE: document.getElementById("tplDdrType").value.trim() || "LPDDR5X",
+      DDR_VENDOR: document.getElementById("tplDdrVendor").value.trim() || "SKhynix",
       SOC_ID: document.getElementById("tplSocId").value.trim() || "618",
       SOC_MACHINE: document.getElementById("tplSocMachine").value.trim() || "SM8750",
       KERNEL_RELEASE: document.getElementById("tplKernelRel").value.trim(),
@@ -530,11 +579,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("btnClearProbe").onclick = async () => {
     await ksuExec(`"${CLI_BIN}" probe clear`);
     refreshProbeAndTelemetry();
-    toast("已清空探针日志");
+    toast("已清空探针与崩溃日志缓冲区");
   };
 
   document.getElementById("btnClearTelemetry").onclick = async () => {
-    await ksuExec(`rm -f "${LAUNCH_LOG}"`);
+    await ksuExec(`"${CLI_BIN}" probe clear-telemetry`);
     refreshProbeAndTelemetry();
     toast("已清空注入遥测记录");
   };
