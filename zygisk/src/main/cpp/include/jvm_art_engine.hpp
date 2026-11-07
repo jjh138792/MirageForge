@@ -1,201 +1,422 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <cinttypes>
-#include <set>
-#include <mutex>
-#include <dlfcn.h>
-#include <sys/sysmacros.h>
-#include "zygisk.hpp"
+#include <sstream>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
+#include <sys/stat.h>
+#include <linux/memfd.h>
 #include "mirage_shared.hpp"
-#include "bionic_prop_engine.hpp"
-#include "vfs_sysinfo_engine.hpp"
-#include "graphics_vulkan_gles.hpp"
+#include "fd_cloak_tracker.hpp"
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
 
 namespace mirage {
 
-inline zygisk::Api *g_zygisk_api = nullptr;
-inline std::mutex g_maps_mtx;
-inline std::set<std::pair<dev_t, ino_t>> g_hooked_elves;
+inline int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
+inline int (*orig_openat_2)(int dirfd, const char *pathname, int flags) = nullptr;
+inline int (*orig_open)(const char *pathname, int flags, mode_t mode) = nullptr;
+inline FILE *(*orig_fopen)(const char *pathname, const char *mode) = nullptr;
+inline FILE *(*orig_fopen64)(const char *pathname, const char *mode) = nullptr;
+inline int (*orig_close)(int fd) = nullptr;
+inline ssize_t (*orig_readlink)(const char *pathname, char *buf, size_t bufsiz) = nullptr;
+inline ssize_t (*orig_readlinkat)(int dirfd, const char *pathname, char *buf, size_t bufsiz) = nullptr;
+inline int (*orig_fstat)(int fd, struct stat *statbuf) = nullptr;
+inline FILE *(*orig_popen)(const char *command, const char *type) = nullptr;
+inline int (*orig_uname)(struct utsname *buf) = nullptr;
+inline int (*orig_sysinfo)(struct sysinfo *info) = nullptr;
+inline long (*orig_sysconf)(int name) = nullptr;
 
-inline void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
-inline void *(*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
-inline void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
-
-inline void scan_and_commit_plt_hooks();
-
-inline void *hook_dlsym(void *handle, const char *symbol) {
-    if (symbol && !g_tls_in_hook) {
-        if (g_ctx.enable_build_props) {
-            if (std::strcmp(symbol, "__system_property_find") == 0) return reinterpret_cast<void *>(hook_system_property_find);
-            if (std::strcmp(symbol, "__system_property_read_callback") == 0) return reinterpret_cast<void *>(hook_system_property_read_callback);
-            if (std::strcmp(symbol, "__system_property_read") == 0) return reinterpret_cast<void *>(hook_system_property_read);
-            if (std::strcmp(symbol, "__system_property_get") == 0) return reinterpret_cast<void *>(hook_system_property_get);
-            if (std::strcmp(symbol, "__system_property_foreach") == 0) return reinterpret_cast<void *>(hook_system_property_foreach);
-            if (std::strcmp(symbol, "popen") == 0) return reinterpret_cast<void *>(hook_popen);
-            if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
-        }
-        if (g_ctx.enable_vfs_shield) {
-            if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
-            if (std::strcmp(symbol, "__openat_2") == 0) return reinterpret_cast<void *>(hook_openat_2);
-            if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
-            if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
-            if (std::strcmp(symbol, "readlink") == 0) return reinterpret_cast<void *>(hook_readlink);
-            if (std::strcmp(symbol, "readlinkat") == 0) return reinterpret_cast<void *>(hook_readlinkat);
-            if (std::strcmp(symbol, "fstat") == 0) return reinterpret_cast<void *>(hook_fstat);
-            if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
-            if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
-            if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
-        }
-        if (g_ctx.enable_gl_vulkan) {
-            if (std::strcmp(symbol, "glGetString") == 0) return reinterpret_cast<void *>(hook_glGetString);
-            if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hook_eglGetProcAddress);
-            if (std::strcmp(symbol, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<void *>(hook_vkGetInstanceProcAddr);
-            if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties") == 0) return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties);
-            if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties2") == 0) return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2);
-        }
-    }
-    return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
+// 计算扣除硬件 Carveout (約 6.5% 预留给 Modem/GPU/TZ) 后的真实感 MemTotal (kB)
+// 确保系统信息 App 将“已安装物理内存”识别为 16GB，同时“可用内存”显示为合理的 ~9.2GB
+inline uint64_t calc_realistic_memtotal_kb(int ram_gb) {
+    uint64_t phys_kb = static_cast<uint64_t>(ram_gb > 0 ? ram_gb : 16) * 1024ULL * 1024ULL;
+    return (phys_kb * 935ULL) / 1000ULL;
 }
 
-// 判断动态加载的库是否需要触发增量 PLT 扫描（跳过早已在 Zygote 中扫描过的系统基础库，消除启动卡顿）
-inline bool should_rescan_on_dlopen(const char *filename) {
-    if (!filename) return false;
-    if (std::strncmp(filename, "/system/", 8) == 0 ||
-        std::strncmp(filename, "/apex/", 6) == 0) {
-        return false;
+inline void build_vfs_topology() {
+    auto &files = g_ctx.vfs_files;
+    files.clear();
+
+    // 1. 全分区 build.prop
+    {
+        std::ostringstream ss;
+        ss << "# Generated by MirageForge v" << MIRAGE_ENGINE_VERSION << " VFS Hypervisor\n";
+        for (const auto &kv : g_ctx.prop_map) {
+            ss << kv.first << "=" << kv.second << "\n";
+        }
+        std::string prop_blob = ss.str();
+        files["/system/build.prop"] = prop_blob;
+        files["/system/etc/build.prop"] = prop_blob;
+        files["/vendor/build.prop"] = prop_blob;
+        files["/vendor/etc/build.prop"] = prop_blob;
+        files["/product/build.prop"] = prop_blob;
+        files["/product/etc/build.prop"] = prop_blob;
+        files["/odm/etc/build.prop"] = prop_blob;
+        files["/odm/build.prop"] = prop_blob;
     }
+
+    // 2. /proc/cpuinfo & CPU 频率与 ARM64 MIDR_EL1 寄存器拓扑
+    {
+        int cores = (g_ctx.cpu_cores > 0 && g_ctx.cpu_cores <= 16) ? g_ctx.cpu_cores : 8;
+        std::ostringstream ss;
+        ss << "Processor\t: AArch64 Processor rev 1 (aarch64)\n";
+        for (int i = 0; i < cores; ++i) {
+            ss << "processor\t: " << i << "\n"
+               << "BogoMIPS\t: 38.40\n"
+               << "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti\n"
+               << "CPU implementer\t: 0x41\n"
+               << "CPU architecture: 8\n"
+               << "CPU variant\t: 0x1\n"
+               << "CPU part\t: " << (i < 6 ? "0xd85" : "0xd87") << "\n"
+               << "CPU revision\t: 1\n\n";
+        }
+        ss << "Hardware\t: " << g_ctx.cpu_hardware << "\n";
+        files["/proc/cpuinfo"] = ss.str();
+
+        std::string core_range = "0-" + std::to_string(cores - 1) + "\n";
+        files["/sys/devices/system/cpu/present"] = core_range;
+        files["/sys/devices/system/cpu/possible"] = core_range;
+        files["/sys/devices/system/cpu/online"] = core_range;
+        files["/sys/devices/system/cpu/kernel_max"] = std::to_string(cores - 1) + "\n";
+
+        std::string max_freq = std::to_string(g_ctx.cpu_max_freq_khz) + "\n";
+        std::string midr = g_ctx.cpu_midr_el1 + "\n";
+        for (int i = 0; i < cores; ++i) {
+            std::string cpu_dir = "/sys/devices/system/cpu/cpu" + std::to_string(i);
+            files[cpu_dir + "/cpufreq/cpuinfo_max_freq"] = max_freq;
+            files[cpu_dir + "/cpufreq/scaling_max_freq"] = max_freq;
+            files[cpu_dir + "/regs/identification/midr_el1"] = midr;
+            files[cpu_dir + "/regs/identification/revidr_el1"] = "0x0000000000000000\n";
+        }
+    }
+
+    // 3. /proc/meminfo & 物理 DDR 硬件节点对称合成
+    {
+        int ram_gb = g_ctx.ram_gb > 0 ? g_ctx.ram_gb : 16;
+        uint64_t total_kb = calc_realistic_memtotal_kb(ram_gb);
+        uint64_t free_kb  = (total_kb * 24ULL) / 100ULL;
+        uint64_t avail_kb = (total_kb * 58ULL) / 100ULL; // ~58% 可用内存，符合真实 Android 负载
+        uint64_t cached_kb = (total_kb * 28ULL) / 100ULL;
+        uint64_t active_kb = (total_kb * 36ULL) / 100ULL;
+        uint64_t inactive_kb = (total_kb * 22ULL) / 100ULL;
+
+        std::ostringstream ss;
+        ss << "MemTotal:       " << total_kb << " kB\n"
+           << "MemFree:        " << free_kb << " kB\n"
+           << "MemAvailable:   " << avail_kb << " kB\n"
+           << "Buffers:          184320 kB\n"
+           << "Cached:         " << cached_kb << " kB\n"
+           << "SwapCached:            0 kB\n"
+           << "Active:         " << active_kb << " kB\n"
+           << "Inactive:       " << inactive_kb << " kB\n"
+           << "SwapTotal:       8388608 kB\n"
+           << "SwapFree:        8126464 kB\n";
+        files["/proc/meminfo"] = ss.str();
+
+        // 物理 DDR 规格节点（供 DevCheck / Device Info HW / AIDA64 / 系统设置读取“已安装内存: 16GB LPDDR5X”）
+        std::string ddr_desc = std::to_string(ram_gb) + "GB " + g_ctx.ddr_type + " (" + g_ctx.ddr_vendor + ")\n";
+        files["/proc/ddr_info"] = ddr_desc;
+        files["/sys/devices/system/chip-info/ddr_info"] = ddr_desc;
+        files["/sys/devices/system/chip-info/ddr_type"] = g_ctx.ddr_type + "\n";
+        files["/sys/devices/system/chip-info/ddr_size"] = std::to_string(ram_gb) + "GB\n";
+        files["/sys/firmware/devicetree/base/memory/ddr_device_type"] = g_ctx.ddr_type + "\n";
+    }
+
+    // 4. /proc/version & /proc/sys/kernel/osrelease
+    {
+        files["/proc/sys/kernel/osrelease"] = g_ctx.kernel_release + "\n";
+        files["/proc/version"] = "Linux version " + g_ctx.kernel_release + " (kleaf@build-host) " + g_ctx.kernel_version + "\n";
+    }
+
+    // 5. SoC & Adreno KGSL 硬件节点
+    {
+        files["/sys/class/kgsl/kgsl-3d0/gpu_model"] = g_ctx.gl_renderer + "\n";
+        files["/sys/devices/soc0/soc_id"] = g_ctx.soc_id + "\n";
+        files["/sys/devices/soc0/family"] = g_ctx.soc_family + "\n";
+        files["/sys/devices/soc0/machine"] = g_ctx.soc_machine + "\n";
+        files["/sys/devices/soc0/vendor"] = g_ctx.gl_vendor + "\n";
+    }
+}
+
+inline std::string normalize_vfs_path(const char *raw_path) {
+    if (!raw_path) return "";
+    std::string out;
+    out.reserve(std::strlen(raw_path));
+    bool prev_slash = false;
+    for (const char *p = raw_path; *p != '\0'; ++p) {
+        if (*p == '/') {
+            if (!prev_slash) out.push_back('/');
+            prev_slash = true;
+        } else {
+            out.push_back(*p);
+            prev_slash = false;
+        }
+    }
+    return out;
+}
+
+inline bool is_sensitive_proc_line(const char *line) {
+    return std::strstr(line, "mirage_forge") != nullptr ||
+           std::strstr(line, "zygisk") != nullptr ||
+           std::strstr(line, "magisk") != nullptr ||
+           std::strstr(line, "/data/adb") != nullptr ||
+           std::strstr(line, "kernelsu") != nullptr ||
+           std::strstr(line, "/memfd:") != nullptr ||
+           std::strstr(line, "apatch") != nullptr ||
+           std::strstr(line, "lsposed") != nullptr;
+}
+
+inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *out_clean) {
+    if (!g_ctx.enable_maps_cloak || !out_clean) return false;
+
+    bool is_maps = (norm_path == "/proc/self/maps" ||
+                    norm_path == "/proc/thread-self/maps" ||
+                    norm_path == "/proc/self/smaps");
+    bool is_mounts = (norm_path == "/proc/self/mountinfo" ||
+                      norm_path == "/proc/self/mounts" ||
+                      norm_path == "/proc/mounts");
+
+    if (!is_maps && !is_mounts) return false;
+
+    FILE *real_fp = orig_fopen ? orig_fopen(norm_path.c_str(), "r") : nullptr;
+    if (!real_fp) return false;
+
+    std::ostringstream clean_ss;
+    char line[1024];
+    size_t stripped = 0;
+    while (std::fgets(line, sizeof(line), real_fp)) {
+        if (is_sensitive_proc_line(line)) {
+            ++stripped;
+            continue;
+        }
+        clean_ss << line;
+    }
+    std::fclose(real_fp);
+
+    *out_clean = clean_ss.str();
+    emit_probe("MAPS_CLOAK", norm_path, "Stripped " + std::to_string(stripped) + " traces");
     return true;
 }
 
-inline void *hook_dlopen(const char *filename, int flags) {
-    void *handle = orig_dlopen ? orig_dlopen(filename, flags) : nullptr;
-    if (handle && should_rescan_on_dlopen(filename)) {
-        ScopedHookGuard guard;
-        if (guard) {
-            emit_probe("DLOPEN", filename, "Incremental PLT Hook");
-            scan_and_commit_plt_hooks();
-        }
+inline int open_cloaked_vfs_fd(const char *raw_path) {
+    if (!raw_path || !g_ctx.enable_vfs_shield) return -1;
+    std::string norm = normalize_vfs_path(raw_path);
+
+    const std::string *target_content = nullptr;
+    std::string dynamic_clean_content;
+
+    auto it = g_ctx.vfs_files.find(norm);
+    if (it != g_ctx.vfs_files.end()) {
+        target_content = &it->second;
+    } else if (sanitize_live_proc_file(norm, &dynamic_clean_content)) {
+        target_content = &dynamic_clean_content;
+    } else {
+        return -1;
     }
-    return handle;
+
+    int fd = static_cast<int>(syscall(__NR_memfd_create, "", MFD_CLOEXEC));
+    if (fd < 0) return -1;
+
+    if (!target_content->empty()) {
+        write_full(fd, target_content->data(), target_content->size());
+        lseek(fd, 0, SEEK_SET);
+    }
+
+    g_fd_cloak.register_fd(fd, norm, target_content->size());
+    emit_probe("VFS_OPEN", norm, "Cloaked(fd=" + std::to_string(fd) + ")");
+    return fd;
 }
 
-inline void *hook_android_dlopen_ext(const char *filename, int flags, const void *extinfo) {
-    void *handle = orig_android_dlopen_ext ? orig_android_dlopen_ext(filename, flags, extinfo) : nullptr;
-    if (handle && should_rescan_on_dlopen(filename)) {
-        ScopedHookGuard guard;
-        if (guard) {
-            emit_probe("DLOPEN_EXT", filename, "Incremental PLT Hook");
-            scan_and_commit_plt_hooks();
-        }
+inline int hook_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
+    ScopedHookGuard guard;
+    if (guard) {
+        int fake_fd = open_cloaked_vfs_fd(pathname);
+        if (fake_fd >= 0) return fake_fd;
     }
-    return handle;
+    return orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
 }
 
-inline void scan_and_commit_plt_hooks() {
-    if (!g_zygisk_api) return;
-    if (!g_maps_mtx.try_lock()) return; // 使用 try_lock 避免多线程并发 dlopen 阻塞主线程
-
-    FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
-    if (!fp) {
-        g_maps_mtx.unlock();
-        return;
+inline int hook_openat_2(int dirfd, const char *pathname, int flags) {
+    ScopedHookGuard guard;
+    if (guard) {
+        int fake_fd = open_cloaked_vfs_fd(pathname);
+        if (fake_fd >= 0) return fake_fd;
     }
+    return orig_openat_2 ? orig_openat_2(dirfd, pathname, flags) : -1;
+}
 
-    char line[1024];
-    bool dirty = false;
+inline int hook_open(const char *pathname, int flags, mode_t mode) {
+    ScopedHookGuard guard;
+    if (guard) {
+        int fake_fd = open_cloaked_vfs_fd(pathname);
+        if (fake_fd >= 0) return fake_fd;
+    }
+    return orig_open ? orig_open(pathname, flags, mode) : -1;
+}
 
-    while (std::fgets(line, sizeof(line), fp)) {
-        uintptr_t start = 0, end = 0, offset = 0;
-        unsigned int dev_maj = 0, dev_min = 0;
-        unsigned long inode_ul = 0;
-        char perms[8] = {0};
-        int path_pos = 0;
-
-        if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %" SCNxPTR " %x:%x %lu %n",
-                        &start, &end, perms, &offset, &dev_maj, &dev_min, &inode_ul, &path_pos) < 7) {
-            continue;
-        }
-        if (inode_ul == 0) continue;
-
-        char *path = line + path_pos;
-        while (*path == ' ' || *path == '\t') ++path;
-        size_t len = std::strlen(path);
-        while (len > 0 && (path[len - 1] == '\n' || path[len - 1] == '\r')) {
-            path[--len] = '\0';
-        }
-
-        // 只扫描真实 ELF 动态库 (.so)，跳过 .dex/.vdex/.art/.apk/.jar/字体/资源映射，大幅提速！
-        if (path[0] != '/' ||
-            std::strstr(path, ".so") == nullptr ||
-            std::strstr(path, "/libc.so") != nullptr ||
-            std::strstr(path, "/libdl.so") != nullptr ||
-            std::strstr(path, "/libart.so") != nullptr ||
-            std::strstr(path, "/linker") != nullptr ||
-            std::strstr(path, "mirage_forge") != nullptr) {
-            continue;
-        }
-
-        dev_t dev = makedev(dev_maj, dev_min);
-        ino_t inode = static_cast<ino_t>(inode_ul);
-        auto id_pair = std::make_pair(dev, inode);
-        if (!g_hooked_elves.insert(id_pair).second) {
-            continue;
-        }
-        dirty = true;
-
-        // 关键修复：若 orig_fn 已在 onLoad 中通过 dlsym 拿到真实地址，则传入 dummy 槽位，绝不覆写 orig_fn！
-        auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
-            void *dummy_old = nullptr;
-            void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &dummy_old;
-            g_zygisk_api->pltHookRegister(dev, inode, sym, new_fn, target_old);
-        };
-
-        reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
-        reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
-        reg("dlsym", reinterpret_cast<void *>(hook_dlsym), reinterpret_cast<void **>(&orig_dlsym));
-
-        if (g_ctx.enable_build_props || g_ctx.enable_probe) {
-            reg("__system_property_find", reinterpret_cast<void *>(hook_system_property_find), reinterpret_cast<void **>(&orig_system_property_find));
-            reg("__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read_callback), reinterpret_cast<void **>(&orig_system_property_read_callback));
-            reg("__system_property_read", reinterpret_cast<void *>(hook_system_property_read), reinterpret_cast<void **>(&orig_system_property_read));
-            reg("__system_property_get", reinterpret_cast<void *>(hook_system_property_get), reinterpret_cast<void **>(&orig_system_property_get));
-            reg("__system_property_foreach", reinterpret_cast<void *>(hook_system_property_foreach), reinterpret_cast<void **>(&orig_system_property_foreach));
-            reg("__system_property_find_nth", reinterpret_cast<void *>(hook_system_property_find_nth), reinterpret_cast<void **>(&orig_system_property_find_nth));
-            reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
-            reg("AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString));
-        }
-
-        if (g_ctx.enable_vfs_shield) {
-            reg("openat", reinterpret_cast<void *>(hook_openat), reinterpret_cast<void **>(&orig_openat));
-            reg("__openat_2", reinterpret_cast<void *>(hook_openat_2), reinterpret_cast<void **>(&orig_openat_2));
-            reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
-            reg("fopen", reinterpret_cast<void *>(hook_fopen), reinterpret_cast<void **>(&orig_fopen));
-            reg("fopen64", reinterpret_cast<void *>(hook_fopen64), reinterpret_cast<void **>(&orig_fopen64));
-            reg("close", reinterpret_cast<void *>(hook_close), reinterpret_cast<void **>(&orig_close));
-            reg("readlink", reinterpret_cast<void *>(hook_readlink), reinterpret_cast<void **>(&orig_readlink));
-            reg("readlinkat", reinterpret_cast<void *>(hook_readlinkat), reinterpret_cast<void **>(&orig_readlinkat));
-            reg("fstat", reinterpret_cast<void *>(hook_fstat), reinterpret_cast<void **>(&orig_fstat));
-            reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo));
-            reg("sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf));
-            reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
-        }
-
-        if (g_ctx.enable_gl_vulkan) {
-            reg("glGetString", reinterpret_cast<void *>(hook_glGetString), reinterpret_cast<void **>(&orig_glGetString));
-            reg("eglGetProcAddress", reinterpret_cast<void *>(hook_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
-            reg("vkGetInstanceProcAddr", reinterpret_cast<void *>(hook_vkGetInstanceProcAddr), reinterpret_cast<void **>(&orig_vkGetInstanceProcAddr));
-            reg("vkGetPhysicalDeviceProperties", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties));
-            reg("vkGetPhysicalDeviceProperties2", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties2));
+inline FILE *hook_fopen(const char *pathname, const char *mode) {
+    ScopedHookGuard guard;
+    if (guard) {
+        int fake_fd = open_cloaked_vfs_fd(pathname);
+        if (fake_fd >= 0) {
+            FILE *fp = fdopen(fake_fd, "r");
+            if (fp) return fp;
+            g_fd_cloak.unregister_fd(fake_fd);
+            if (orig_close) orig_close(fake_fd); else close(fake_fd);
         }
     }
-    std::fclose(fp);
+    return orig_fopen ? orig_fopen(pathname, mode) : nullptr;
+}
 
-    if (dirty) {
-        g_zygisk_api->pltHookCommit();
+inline FILE *hook_fopen64(const char *pathname, const char *mode) {
+    return hook_fopen(pathname, mode);
+}
+
+inline int hook_close(int fd) {
+    g_fd_cloak.unregister_fd(fd);
+    return orig_close ? orig_close(fd) : close(fd);
+}
+
+inline ssize_t hook_readlink(const char *pathname, char *buf, size_t bufsiz) {
+    ScopedHookGuard guard;
+    std::string cloaked_path;
+    if (guard && g_ctx.enable_vfs_shield && buf && bufsiz > 0 &&
+        g_fd_cloak.resolve_proc_fd_link(pathname, &cloaked_path)) {
+        size_t copy_len = std::min(bufsiz, cloaked_path.size());
+        std::memcpy(buf, cloaked_path.data(), copy_len);
+        emit_probe("FD_CLOAK", pathname, cloaked_path);
+        return static_cast<ssize_t>(copy_len);
     }
-    g_maps_mtx.unlock();
+    return orig_readlink ? orig_readlink(pathname, buf, bufsiz) : -1;
+}
+
+inline ssize_t hook_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
+    ScopedHookGuard guard;
+    std::string cloaked_path;
+    if (guard && g_ctx.enable_vfs_shield && buf && bufsiz > 0 &&
+        g_fd_cloak.resolve_proc_fd_link(pathname, &cloaked_path)) {
+        size_t copy_len = std::min(bufsiz, cloaked_path.size());
+        std::memcpy(buf, cloaked_path.data(), copy_len);
+        emit_probe("FD_CLOAK", pathname, cloaked_path);
+        return static_cast<ssize_t>(copy_len);
+    }
+    return orig_readlinkat ? orig_readlinkat(dirfd, pathname, buf, bufsiz) : -1;
+}
+
+inline int hook_fstat(int fd, struct stat *statbuf) {
+    if (g_ctx.enable_vfs_shield && g_fd_cloak.get_cloaked_stat(fd, statbuf)) {
+        return 0;
+    }
+    return orig_fstat ? orig_fstat(fd, statbuf) : -1;
+}
+
+// sysinfo() 严格对齐 Carveout 后的 MemTotal 与 MemAvailable
+inline int hook_sysinfo(struct sysinfo *info) {
+    int ret = orig_sysinfo ? orig_sysinfo(info) : sysinfo(info);
+    ScopedHookGuard guard;
+    if (guard && ret == 0 && info && g_ctx.enable_vfs_shield && g_ctx.ram_gb > 0) {
+        uint64_t total_bytes = calc_realistic_memtotal_kb(g_ctx.ram_gb) * 1024ULL;
+        uint32_t unit = info->mem_unit > 0 ? info->mem_unit : 1;
+        info->totalram = static_cast<unsigned long>(total_bytes / unit);
+        info->freeram  = (info->totalram * 58UL) / 100UL;
+        info->bufferram = (info->totalram * 4UL) / 100UL;
+        emit_probe("SYSINFO", "totalram", std::to_string(g_ctx.ram_gb) + "GB (" + g_ctx.ddr_type + ")");
+    }
+    return ret;
+}
+
+// sysconf(_SC_PHYS_PAGES) 严格对齐 Carveout 后的物理页数
+inline long hook_sysconf(int name) {
+    ScopedHookGuard guard;
+    if (guard && g_ctx.enable_vfs_shield) {
+        if (name == _SC_NPROCESSORS_CONF || name == _SC_NPROCESSORS_ONLN) {
+            emit_probe("SYSCONF", "_SC_NPROCESSORS", std::to_string(g_ctx.cpu_cores));
+            return g_ctx.cpu_cores > 0 ? g_ctx.cpu_cores : 8;
+        }
+        if (name == _SC_PHYS_PAGES && g_ctx.ram_gb > 0) {
+            long page_sz = orig_sysconf ? orig_sysconf(_SC_PAGESIZE) : 4096;
+            if (page_sz <= 0) page_sz = 4096;
+            uint64_t total_bytes = calc_realistic_memtotal_kb(g_ctx.ram_gb) * 1024ULL;
+            emit_probe("SYSCONF", "_SC_PHYS_PAGES", std::to_string(g_ctx.ram_gb) + "GB");
+            return static_cast<long>(total_bytes / static_cast<uint64_t>(page_sz));
+        }
+    }
+    return orig_sysconf ? orig_sysconf(name) : sysconf(name);
+}
+
+inline int hook_uname(struct utsname *buf) {
+    int ret = orig_uname ? orig_uname(buf) : uname(buf);
+    ScopedHookGuard guard;
+    if (guard && ret == 0 && buf && g_ctx.enable_vfs_shield) {
+        if (!g_ctx.cpu_arch.empty()) {
+            std::strncpy(buf->machine, g_ctx.cpu_arch.c_str(), sizeof(buf->machine) - 1);
+            buf->machine[sizeof(buf->machine) - 1] = '\0';
+        }
+        if (!g_ctx.kernel_release.empty()) {
+            std::strncpy(buf->release, g_ctx.kernel_release.c_str(), sizeof(buf->release) - 1);
+            buf->release[sizeof(buf->release) - 1] = '\0';
+        }
+        if (!g_ctx.kernel_version.empty()) {
+            std::strncpy(buf->version, g_ctx.kernel_version.c_str(), sizeof(buf->version) - 1);
+            buf->version[sizeof(buf->version) - 1] = '\0';
+        }
+        emit_probe("UNAME", "release/machine", std::string(buf->release) + " / " + buf->machine);
+    }
+    return ret;
+}
+
+inline FILE *hook_popen(const char *command, const char *type) {
+    ScopedHookGuard guard;
+    if (guard && command && g_ctx.enable_build_props) {
+        std::string cmd(command);
+        size_t first = cmd.find_first_not_of(" \t");
+        if (first != std::string::npos) cmd = cmd.substr(first);
+
+        if (cmd.rfind("getprop", 0) == 0 || cmd.rfind("/system/bin/getprop", 0) == 0) {
+            std::string output;
+            size_t sp = cmd.find(' ');
+            if (sp != std::string::npos) {
+                std::string arg = cmd.substr(sp + 1);
+                size_t a_start = arg.find_first_not_of(" \t\"'");
+                size_t a_end = arg.find_last_not_of(" \t\"'\r\n");
+                if (a_start != std::string::npos && a_end != std::string::npos && a_end >= a_start) {
+                    std::string key = arg.substr(a_start, a_end - a_start + 1);
+                    auto it = g_ctx.prop_map.find(key);
+                    if (it != g_ctx.prop_map.end()) {
+                        output = it->second + "\n";
+                        emit_probe("POPEN_GETPROP", key, it->second);
+                    }
+                }
+            } else {
+                std::ostringstream ss;
+                for (const auto &kv : g_ctx.prop_map) {
+                    ss << "[" << kv.first << "]: [" << kv.second << "]\n";
+                }
+                output = ss.str();
+                emit_probe("POPEN_GETPROP", "ALL", "Synthesized");
+            }
+
+            if (!output.empty()) {
+                int fd = static_cast<int>(syscall(__NR_memfd_create, "", MFD_CLOEXEC));
+                if (fd >= 0) {
+                    write_full(fd, output.data(), output.size());
+                    lseek(fd, 0, SEEK_SET);
+                    FILE *fp = fdopen(fd, "r");
+                    if (fp) return fp;
+                    if (orig_close) orig_close(fd); else close(fd);
+                }
+            }
+        }
+    }
+    return orig_popen ? orig_popen(command, type) : nullptr;
 }
 
 } // namespace mirage
