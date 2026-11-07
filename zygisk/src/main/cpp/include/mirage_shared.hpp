@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/system_properties.h>
 #include <android/log.h>
+#include "mirage_logger.hpp"
 
 #define LOG_TAG "MirageForge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -23,14 +24,34 @@
 
 namespace mirage {
 
-constexpr const char *MIRAGE_ENGINE_VERSION = "1.0.0";
+constexpr const char *MIRAGE_ENGINE_VERSION = "1.0.1";
 constexpr const char *CLI_BIN_PATH          = "/data/adb/modules/mirage_forge/bin/mirageforge_cli";
 constexpr const char *DATA_ROOT_DIR         = "/data/adb/mirage_forge";
 constexpr const char *ROUTES_DB_PATH        = "/data/adb/mirage_forge/routes.db";
 constexpr const char *APPS_CONF_DIR         = "/data/adb/mirage_forge/apps";
 constexpr const char *LAUNCH_LOG_PATH       = "/data/adb/mirage_forge/launch_history.log";
 
-// 编译期与运行期 FNV-1a 64位高速哈希
+// 线程局部重入保护器：防止 Hook 函数内部调用 libc 或 unwind 时触发递归死锁
+inline thread_local bool g_tls_in_hook = false;
+
+struct ScopedHookGuard {
+    bool entered;
+    ScopedHookGuard() noexcept {
+        if (g_tls_in_hook) {
+            entered = false;
+        } else {
+            g_tls_in_hook = true;
+            entered = true;
+        }
+    }
+    ~ScopedHookGuard() noexcept {
+        if (entered) {
+            g_tls_in_hook = false;
+        }
+    }
+    explicit operator bool() const noexcept { return entered; }
+};
+
 constexpr uint64_t fnv1a_64(const char *str, size_t len) noexcept {
     uint64_t hash = 14695981039346656037ULL;
     for (size_t i = 0; i < len; ++i) {
@@ -44,20 +65,20 @@ inline uint64_t hash_str(const std::string &s) noexcept {
     return fnv1a_64(s.data(), s.size());
 }
 
-// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构 (标准 POD 布局)
+// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构
 struct alignas(4) BionicPropInfoCompat {
-    uint32_t serial;              // 偏移 0..3 (偶数表示稳定状态)
+    uint32_t serial;              // 偏移 0..3
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
-    char name[1];                 // 偏移 96..N (柔性数组起始位)
+    char name[1];                 // 偏移 96..N
 };
 
 class SyntheticPropArena {
 public:
+    // 启动阶段预热完毕后，运行期查询完全无锁或极轻量读取
     const prop_info *obtain(const std::string &name, const std::string &val) {
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = by_name_.find(name);
         if (it != by_name_.end()) {
-            update_value(it->second, val);
             return reinterpret_cast<const prop_info *>(it->second);
         }
 
@@ -74,7 +95,6 @@ public:
 
         by_name_[name] = pi;
         long_values_[pi] = val;
-        ordered_list_.push_back(pi);
         return reinterpret_cast<const prop_info *>(pi);
     }
 
@@ -89,27 +109,10 @@ public:
         return true;
     }
 
-    std::vector<const prop_info *> snapshot_all() {
-        std::lock_guard<std::mutex> lock(mtx_);
-        std::vector<const prop_info *> res;
-        res.reserve(ordered_list_.size());
-        for (auto *p : ordered_list_) {
-            res.push_back(reinterpret_cast<const prop_info *>(p));
-        }
-        return res;
-    }
-
 private:
-    void update_value(BionicPropInfoCompat *pi, const std::string &val) {
-        std::strncpy(pi->value, val.c_str(), PROP_VALUE_MAX - 1);
-        pi->value[PROP_VALUE_MAX - 1] = '\0';
-        long_values_[pi] = val;
-    }
-
     std::mutex mtx_;
     std::unordered_map<std::string, BionicPropInfoCompat *> by_name_;
     std::unordered_map<BionicPropInfoCompat *, std::string> long_values_;
-    std::vector<BionicPropInfoCompat *> ordered_list_;
 };
 
 inline SyntheticPropArena g_prop_arena;
@@ -121,6 +124,7 @@ struct MirageContext {
     bool enable_vfs_shield = true;
     bool enable_maps_cloak = true;
     bool enable_probe = false;
+    bool force_spoof_sdk = false; // 默认 false，防止跨大版本修改 SDK_INT 导致应用调不存在的 API 闪退
 
     std::string pkg_name;
 
@@ -132,16 +136,18 @@ struct MirageContext {
     uint32_t vulkan_vendor_id = 0x5143;
     uint32_t vulkan_device_id = 0x43050000;
 
-    // VFS & Syscall 硬件参数
+    // VFS & Syscall & DDR 内存对称参数
     std::string cpu_hardware = "Qualcomm Technologies, Inc SM8750";
     std::string cpu_arch = "aarch64";
     std::string soc_id = "618";
     std::string soc_family = "Snapdragon";
     std::string soc_machine = "SM8750";
-    std::string cpu_midr_el1 = "0x00000000511f8000"; // Qualcomm Oryon / Cortex-X925 MIDR
+    std::string cpu_midr_el1 = "0x00000000511f8000";
     int cpu_cores = 8;
     int cpu_max_freq_khz = 4320000;
     int ram_gb = 16;
+    std::string ddr_type = "LPDDR5X";
+    std::string ddr_vendor = "SKhynix";
     std::string kernel_release = "6.6.30-android15-8-g94b8f12ab4c1";
     std::string kernel_version = "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025";
 
@@ -155,6 +161,8 @@ inline MirageContext g_ctx;
 inline std::mutex g_probe_mtx;
 inline std::unordered_set<uint64_t> g_probe_dedup;
 
+// 输出携带实时 Native 调用栈的探针审计日志
+// 格式: [PROBE][pkg][DOMAIN] key => val @@ caller_chain
 inline void emit_probe(const char *domain, const std::string &key, const std::string &val) {
     if (!g_ctx.enable_probe) return;
     std::string composite = std::string(domain) + ":" + key;
@@ -164,7 +172,9 @@ inline void emit_probe(const char *domain, const std::string &key, const std::st
         if (g_probe_dedup.size() > 1024) return;
         if (!g_probe_dedup.insert(h).second) return;
     }
-    LOGI("[PROBE][%s][%s] %s => %s", g_ctx.pkg_name.c_str(), domain, key.c_str(), val.c_str());
+    std::string stack = capture_caller_chain(2, 4);
+    LOGI("[PROBE][%s][%s] %s => %s @@ %s",
+         g_ctx.pkg_name.c_str(), domain, key.c_str(), val.c_str(), stack.c_str());
 }
 
 inline bool write_full(int fd, const void *buf, size_t len) {

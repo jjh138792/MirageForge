@@ -7,85 +7,6 @@
 
 namespace mirage {
 
-inline std::string query_prop_for_jni(const char *key, const char *def_val) {
-    if (!key) return def_val ? def_val : "";
-    if (g_ctx.enable_build_props) {
-        auto it = g_ctx.prop_map.find(key);
-        if (it != g_ctx.prop_map.end()) {
-            emit_probe("JNI_PROP", key, it->second);
-            return it->second;
-        }
-        if (g_ctx.enable_probe && std::strncmp(key, "ro.", 3) == 0) {
-            emit_probe("JNI_PROP_UNMAPPED", key, "<passthrough>");
-        }
-    }
-    char buf[PROP_VALUE_MAX] = {0};
-    if (orig_system_property_get && orig_system_property_get(key, buf) > 0) {
-        return std::string(buf);
-    }
-    return def_val ? def_val : "";
-}
-
-inline jstring JNICALL jni_native_get(JNIEnv *env, jclass, jstring keyJ, jstring defJ) {
-    if (!keyJ) return defJ;
-    const char *key = env->GetStringUTFChars(keyJ, nullptr);
-    const char *def = defJ ? env->GetStringUTFChars(defJ, nullptr) : nullptr;
-    std::string res = query_prop_for_jni(key, def);
-    if (key) env->ReleaseStringUTFChars(keyJ, key);
-    if (defJ && def) env->ReleaseStringUTFChars(defJ, def);
-    return env->NewStringUTF(res.c_str());
-}
-
-inline jint JNICALL jni_native_get_int(JNIEnv *env, jclass, jstring keyJ, jint defV) {
-    if (!keyJ) return defV;
-    const char *key = env->GetStringUTFChars(keyJ, nullptr);
-    std::string res = query_prop_for_jni(key, "");
-    if (key) env->ReleaseStringUTFChars(keyJ, key);
-    if (res.empty()) return defV;
-    char *end = nullptr;
-    long v = std::strtol(res.c_str(), &end, 0);
-    return (end != res.c_str()) ? static_cast<jint>(v) : defV;
-}
-
-inline jlong JNICALL jni_native_get_long(JNIEnv *env, jclass, jstring keyJ, jlong defV) {
-    if (!keyJ) return defV;
-    const char *key = env->GetStringUTFChars(keyJ, nullptr);
-    std::string res = query_prop_for_jni(key, "");
-    if (key) env->ReleaseStringUTFChars(keyJ, key);
-    if (res.empty()) return defV;
-    char *end = nullptr;
-    long long v = std::strtoll(res.c_str(), &end, 0);
-    return (end != res.c_str()) ? static_cast<jlong>(v) : defV;
-}
-
-inline jboolean JNICALL jni_native_get_boolean(JNIEnv *env, jclass, jstring keyJ, jboolean defV) {
-    if (!keyJ) return defV;
-    const char *key = env->GetStringUTFChars(keyJ, nullptr);
-    std::string res = query_prop_for_jni(key, "");
-    if (key) env->ReleaseStringUTFChars(keyJ, key);
-    if (res.empty()) return defV;
-    if (res == "1" || res == "true" || res == "y" || res == "yes" || res == "on") return JNI_TRUE;
-    if (res == "0" || res == "false" || res == "n" || res == "no" || res == "off") return JNI_FALSE;
-    return defV;
-}
-
-inline void register_system_properties_natives(JNIEnv *env) {
-    jclass sp_cls = env->FindClass("android/os/SystemProperties");
-    if (!sp_cls) {
-        env->ExceptionClear();
-        return;
-    }
-    JNINativeMethod methods[] = {
-        {"native_get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(jni_native_get)},
-        {"native_get_int", "(Ljava/lang/String;I)I", reinterpret_cast<void *>(jni_native_get_int)},
-        {"native_get_long", "(Ljava/lang/String;J)J", reinterpret_cast<void *>(jni_native_get_long)},
-        {"native_get_boolean", "(Ljava/lang/String;Z)Z", reinterpret_cast<void *>(jni_native_get_boolean)}
-    };
-    env->RegisterNatives(sp_cls, methods, sizeof(methods) / sizeof(methods[0]));
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    env->DeleteLocalRef(sp_cls);
-}
-
 inline void reflect_java_build_fields(JNIEnv *env) {
     auto set_str = [&](jclass cls, const char *name, const std::string &val) {
         jfieldID fid = env->GetStaticFieldID(cls, name, "Ljava/lang/String;");
@@ -151,9 +72,14 @@ inline void reflect_java_build_fields(JNIEnv *env) {
     if (ver_cls) {
         for (const auto &kv : g_ctx.version_map) {
             if (kv.first == "SDK_INT" || kv.first == "DEVICE_INITIAL_SDK_INT" || kv.first == "PREVIEW_SDK_INT") {
-                int sdk = std::atoi(kv.second.c_str());
-                if (sdk >= 0) set_int(ver_cls, kv.first.c_str(), sdk);
-            } else {
+                // 仅在显式开启 force_spoof_sdk 时才覆写 SDK_INT，防止跨 API 版本触发 NoSuchMethodError
+                if (g_ctx.force_spoof_sdk) {
+                    int sdk = std::atoi(kv.second.c_str());
+                    if (sdk > 0) set_int(ver_cls, kv.first.c_str(), sdk);
+                }
+            } else if (kv.first == "SECURITY_PATCH" || kv.first == "INCREMENTAL") {
+                set_str(ver_cls, kv.first.c_str(), kv.second);
+            } else if (kv.first == "RELEASE" && g_ctx.force_spoof_sdk) {
                 set_str(ver_cls, kv.first.c_str(), kv.second);
             }
         }

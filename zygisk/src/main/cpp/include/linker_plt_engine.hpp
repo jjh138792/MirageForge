@@ -26,7 +26,7 @@ inline void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
 inline void scan_and_commit_plt_hooks();
 
 inline void *hook_dlsym(void *handle, const char *symbol) {
-    if (symbol) {
+    if (symbol && !g_tls_in_hook) {
         if (g_ctx.enable_build_props) {
             if (std::strcmp(symbol, "__system_property_find") == 0) return reinterpret_cast<void *>(hook_system_property_find);
             if (std::strcmp(symbol, "__system_property_read_callback") == 0) return reinterpret_cast<void *>(hook_system_property_read_callback);
@@ -59,30 +59,49 @@ inline void *hook_dlsym(void *handle, const char *symbol) {
     return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
 }
 
+// 判断动态加载的库是否需要触发增量 PLT 扫描（跳过早已在 Zygote 中扫描过的系统基础库，消除启动卡顿）
+inline bool should_rescan_on_dlopen(const char *filename) {
+    if (!filename) return false;
+    if (std::strncmp(filename, "/system/", 8) == 0 ||
+        std::strncmp(filename, "/apex/", 6) == 0) {
+        return false;
+    }
+    return true;
+}
+
 inline void *hook_dlopen(const char *filename, int flags) {
     void *handle = orig_dlopen ? orig_dlopen(filename, flags) : nullptr;
-    if (handle && filename) {
-        emit_probe("DLOPEN", filename, "Incremental PLT Scan");
-        scan_and_commit_plt_hooks();
+    if (handle && should_rescan_on_dlopen(filename)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            emit_probe("DLOPEN", filename, "Incremental PLT Hook");
+            scan_and_commit_plt_hooks();
+        }
     }
     return handle;
 }
 
 inline void *hook_android_dlopen_ext(const char *filename, int flags, const void *extinfo) {
     void *handle = orig_android_dlopen_ext ? orig_android_dlopen_ext(filename, flags, extinfo) : nullptr;
-    if (handle && filename) {
-        emit_probe("DLOPEN_EXT", filename, "Incremental PLT Scan");
-        scan_and_commit_plt_hooks();
+    if (handle && should_rescan_on_dlopen(filename)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            emit_probe("DLOPEN_EXT", filename, "Incremental PLT Hook");
+            scan_and_commit_plt_hooks();
+        }
     }
     return handle;
 }
 
 inline void scan_and_commit_plt_hooks() {
     if (!g_zygisk_api) return;
-    std::lock_guard<std::mutex> lock(g_maps_mtx);
+    if (!g_maps_mtx.try_lock()) return; // 使用 try_lock 避免多线程并发 dlopen 阻塞主线程
 
     FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
-    if (!fp) return;
+    if (!fp) {
+        g_maps_mtx.unlock();
+        return;
+    }
 
     char line[1024];
     bool dirty = false;
@@ -107,9 +126,12 @@ inline void scan_and_commit_plt_hooks() {
             path[--len] = '\0';
         }
 
+        // 只扫描真实 ELF 动态库 (.so)，跳过 .dex/.vdex/.art/.apk/.jar/字体/资源映射，大幅提速！
         if (path[0] != '/' ||
+            std::strstr(path, ".so") == nullptr ||
             std::strstr(path, "/libc.so") != nullptr ||
             std::strstr(path, "/libdl.so") != nullptr ||
+            std::strstr(path, "/libart.so") != nullptr ||
             std::strstr(path, "/linker") != nullptr ||
             std::strstr(path, "mirage_forge") != nullptr) {
             continue;
@@ -123,8 +145,11 @@ inline void scan_and_commit_plt_hooks() {
         }
         dirty = true;
 
-        auto reg = [&](const char *sym, void *new_fn, void **old_fn) {
-            g_zygisk_api->pltHookRegister(dev, inode, sym, new_fn, old_fn);
+        // 关键修复：若 orig_fn 已在 onLoad 中通过 dlsym 拿到真实地址，则传入 dummy 槽位，绝不覆写 orig_fn！
+        auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
+            void *dummy_old = nullptr;
+            void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &dummy_old;
+            g_zygisk_api->pltHookRegister(dev, inode, sym, new_fn, target_old);
         };
 
         reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
@@ -170,6 +195,7 @@ inline void scan_and_commit_plt_hooks() {
     if (dirty) {
         g_zygisk_api->pltHookCommit();
     }
+    g_maps_mtx.unlock();
 }
 
 } // namespace mirage

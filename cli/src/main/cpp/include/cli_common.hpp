@@ -21,17 +21,18 @@
 
 namespace mirage::cli {
 
-constexpr const char *MIRAGE_VERSION      = "1.0.0";
-constexpr int         MIRAGE_VERSION_CODE = 100;
+constexpr const char *MIRAGE_VERSION      = "1.0.1";
+constexpr int         MIRAGE_VERSION_CODE = 101;
 
-constexpr const char *DATA_ROOT_DIR = "/data/adb/mirage_forge";
-constexpr const char *TPL_DIR       = "/data/adb/mirage_forge/templates";
-constexpr const char *APPS_DIR      = "/data/adb/mirage_forge/apps";
-constexpr const char *ROUTES_DB     = "/data/adb/mirage_forge/routes.db";
-constexpr const char *CONFIG_JSON   = "/data/adb/mirage_forge/config.json";
-constexpr const char *MODULE_DIR    = "/data/adb/modules/mirage_forge";
+constexpr const char *DATA_ROOT_DIR   = "/data/adb/mirage_forge";
+constexpr const char *TPL_DIR         = "/data/adb/mirage_forge/templates";
+constexpr const char *APPS_DIR        = "/data/adb/mirage_forge/apps";
+constexpr const char *ROUTES_DB       = "/data/adb/mirage_forge/routes.db";
+constexpr const char *CONFIG_JSON     = "/data/adb/mirage_forge/config.json";
+constexpr const char *LAUNCH_LOG_FILE = "/data/adb/mirage_forge/launch_history.log";
+constexpr const char *MODULE_DIR      = "/data/adb/modules/mirage_forge";
 
-// 全息机型模板结构体
+// 全息机型模板结构体 (v1.0.1 含物理 DDR 对称规格)
 struct DeviceTemplate {
     std::string id;
     std::string name;
@@ -58,11 +59,13 @@ struct DeviceTemplate {
     std::string gl_renderer = "Adreno (TM) 830";
     std::string gl_version = "OpenGL ES 3.2 V@0800.0";
 
-    // VFS & Syscall 硬件节点参数
+    // VFS & Syscall & 物理内存对称参数
     std::string cpu_hardware = "Qualcomm Technologies, Inc SM8750";
     int cpu_cores = 8;
     int cpu_max_freq = 4320000;
     int ram_gb = 16;
+    std::string ddr_type = "LPDDR5X";
+    std::string ddr_vendor = "SKhynix";
     std::string soc_id = "618";
     std::string soc_machine = "SM8750";
     std::string kernel_release = "6.6.30-android15-8-g94b8f12ab4c1";
@@ -72,7 +75,7 @@ struct DeviceTemplate {
     std::string custom_props;
 };
 
-// 应用级四维分流路由结构体
+// 应用级五维分流路由结构体
 struct AppRoute {
     std::string pkg_name;
     std::string tpl_id;
@@ -80,9 +83,9 @@ struct AppRoute {
     bool enable_gl = true;
     bool enable_vfs = true;
     bool enable_probe = false;
+    bool force_spoof_sdk = false; // 默认 false，防止跨 Android 大版本篡改 SDK_INT 引发应用崩溃
 };
 
-// 字符串工具函数
 inline std::string trim(const std::string &s) {
     size_t first = s.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return "";
@@ -126,7 +129,6 @@ inline bool is_safe_token(const std::string &s) {
     return s.find("..") == std::string::npos;
 }
 
-// JSON 字符串安全转义
 inline std::string json_escape(const std::string &s) {
     std::string out;
     out.reserve(s.size() + 16);
@@ -153,7 +155,6 @@ inline std::string json_escape(const std::string &s) {
     return out;
 }
 
-// 递归创建目录并赋权
 inline bool ensure_dir(const char *path, mode_t mode = 0700) {
     struct stat st{};
     if (stat(path, &st) == 0) {
@@ -167,7 +168,7 @@ inline bool ensure_dir(const char *path, mode_t mode = 0700) {
     return false;
 }
 
-// 原子级文件写入（先写 .tmp + fsync，再 rename 原子覆盖，防止并发读到半截文件）
+// 原子级文件写入（先写 .tmp + fsync，再 rename 原子覆盖）
 inline bool write_file_atomic(const std::string &path, const std::string &content, mode_t mode = 0600) {
     std::string tmp_path = path + ".tmp." + std::to_string(getpid());
     int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
@@ -206,7 +207,6 @@ inline std::string read_file_to_string(const std::string &path) {
     return ss.str();
 }
 
-// 轻量级扁平 JSON 字段提取器（用于解析 WebUI 传入的模板 JSON 对象）
 inline std::unordered_map<std::string, std::string> parse_flat_json_object(const std::string &json) {
     std::unordered_map<std::string, std::string> res;
     size_t i = 0, n = json.size();
@@ -218,7 +218,7 @@ inline std::unordered_map<std::string, std::string> parse_flat_json_object(const
     auto parse_str = [&]() -> std::string {
         std::string out;
         if (i >= n || json[i] != '\"') return out;
-        ++i; // skip opening quote
+        ++i;
         while (i < n) {
             char c = json[i++];
             if (c == '\"') break;
@@ -254,7 +254,7 @@ inline std::unordered_map<std::string, std::string> parse_flat_json_object(const
         std::string key = parse_str();
         skip_ws();
         if (i >= n || json[i] != ':') break;
-        ++i; // skip ':'
+        ++i;
         skip_ws();
 
         if (i >= n) break;
@@ -271,7 +271,6 @@ inline std::unordered_map<std::string, std::string> parse_flat_json_object(const
     return res;
 }
 
-// 将 DeviceTemplate 序列化为 JSON 对象字符串
 inline std::string template_to_json(const DeviceTemplate &t) {
     std::ostringstream ss;
     ss << "{"
@@ -301,6 +300,8 @@ inline std::string template_to_json(const DeviceTemplate &t) {
        << "\"CPU_CORES\":" << t.cpu_cores << ","
        << "\"CPU_MAX_FREQ\":" << t.cpu_max_freq << ","
        << "\"RAM_GB\":" << t.ram_gb << ","
+       << "\"DDR_TYPE\":\"" << json_escape(t.ddr_type) << "\","
+       << "\"DDR_VENDOR\":\"" << json_escape(t.ddr_vendor) << "\","
        << "\"SOC_ID\":\"" << json_escape(t.soc_id) << "\","
        << "\"SOC_MACHINE\":\"" << json_escape(t.soc_machine) << "\","
        << "\"KERNEL_RELEASE\":\"" << json_escape(t.kernel_release) << "\","
@@ -342,6 +343,8 @@ inline DeviceTemplate template_from_kv_map(const std::unordered_map<std::string,
     t.cpu_cores        = std::atoi(get("CPU_CORES", "8").c_str());
     t.cpu_max_freq     = std::atoi(get("CPU_MAX_FREQ", "4320000").c_str());
     t.ram_gb           = std::atoi(get("RAM_GB", "16").c_str());
+    t.ddr_type         = get("DDR_TYPE", "LPDDR5X");
+    t.ddr_vendor       = get("DDR_VENDOR", "SKhynix");
     t.soc_id           = get("SOC_ID", "618");
     t.soc_machine      = get("SOC_MACHINE", "SM8750");
     t.kernel_release   = get("KERNEL_RELEASE", "6.6.30-android15-8-g94b8f12ab4c1");

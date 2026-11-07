@@ -24,15 +24,18 @@ static void print_usage() {
         << "  template set-stdin                       Create or update template reading JSON from stdin\n"
         << "  template delete <id>                     Delete template and unbind apps\n\n"
         << "Prop Alchemy Commands:\n"
-        << "  parse-prop <file|-> [--save] [--id <id>] Parse build.prop & infer GPU/SoC/VFS topology\n\n"
+        << "  parse-prop <file|-> [--save] [--id <id>] Parse build.prop & infer GPU/SoC/DDR/VFS topology\n\n"
         << "App Route Commands:\n"
-        << "  route set <pkg> <tpl_id> [--build 0|1] [--gl 0|1] [--vfs 0|1] [--probe 0|1] [--restart]\n"
+        << "  route set <pkg> <tpl_id> [--build 0|1] [--gl 0|1] [--vfs 0|1] [--probe 0|1] [--sdk 0|1] [--restart]\n"
         << "  route remove <pkg> [--restart]           Remove spoofing for package\n\n"
         << "Zygisk & Probe Commands:\n"
         << "  zygisk-fetch <pkg>                       Output compiled KV config for Zygisk Companion\n"
-        << "  probe list [--pkg <p>] [--unmapped] [--json]\n"
+        << "  probe list [--pkg <p>] [--unmapped] [--limit <n>] [--json]\n"
+        << "  probe crashes [--limit <n>] [--json]     Show native crash signal diagnostics & backtraces\n"
+        << "  probe telemetry [--limit <n>] [--json]   Show app injection telemetry history\n"
         << "  probe capture <pkg> <key> <val>          Capture unmapped prop into bound template\n"
-        << "  probe clear                              Clear logcat probe buffer\n";
+        << "  probe clear                              Clear logcat probe & crash buffer\n"
+        << "  probe clear-telemetry                    Clear launch telemetry history\n";
 }
 
 static bool has_flag(int argc, char **argv, const std::string &flag) {
@@ -64,7 +67,6 @@ int main(int argc, char **argv) {
     std::string cmd = argv[1];
     bool json_mode = has_flag(argc, argv, "--json");
 
-    // 1. zygisk-fetch 高速通道：直接读取预编译的 /data/adb/mirage_forge/apps/<pkg>.conf
     if (cmd == "zygisk-fetch") {
         if (argc < 3 || !is_safe_token(argv[2])) return 1;
         std::string conf_path = std::string(APPS_DIR) + "/" + argv[2] + ".conf";
@@ -112,7 +114,8 @@ int main(int argc, char **argv) {
                           << " | Build:" << r.enable_build
                           << " GL:" << r.enable_gl
                           << " VFS:" << r.enable_vfs
-                          << " Probe:" << r.enable_probe << "]\n";
+                          << " Probe:" << r.enable_probe
+                          << " SDK:" << r.force_spoof_sdk << "]\n";
             }
         }
         return 0;
@@ -184,13 +187,14 @@ int main(int argc, char **argv) {
         std::string sub = (argc >= 3) ? argv[2] : "";
         if (sub == "set" && argc >= 5) {
             AppRoute r;
-            r.pkg_name     = argv[3];
-            r.tpl_id       = argv[4];
-            r.enable_build = (get_opt(argc, argv, "--build", "1") == "1");
-            r.enable_gl    = (get_opt(argc, argv, "--gl", "1") == "1");
-            r.enable_vfs   = (get_opt(argc, argv, "--vfs", "1") == "1");
-            r.enable_probe = (get_opt(argc, argv, "--probe", "0") == "1");
-            bool restart   = has_flag(argc, argv, "--restart");
+            r.pkg_name        = argv[3];
+            r.tpl_id          = argv[4];
+            r.enable_build    = (get_opt(argc, argv, "--build", "1") == "1");
+            r.enable_gl       = (get_opt(argc, argv, "--gl", "1") == "1");
+            r.enable_vfs      = (get_opt(argc, argv, "--vfs", "1") == "1");
+            r.enable_probe    = (get_opt(argc, argv, "--probe", "0") == "1");
+            r.force_spoof_sdk = (get_opt(argc, argv, "--sdk", "0") == "1");
+            bool restart      = has_flag(argc, argv, "--restart");
 
             bool ok = store.set_route(r, restart);
             std::cout << (ok ? "{\"ok\":true}\n" : "{\"ok\":false}\n");
@@ -206,16 +210,44 @@ int main(int argc, char **argv) {
 
     if (cmd == "probe") {
         std::string sub = (argc >= 3) ? argv[2] : "list";
+        size_t limit = static_cast<size_t>(std::atoi(get_opt(argc, argv, "--limit", "150").c_str()));
+        if (limit == 0) limit = 150;
+
         if (sub == "list") {
             std::string filter_pkg = get_opt(argc, argv, "--pkg");
             bool unmapped_only = has_flag(argc, argv, "--unmapped");
-            size_t limit = static_cast<size_t>(std::atoi(get_opt(argc, argv, "--limit", "150").c_str()));
-            auto events = ProbeDoctor::query_probe_logs(filter_pkg, unmapped_only, limit > 0 ? limit : 150);
+            auto events = ProbeDoctor::query_probe_logs(filter_pkg, unmapped_only, limit);
             if (json_mode) {
                 std::cout << ProbeDoctor::events_to_json(events) << "\n";
             } else {
                 for (const auto &e : events) {
-                    std::cout << "[" << e.domain << "] " << e.pkg << " : " << e.key << " => " << e.value << "\n";
+                    std::cout << "[" << e.domain << "] " << e.pkg << " : " << e.key << " => " << e.value;
+                    if (!e.stack.empty()) std::cout << "\n    \\_ Stack: " << e.stack;
+                    std::cout << "\n";
+                }
+            }
+            return 0;
+        }
+        if (sub == "crashes") {
+            auto crashes = ProbeDoctor::query_crash_logs(limit);
+            if (json_mode) {
+                std::cout << ProbeDoctor::crashes_to_json(crashes) << "\n";
+            } else {
+                for (const auto &c : crashes) {
+                    std::cout << "[CRASH][" << c.signal << "] " << c.pkg << " (" << c.detail << ")\n"
+                              << "    \\_ Stack: " << c.stack << "\n";
+                }
+            }
+            return 0;
+        }
+        if (sub == "telemetry") {
+            auto tele = ProbeDoctor::query_telemetry(limit);
+            if (json_mode) {
+                std::cout << ProbeDoctor::telemetry_to_json(tele) << "\n";
+            } else {
+                for (const auto &t : tele) {
+                    std::cout << "[PID:" << t.pid << "] " << t.pkg << " => " << t.model
+                              << " | " << t.gpu << " | " << t.ram << "\n";
                 }
             }
             return 0;
@@ -227,6 +259,11 @@ int main(int argc, char **argv) {
         }
         if (sub == "clear") {
             ProbeDoctor::clear_logs();
+            std::cout << "{\"ok\":true}\n";
+            return 0;
+        }
+        if (sub == "clear-telemetry") {
+            ProbeDoctor::clear_telemetry();
             std::cout << "{\"ok\":true}\n";
             return 0;
         }

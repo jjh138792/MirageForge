@@ -159,6 +159,10 @@ body {
   margin-bottom: 14px;
 }
 
+.crash-card {
+  border-color: rgba(255, 92, 124, 0.28);
+}
+
 .hint-text {
   font-size: 12px;
   color: var(--text-muted);
@@ -316,7 +320,7 @@ textarea:focus, input[type="text"]:focus, select:focus {
   border-color: var(--accent);
 }
 
-/* 应用分流列表 (含原生图标与标签) */
+/* 应用分流列表 */
 .app-list {
   display: flex;
   flex-direction: column;
@@ -356,9 +360,7 @@ textarea:focus, input[type="text"]:focus, select:focus {
   flex-shrink: 0;
 }
 
-.app-title-box {
-  min-width: 0;
-}
+.app-title-box { min-width: 0; }
 
 .app-label {
   font-size: 14px;
@@ -382,9 +384,7 @@ textarea:focus, input[type="text"]:focus, select:focus {
   flex-shrink: 0;
 }
 
-.app-select {
-  width: 185px;
-}
+.app-select { width: 185px; }
 
 .app-switches {
   display: flex;
@@ -419,7 +419,14 @@ textarea:focus, input[type="text"]:focus, select:focus {
   font-weight: 600;
 }
 
-/* 探针面板样式 */
+.sw-pill.sdk-on {
+  background: rgba(255, 184, 77, 0.18);
+  color: var(--warning);
+  border-color: rgba(255, 184, 77, 0.45);
+  font-weight: 600;
+}
+
+/* 探针与调用栈面板样式 */
 .probe-toolbar {
   display: flex;
   justify-content: space-between;
@@ -431,22 +438,50 @@ textarea:focus, input[type="text"]:focus, select:focus {
 .probe-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  max-height: 480px;
+  gap: 8px;
+  max-height: 520px;
   overflow-y: auto;
 }
 
 .probe-row {
-  background: rgba(0, 0, 0, 0.38);
+  background: rgba(0, 0, 0, 0.42);
   border: 1px solid var(--card-border);
   border-radius: 10px;
   padding: 9px 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
   display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.probe-row.crash-row {
+  background: rgba(255, 92, 124, 0.08);
+  border-color: rgba(255, 92, 124, 0.35);
+}
+
+.probe-row-head {
+  display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 10px;
+}
+
+.stack-trace {
+  font-size: 10.5px;
+  color: #a5d6ff;
+  background: rgba(124, 92, 255, 0.08);
+  border-left: 2px solid var(--accent);
+  padding: 4px 8px;
+  border-radius: 0 6px 6px 0;
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+.stack-trace.crash-stack {
+  color: #ffa198;
+  background: rgba(255, 92, 124, 0.12);
+  border-left-color: var(--danger);
 }
 
 .probe-tag {
@@ -464,6 +499,12 @@ textarea:focus, input[type="text"]:focus, select:focus {
   border: 1px solid rgba(255, 184, 77, 0.4);
 }
 
+.probe-tag.crash {
+  background: rgba(255, 92, 124, 0.25);
+  color: #ff8da3;
+  border: 1px solid rgba(255, 92, 124, 0.5);
+}
+
 .btn-capture {
   background: rgba(255, 184, 77, 0.16);
   color: var(--warning);
@@ -478,7 +519,7 @@ textarea:focus, input[type="text"]:focus, select:focus {
 .probe-empty {
   text-align: center;
   color: var(--text-muted);
-  padding: 28px;
+  padding: 22px;
   font-size: 12px;
 }
 

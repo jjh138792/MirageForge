@@ -1,4 +1,4 @@
-name: Build MirageForge v1.0.0 (Zygisk + CLI)
+name: Build MirageForge v1.0.1 (Zygisk + CLI)
 
 on:
   push:
@@ -69,10 +69,10 @@ jobs:
           chmod +x module/customize.sh module/action.sh module/uninstall.sh
           chmod +x module/bin/mirageforge_cli module/bin/*/mirageforge_cli
           cd module
-          zip -r9 ../MirageForge-Zygisk-v1.0.0.zip . -x "*.DS_Store"
+          zip -r9 ../MirageForge-Zygisk-v1.0.1.zip . -x "*.DS_Store"
 
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MirageForge-Zygisk-v1.0.0
-          path: MirageForge-Zygisk-v1.0.0.zip
+          name: MirageForge-Zygisk-v1.0.1
+          path: MirageForge-Zygisk-v1.0.1.zip

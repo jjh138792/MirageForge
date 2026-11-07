@@ -2,8 +2,8 @@
 SKIPUNZIP=1
 
 ui_print "========================================================"
-ui_print "   蜃楼工坊 · MirageForge v1.0.0                        "
-ui_print "   CLI-Driven Hardware Hypervisor & Probe Radar         "
+ui_print "   蜃楼工坊 · MirageForge v1.0.1                        "
+ui_print "   CLI-Driven Hardware Hypervisor & Stack Backtrace     "
 ui_print "========================================================"
 ui_print "- 设备架构: $ARCH ($ABI) | Android API: $API"
 
@@ -41,13 +41,14 @@ fi
 chmod 0755 "$MODPATH/bin/mirageforge_cli"
 chcon u:object_r:system_file:s0 "$MODPATH/bin/mirageforge_cli" 2>/dev/null
 
-# 创建 /system/bin 软链接，方便用户在终端直接运行 mirageforge_cli
+# 创建 /system/bin 软链接，方便在终端直接运行 mirageforge_cli
 mkdir -p "$MODPATH/system/bin"
 ln -sf "/data/adb/modules/mirage_forge/bin/mirageforge_cli" "$MODPATH/system/bin/mirageforge_cli"
 
-# 3. 调用 mirageforge_cli init 初始化数据中心与旗舰机型模板库
-ui_print "- 正在通过 mirageforge_cli 初始化全息模板库..."
+# 3. 调用 mirageforge_cli init 初始化数据中心与同步编译所有应用配置
+ui_print "- 正在通过 mirageforge_cli 初始化全息模板库与 DDR 对称配置..."
 "$MODPATH/bin/mirageforge_cli" init
+"$MODPATH/bin/mirageforge_cli" sync >/dev/null 2>&1
 
 # 4. 设置权限与安全上下文
 ui_print "- 正在设置文件权限与 SELinux 安全上下文..."
@@ -56,4 +57,4 @@ set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 
-ui_print "- MirageForge v1.0.0 安装完成！重启设备后生效。"
+ui_print "- MirageForge v1.0.1 安装完成！重启设备后生效。"

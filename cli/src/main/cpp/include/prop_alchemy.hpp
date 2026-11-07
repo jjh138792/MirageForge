@@ -15,6 +15,7 @@ public:
         std::string soc_id;
         std::string soc_machine;
         int max_freq_khz;
+        std::string ddr_type;
     };
 
     static InferredTopology infer_topology(const std::string &board, const std::string &soc_model) {
@@ -22,28 +23,28 @@ public:
         for (char &c : token) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
         if (token.find("sun") != std::string::npos || token.find("sm8750") != std::string::npos) {
-            return {"Qualcomm", "Adreno (TM) 830", "Qualcomm Technologies, Inc SM8750", "618", "SM8750", 4320000};
+            return {"Qualcomm", "Adreno (TM) 830", "Qualcomm Technologies, Inc SM8750", "618", "SM8750", 4320000, "LPDDR5X"};
         }
         if (token.find("pineapple") != std::string::npos || token.find("sm8650") != std::string::npos) {
-            return {"Qualcomm", "Adreno (TM) 750", "Qualcomm Technologies, Inc SM8650", "557", "SM8650", 3300000};
+            return {"Qualcomm", "Adreno (TM) 750", "Qualcomm Technologies, Inc SM8650", "557", "SM8650", 3300000, "LPDDR5X"};
         }
         if (token.find("kalama") != std::string::npos || token.find("sm8550") != std::string::npos) {
-            return {"Qualcomm", "Adreno (TM) 740", "Qualcomm Technologies, Inc SM8550", "519", "SM8550", 3190000};
+            return {"Qualcomm", "Adreno (TM) 740", "Qualcomm Technologies, Inc SM8550", "519", "SM8550", 3190000, "LPDDR5X"};
         }
         if (token.find("taro") != std::string::npos || token.find("sm8475") != std::string::npos) {
-            return {"Qualcomm", "Adreno (TM) 730", "Qualcomm Technologies, Inc SM8475", "530", "SM8475", 3190000};
+            return {"Qualcomm", "Adreno (TM) 730", "Qualcomm Technologies, Inc SM8475", "530", "SM8475", 3190000, "LPDDR5"};
         }
         if (token.find("mt6991") != std::string::npos) {
-            return {"ARM", "Immortalis-G925 MC12", "MT6991", "6991", "MT6991", 3620000};
+            return {"ARM", "Immortalis-G925 MC12", "MT6991", "6991", "MT6991", 3620000, "LPDDR5X"};
         }
         if (token.find("mt6989") != std::string::npos) {
-            return {"ARM", "Immortalis-G720 MC12", "MT6989", "6989", "MT6989", 3250000};
+            return {"ARM", "Immortalis-G720 MC12", "MT6989", "6989", "MT6989", 3250000, "LPDDR5X"};
         }
         if (token.find("mt6985") != std::string::npos) {
-            return {"ARM", "Immortalis-G715 MC11", "MT6985", "6985", "MT6985", 3050000};
+            return {"ARM", "Immortalis-G715 MC11", "MT6985", "6985", "MT6985", 3050000, "LPDDR5X"};
         }
         std::string fallback_soc = !soc_model.empty() ? soc_model : (!board.empty() ? board : "SM8750");
-        return {"Qualcomm", "Adreno (TM) 830", "Qualcomm Technologies, Inc " + fallback_soc, "618", fallback_soc, 4320000};
+        return {"Qualcomm", "Adreno (TM) 830", "Qualcomm Technologies, Inc " + fallback_soc, "618", fallback_soc, 4320000, "LPDDR5X"};
     }
 
     static bool parse_build_prop(const std::string &raw_text, DeviceTemplate *out_tpl, const std::string &custom_id = "") {
@@ -114,11 +115,35 @@ public:
             "ro.vendor.build.fingerprint", "ro.system.build.fingerprint", "ro.odm.build.fingerprint"
         });
 
+        // 提取可能存在的原厂 DDR 信息
+        std::string raw_ddr = pick({"ro.boot.hardware.ddr", "ro.boot.ddr_info", "ro.hardware.ddr"});
+        std::string raw_ddr_type = pick({"ro.boot.ddr_type"});
+        std::string raw_ram_size = pick({"ro.boot.ddr_size", "ro.vendor.hw.ram", "ro.boot.ramsize"});
+
         if (model.empty() && brand.empty() && fingerprint.empty()) {
             return false;
         }
 
         InferredTopology topo = infer_topology(board, soc_model);
+
+        int detected_ram_gb = 16;
+        if (!raw_ram_size.empty()) {
+            int parsed_ram = std::atoi(raw_ram_size.c_str());
+            if (parsed_ram >= 4 && parsed_ram <= 32) detected_ram_gb = parsed_ram;
+        }
+
+        std::string detected_ddr_type = !raw_ddr_type.empty() ? raw_ddr_type : topo.ddr_type;
+        if (raw_ddr.find("LPDDR5T") != std::string::npos) detected_ddr_type = "LPDDR5T";
+        else if (raw_ddr.find("LPDDR5X") != std::string::npos) detected_ddr_type = "LPDDR5X";
+        else if (raw_ddr.find("LPDDR5") != std::string::npos) detected_ddr_type = "LPDDR5";
+        else if (raw_ddr.find("LPDDR4X") != std::string::npos) detected_ddr_type = "LPDDR4X";
+
+        std::string detected_ddr_vendor = "SKhynix";
+        if (raw_ddr.find("Samsung") != std::string::npos || raw_ddr.find("SAMSUNG") != std::string::npos) {
+            detected_ddr_vendor = "Samsung";
+        } else if (raw_ddr.find("Micron") != std::string::npos || raw_ddr.find("MICRON") != std::string::npos) {
+            detected_ddr_vendor = "Micron";
+        }
 
         std::string market_name;
         if (prop_map.count("ro.product.marketname")) market_name = prop_map["ro.product.marketname"];
@@ -154,13 +179,14 @@ public:
         t.cpu_hardware     = topo.cpu_hw;
         t.cpu_cores        = 8;
         t.cpu_max_freq     = topo.max_freq_khz;
-        t.ram_gb           = 16;
+        t.ram_gb           = detected_ram_gb;
+        t.ddr_type         = detected_ddr_type;
+        t.ddr_vendor       = detected_ddr_vendor;
         t.soc_id           = topo.soc_id;
         t.soc_machine      = topo.soc_machine;
         t.kernel_release   = "6.6.30-android15-8-g94b8f12ab4c1";
         t.kernel_version   = "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025";
 
-        // 收集剩余有价值的厂商专属属性 (上限 100 条)
         std::ostringstream extra_ss;
         int extra_count = 0;
         for (const std::string &k : ordered_keys) {

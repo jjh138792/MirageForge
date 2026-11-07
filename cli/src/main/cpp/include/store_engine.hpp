@@ -41,19 +41,20 @@ public:
             closedir(dir);
         }
 
-        // 2. 加载 /data/adb/mirage_forge/routes.db
+        // 2. 加载 /data/adb/mirage_forge/routes.db (兼容 6 列与 v1.0.1 的 7 列格式)
         std::string routes_raw = read_file_to_string(ROUTES_DB);
         for (const std::string &line : split_lines(routes_raw)) {
             if (line.empty() || line[0] == '#') continue;
             auto parts = split_char(line, '|');
             if (parts.size() >= 6 && is_safe_token(parts[0]) && !parts[1].empty()) {
                 AppRoute r;
-                r.pkg_name     = parts[0];
-                r.tpl_id       = parts[1];
-                r.enable_build = (parts[2] == "1");
-                r.enable_gl    = (parts[3] == "1");
-                r.enable_vfs   = (parts[4] == "1");
-                r.enable_probe = (parts[5] == "1");
+                r.pkg_name        = parts[0];
+                r.tpl_id          = parts[1];
+                r.enable_build    = (parts[2] == "1");
+                r.enable_gl       = (parts[3] == "1");
+                r.enable_vfs      = (parts[4] == "1");
+                r.enable_probe    = (parts[5] == "1");
+                r.force_spoof_sdk = (parts.size() >= 7 && parts[6] == "1");
                 routes_[r.pkg_name] = r;
             }
         }
@@ -64,15 +65,13 @@ public:
         ensure_dir(TPL_DIR, 0700);
         ensure_dir(APPS_DIR, 0700);
 
-        // 1. 保存所有模板文件
         for (const auto &kv : templates_) {
             std::string path = std::string(TPL_DIR) + "/" + kv.first + ".tpl";
             write_file_atomic(path, serialize_tpl_file(kv.second), 0600);
         }
 
-        // 2. 保存 routes.db
         std::ostringstream r_ss;
-        r_ss << "# MirageForge v1.0.0 Routes Table\n";
+        r_ss << "# MirageForge v" << MIRAGE_VERSION << " Routes Table\n";
         for (const auto &kv : routes_) {
             const AppRoute &r = kv.second;
             if (templates_.find(r.tpl_id) == templates_.end()) continue;
@@ -80,11 +79,11 @@ public:
                  << (r.enable_build ? "1" : "0") << "|"
                  << (r.enable_gl ? "1" : "0") << "|"
                  << (r.enable_vfs ? "1" : "0") << "|"
-                 << (r.enable_probe ? "1" : "0") << "\n";
+                 << (r.enable_probe ? "1" : "0") << "|"
+                 << (r.force_spoof_sdk ? "1" : "0") << "\n";
         }
         write_file_atomic(ROUTES_DB, r_ss.str(), 0600);
 
-        // 3. 清理旧的 apps/*.conf 并重新原子编译所有有效分流
         std::unordered_map<std::string, bool> valid_confs;
         for (const auto &kv : routes_) {
             const AppRoute &r = kv.second;
@@ -111,7 +110,6 @@ public:
             closedir(adir);
         }
 
-        // 4. 同步导出标准 config.json 供外部备份与兼容读取
         write_file_atomic(CONFIG_JSON, export_full_json(), 0600);
         return true;
     }
@@ -158,107 +156,136 @@ public:
         std::system(cmd.c_str());
     }
 
-    // 编译供 Zygisk Native 引擎极速读取的 .conf 内容
+    // 编译供 Zygisk Native v1.0.1 极速直读的 .conf 内容（包含 DDR 物理内存对称属性与 SDK 保护开关）
     static std::string compile_runtime_conf(const DeviceTemplate &tpl, const AppRoute &route) {
         std::string abis = tpl.supported_abis.empty() ? "arm64-v8a,armeabi-v7a,armeabi" : tpl.supported_abis;
         long long build_utc = std::atoll(tpl.build_time.c_str()) / 1000LL;
         if (build_utc <= 0) build_utc = 1736899200LL;
 
+        int ram_gb = tpl.ram_gb > 0 ? tpl.ram_gb : 16;
+        std::string ram_str = std::to_string(ram_gb) + "GB";
+        std::string ram_mb_str = std::to_string(ram_gb * 1024);
+        std::string ddr_type = tpl.ddr_type.empty() ? "LPDDR5X" : tpl.ddr_type;
+        std::string ddr_vendor = tpl.ddr_vendor.empty() ? "SKhynix" : tpl.ddr_vendor;
+        std::string ddr_full = ram_str + "," + ddr_vendor + "," + ddr_type;
+
         std::vector<std::pair<std::string, std::string>> entries = {
-            {"META:ENABLE_BUILD", route.enable_build ? "1" : "0"},
-            {"META:ENABLE_GL",    route.enable_gl ? "1" : "0"},
-            {"META:ENABLE_VFS",   route.enable_vfs ? "1" : "0"},
-            {"META:ENABLE_PROBE", route.enable_probe ? "1" : "0"},
+            {"META:ENABLE_BUILD",    route.enable_build ? "1" : "0"},
+            {"META:ENABLE_GL",       route.enable_gl ? "1" : "0"},
+            {"META:ENABLE_VFS",      route.enable_vfs ? "1" : "0"},
+            {"META:ENABLE_PROBE",    route.enable_probe ? "1" : "0"},
+            {"META:FORCE_SPOOF_SDK", route.force_spoof_sdk ? "1" : "0"},
             // OpenGL ES & Vulkan
             {"GLES:VENDOR",       tpl.gl_vendor},
             {"GLES:RENDERER",     tpl.gl_renderer},
             {"GLES:VERSION",      tpl.gl_version},
-            // VFS & Syscall
-            {"VFS:CPU_HARDWARE",  tpl.cpu_hardware},
-            {"VFS:CPU_ARCH",      "aarch64"},
-            {"VFS:CPU_CORES",     std::to_string(tpl.cpu_cores)},
-            {"VFS:CPU_MAX_FREQ",  std::to_string(tpl.cpu_max_freq)},
-            {"VFS:RAM_GB",        std::to_string(tpl.ram_gb)},
-            {"VFS:SOC_ID",        tpl.soc_id},
-            {"VFS:SOC_MACHINE",   tpl.soc_machine},
-            {"VFS:KERNEL_RELEASE",tpl.kernel_release},
-            {"VFS:KERNEL_VERSION",tpl.kernel_version},
+            // VFS & Syscall & 物理内存对称
+            {"VFS:CPU_HARDWARE",   tpl.cpu_hardware},
+            {"VFS:CPU_ARCH",       "aarch64"},
+            {"VFS:CPU_CORES",      std::to_string(tpl.cpu_cores)},
+            {"VFS:CPU_MAX_FREQ",   std::to_string(tpl.cpu_max_freq)},
+            {"VFS:RAM_GB",         std::to_string(ram_gb)},
+            {"VFS:DDR_TYPE",       ddr_type},
+            {"VFS:DDR_VENDOR",     ddr_vendor},
+            {"VFS:SOC_ID",         tpl.soc_id},
+            {"VFS:SOC_MACHINE",    tpl.soc_machine},
+            {"VFS:KERNEL_RELEASE", tpl.kernel_release},
+            {"VFS:KERNEL_VERSION", tpl.kernel_version},
             // Java Build 反射
-            {"BUILD:MODEL",               tpl.model},
-            {"BUILD:BRAND",               tpl.brand},
-            {"BUILD:MANUFACTURER",        tpl.manufacturer},
-            {"BUILD:DEVICE",              tpl.device},
-            {"BUILD:PRODUCT",             tpl.product},
-            {"BUILD:HARDWARE",            tpl.hardware},
-            {"BUILD:BOARD",               tpl.board},
-            {"BUILD:BOOTLOADER",          tpl.bootloader},
-            {"BUILD:SOC_MANUFACTURER",    tpl.soc_manufacturer},
-            {"BUILD:SOC_MODEL",           tpl.soc_model},
-            {"BUILD:ID",                  tpl.build_id},
-            {"BUILD:FINGERPRINT",         tpl.fingerprint},
-            {"BUILD:SUPPORTED_ABIS",      abis},
+            {"BUILD:MODEL",                tpl.model},
+            {"BUILD:BRAND",                tpl.brand},
+            {"BUILD:MANUFACTURER",         tpl.manufacturer},
+            {"BUILD:DEVICE",               tpl.device},
+            {"BUILD:PRODUCT",              tpl.product},
+            {"BUILD:HARDWARE",             tpl.hardware},
+            {"BUILD:BOARD",                tpl.board},
+            {"BUILD:BOOTLOADER",           tpl.bootloader},
+            {"BUILD:SOC_MANUFACTURER",     tpl.soc_manufacturer},
+            {"BUILD:SOC_MODEL",            tpl.soc_model},
+            {"BUILD:ID",                   tpl.build_id},
+            {"BUILD:FINGERPRINT",          tpl.fingerprint},
+            {"BUILD:SUPPORTED_ABIS",       abis},
             {"BUILD:SUPPORTED_64_BIT_ABIS","arm64-v8a"},
             {"BUILD:SUPPORTED_32_BIT_ABIS","armeabi-v7a,armeabi"},
-            {"BUILD:TAGS",                "release-keys"},
-            {"BUILD:TYPE",                "user"},
-            {"BUILD:TIME",                tpl.build_time},
+            {"BUILD:TAGS",                 "release-keys"},
+            {"BUILD:TYPE",                 "user"},
+            {"BUILD:TIME",                 tpl.build_time},
             // Java Build$VERSION 反射
             {"VERSION:RELEASE",                tpl.release},
             {"VERSION:SDK_INT",                tpl.sdk_int},
             {"VERSION:DEVICE_INITIAL_SDK_INT", tpl.sdk_int},
             {"VERSION:PREVIEW_SDK_INT",        "0"},
             {"VERSION:SECURITY_PATCH",         tpl.security_patch},
-            // Bionic SystemProperties 全分区覆盖
-            {"ro.product.model",               tpl.model},
-            {"ro.product.system.model",        tpl.model},
-            {"ro.product.vendor.model",        tpl.model},
-            {"ro.product.odm.model",           tpl.model},
-            {"ro.product.product.model",       tpl.model},
-            {"ro.product.brand",               tpl.brand},
-            {"ro.product.system.brand",        tpl.brand},
-            {"ro.product.vendor.brand",        tpl.brand},
-            {"ro.product.odm.brand",           tpl.brand},
-            {"ro.product.manufacturer",        tpl.manufacturer},
-            {"ro.product.system.manufacturer", tpl.manufacturer},
-            {"ro.product.vendor.manufacturer", tpl.manufacturer},
-            {"ro.product.odm.manufacturer",    tpl.manufacturer},
-            {"ro.product.device",              tpl.device},
-            {"ro.product.system.device",       tpl.device},
-            {"ro.product.vendor.device",       tpl.device},
-            {"ro.product.odm.device",          tpl.device},
-            {"ro.build.product",               tpl.device},
-            {"ro.product.name",                tpl.product},
-            {"ro.product.system.name",         tpl.product},
-            {"ro.product.vendor.name",         tpl.product},
-            {"ro.product.board",               tpl.board},
-            {"ro.board.platform",              tpl.board},
-            {"ro.hardware",                    tpl.hardware},
-            {"ro.boot.hardware",               tpl.hardware},
-            {"ro.soc.manufacturer",            tpl.soc_manufacturer},
-            {"ro.soc.model",                   tpl.soc_model},
-            {"ro.product.cpu.abi",             "arm64-v8a"},
-            {"ro.product.cpu.abilist",         abis},
-            {"ro.product.cpu.abilist64",       "arm64-v8a"},
-            {"ro.product.cpu.abilist32",       "armeabi-v7a,armeabi"},
-            {"ro.build.id",                    tpl.build_id},
-            {"ro.build.date.utc",              std::to_string(build_utc)},
-            {"ro.build.version.release",       tpl.release},
-            {"ro.build.version.sdk",           tpl.sdk_int},
-            {"ro.build.version.security_patch",tpl.security_patch},
-            {"ro.build.fingerprint",           tpl.fingerprint},
-            {"ro.product.build.fingerprint",   tpl.fingerprint},
-            {"ro.system.build.fingerprint",    tpl.fingerprint},
-            {"ro.vendor.build.fingerprint",    tpl.fingerprint},
-            {"ro.odm.build.fingerprint",       tpl.fingerprint},
-            {"ro.build.tags",                  "release-keys"},
-            {"ro.build.type",                  "user"},
-            {"ro.boot.vbmeta.device_state",    "locked"},
-            {"ro.boot.verifiedbootstate",      "green"},
-            {"ro.boot.flash.locked",           "1"},
-            {"ro.boot.veritymode",             "enforcing"},
-            {"ro.debuggable",                  "0"},
-            {"ro.secure",                      "1"}
+            // Bionic SystemProperties 全分区机型覆盖
+            {"ro.product.model",                tpl.model},
+            {"ro.product.system.model",         tpl.model},
+            {"ro.product.vendor.model",         tpl.model},
+            {"ro.product.odm.model",            tpl.model},
+            {"ro.product.product.model",        tpl.model},
+            {"ro.product.brand",                tpl.brand},
+            {"ro.product.system.brand",         tpl.brand},
+            {"ro.product.vendor.brand",         tpl.brand},
+            {"ro.product.odm.brand",            tpl.brand},
+            {"ro.product.manufacturer",         tpl.manufacturer},
+            {"ro.product.system.manufacturer",  tpl.manufacturer},
+            {"ro.product.vendor.manufacturer",  tpl.manufacturer},
+            {"ro.product.odm.manufacturer",     tpl.manufacturer},
+            {"ro.product.device",               tpl.device},
+            {"ro.product.system.device",        tpl.device},
+            {"ro.product.vendor.device",        tpl.device},
+            {"ro.product.odm.device",           tpl.device},
+            {"ro.build.product",                tpl.device},
+            {"ro.product.name",                 tpl.product},
+            {"ro.product.system.name",          tpl.product},
+            {"ro.product.vendor.name",          tpl.product},
+            {"ro.product.board",                tpl.board},
+            {"ro.board.platform",               tpl.board},
+            {"ro.hardware",                     tpl.hardware},
+            {"ro.boot.hardware",                tpl.hardware},
+            {"ro.soc.manufacturer",             tpl.soc_manufacturer},
+            {"ro.soc.model",                    tpl.soc_model},
+            {"ro.product.cpu.abi",              "arm64-v8a"},
+            {"ro.product.cpu.abilist",          abis},
+            {"ro.product.cpu.abilist64",        "arm64-v8a"},
+            {"ro.product.cpu.abilist32",        "armeabi-v7a,armeabi"},
+            {"ro.build.id",                     tpl.build_id},
+            {"ro.build.date.utc",               std::to_string(build_utc)},
+            {"ro.build.version.security_patch", tpl.security_patch},
+            {"ro.build.fingerprint",            tpl.fingerprint},
+            {"ro.product.build.fingerprint",    tpl.fingerprint},
+            {"ro.system.build.fingerprint",     tpl.fingerprint},
+            {"ro.vendor.build.fingerprint",     tpl.fingerprint},
+            {"ro.odm.build.fingerprint",        tpl.fingerprint},
+            {"ro.build.tags",                   "release-keys"},
+            {"ro.build.type",                   "user"},
+            {"ro.boot.vbmeta.device_state",     "locked"},
+            {"ro.boot.verifiedbootstate",       "green"},
+            {"ro.boot.flash.locked",            "1"},
+            {"ro.boot.veritymode",              "enforcing"},
+            {"ro.debuggable",                   "0"},
+            {"ro.secure",                       "1"},
+            // 物理安装内存与 LPDDR 规格对称属性池 (消灭 6GB LPDDR4 vs 16GB MemAvailable 穿帮)
+            {"ro.boot.hardware.ddr",            ddr_full},
+            {"ro.boot.ddr_size",                ram_str},
+            {"ro.boot.ddr_type",                ddr_type},
+            {"ro.boot.ddr_info",                ddr_full},
+            {"ro.boot.ramsize",                 ram_str},
+            {"ro.boot.memsize",                 ram_str},
+            {"ro.hardware.ddr",                 ddr_full},
+            {"ro.vendor.hw.ram",                ram_str},
+            {"ro.product.ram",                  ram_str},
+            {"ro.config.ram_size",              ram_mb_str},
+            {"ro.sys.ram_size",                 ram_str},
+            {"persist.sys.ram_size",            ram_str}
         };
+
+        // 仅当显式开启 force_spoof_sdk 时才覆写底层 sdk 与 release 属性
+        if (route.force_spoof_sdk) {
+            entries.emplace_back("ro.build.version.release", tpl.release);
+            entries.emplace_back("ro.build.version.sdk", tpl.sdk_int);
+            entries.emplace_back("ro.product.build.version.sdk", tpl.sdk_int);
+            entries.emplace_back("ro.system.build.version.sdk", tpl.sdk_int);
+        }
 
         std::ostringstream ss;
         for (const auto &kv : entries) {
@@ -276,7 +303,6 @@ public:
         return ss.str();
     }
 
-    // 导出完整状态 JSON 供 WebUI 首屏加载或备份
     std::string export_full_json() const {
         std::ostringstream ss;
         ss << "{"
@@ -304,7 +330,8 @@ public:
                << "\"build\":" << (r.enable_build ? "true" : "false") << ","
                << "\"gl\":" << (r.enable_gl ? "true" : "false") << ","
                << "\"vfs\":" << (r.enable_vfs ? "true" : "false") << ","
-               << "\"probe\":" << (r.enable_probe ? "true" : "false")
+               << "\"probe\":" << (r.enable_probe ? "true" : "false") << ","
+               << "\"sdkSpoof\":" << (r.force_spoof_sdk ? "true" : "false")
                << "}";
         }
         ss << "}}";
@@ -347,6 +374,8 @@ private:
            << "CPU_CORES=" << t.cpu_cores << "\n"
            << "CPU_MAX_FREQ=" << t.cpu_max_freq << "\n"
            << "RAM_GB=" << t.ram_gb << "\n"
+           << "DDR_TYPE=" << t.ddr_type << "\n"
+           << "DDR_VENDOR=" << t.ddr_vendor << "\n"
            << "SOC_ID=" << t.soc_id << "\n"
            << "SOC_MACHINE=" << t.soc_machine << "\n"
            << "KERNEL_RELEASE=" << t.kernel_release << "\n"
@@ -386,7 +415,7 @@ private:
         {
             DeviceTemplate t;
             t.id = "xiaomi_15_pro";
-            t.name = "Xiaomi 15 Pro (骁龙8至尊版 / Adreno 830)";
+            t.name = "Xiaomi 15 Pro (骁龙8至尊版 / 16GB LPDDR5X)";
             t.model = "2410DPN6CC";
             t.brand = "Xiaomi";
             t.manufacturer = "Xiaomi";
@@ -402,6 +431,8 @@ private:
             t.cpu_cores = 8;
             t.cpu_max_freq = 4320000;
             t.ram_gb = 16;
+            t.ddr_type = "LPDDR5X";
+            t.ddr_vendor = "SKhynix";
             t.soc_id = "618";
             t.soc_machine = "SM8750";
             t.custom_props = "ro.miui.ui.version.code=15\nro.miui.ui.version.name=V816\nro.product.marketname=Xiaomi 15 Pro";
@@ -410,7 +441,7 @@ private:
         {
             DeviceTemplate t;
             t.id = "rog_9_pro";
-            t.name = "ROG 游戏手机 9 Pro (24GB / 165Hz 满血电竞)";
+            t.name = "ROG 游戏手机 9 Pro (24GB LPDDR5X / 165Hz)";
             t.model = "ASUS_AI2501_A";
             t.brand = "asus";
             t.manufacturer = "asus";
@@ -426,6 +457,8 @@ private:
             t.cpu_cores = 8;
             t.cpu_max_freq = 4320000;
             t.ram_gb = 24;
+            t.ddr_type = "LPDDR5X";
+            t.ddr_vendor = "SKhynix";
             t.soc_id = "618";
             t.soc_machine = "SM8750";
             t.custom_props = "ro.product.asus.series=ROG Phone 9\nro.vendor.asus.gaming=1";
@@ -434,7 +467,7 @@ private:
         {
             DeviceTemplate t;
             t.id = "redmagic_10_pro";
-            t.name = "红魔 10 Pro+ (24GB 氘锋透明版)";
+            t.name = "红魔 10 Pro+ (24GB LPDDR5T 氘锋版)";
             t.model = "NX789J";
             t.brand = "nubia";
             t.manufacturer = "ZTE";
@@ -450,6 +483,8 @@ private:
             t.cpu_cores = 8;
             t.cpu_max_freq = 4320000;
             t.ram_gb = 24;
+            t.ddr_type = "LPDDR5T";
+            t.ddr_vendor = "SKhynix";
             t.soc_id = "618";
             t.soc_machine = "SM8750";
             t.custom_props = "ro.product.marketname=红魔 10 Pro+";
@@ -458,7 +493,7 @@ private:
         {
             DeviceTemplate t;
             t.id = "vivo_x200_pro";
-            t.name = "vivo X200 Pro (天玑9400 / Immortalis-G925)";
+            t.name = "vivo X200 Pro (天玑9400 / 16GB LPDDR5T)";
             t.model = "V2405A";
             t.brand = "vivo";
             t.manufacturer = "vivo";
@@ -475,6 +510,8 @@ private:
             t.cpu_cores = 8;
             t.cpu_max_freq = 3620000;
             t.ram_gb = 16;
+            t.ddr_type = "LPDDR5T";
+            t.ddr_vendor = "SKhynix";
             t.soc_id = "6991";
             t.soc_machine = "MT6991";
             t.custom_props = "ro.vivo.os.build.display.id=OriginOS 5\nro.vivo.market.name=vivo X200 Pro";

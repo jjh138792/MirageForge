@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 
 #include "zygisk.hpp"
+#include "mirage_logger.hpp"
 #include "mirage_shared.hpp"
 #include "fd_cloak_tracker.hpp"
 #include "bionic_prop_engine.hpp"
@@ -108,21 +109,32 @@ public:
         }
         if (orig_close) orig_close(fd); else close(fd);
 
-        // 1. 预热 AOSP 1:1 内存布局的 Bionic prop_info 句柄池
+        // 若未强制要求篡改 SDK 版本，则移除 ro.build.version.sdk 覆盖，防止应用调错高版本 API 崩溃
+        if (!g_ctx.force_spoof_sdk) {
+            g_ctx.prop_map.erase("ro.build.version.sdk");
+            g_ctx.prop_map.erase("ro.product.build.version.sdk");
+            g_ctx.prop_map.erase("ro.system.build.version.sdk");
+        }
+
+        // 1. 预热 AOSP 1:1 内存布局的 Bionic prop_info 句柄池 (含 LPDDR 物理内存对称属性)
         prewarm_bionic_prop_arena();
 
-        // 2. 预合成全套 VFS 硬件拓扑节点
+        // 2. 预合成全套 VFS 硬件拓扑节点 (含 Carveout 折算后的 /proc/meminfo 与 /proc/ddr_info)
         build_vfs_topology();
 
-        g_ctx.active = true;
-        LOGI("MirageForge v%s Online (via mirageforge_cli) -> %s [Props:%zu, VFS:%zu, GPU:%s, Probe:%d]",
-             MIRAGE_ENGINE_VERSION, pkg_name.c_str(), g_ctx.prop_map.size(),
-             g_ctx.vfs_files.size(), g_ctx.gl_renderer.c_str(), g_ctx.enable_probe);
+        // 3. 若开启了幻境探针，同时挂载崩溃信号诊断器
+        if (g_ctx.enable_probe) {
+            install_crash_signal_logger(pkg_name);
+        }
 
-        // 3. 执行第一阶段 ART/JNI 与 PLT 全量劫持
+        g_ctx.active = true;
+        LOGI("MirageForge v%s Active -> %s [Props:%zu, VFS:%zu, RAM:%dGB(%s), GPU:%s, Probe:%d]",
+             MIRAGE_ENGINE_VERSION, pkg_name.c_str(), g_ctx.prop_map.size(),
+             g_ctx.vfs_files.size(), g_ctx.ram_gb, g_ctx.ddr_type.c_str(),
+             g_ctx.gl_renderer.c_str(), g_ctx.enable_probe);
+
         if (g_ctx.enable_build_props) {
             reflect_java_build_fields(env);
-            register_system_properties_natives(env);
         }
         scan_and_commit_plt_hooks();
     }
@@ -153,14 +165,16 @@ private:
             g_ctx.enable_maps_cloak = (v == "1");
         } else if (k == "META:ENABLE_PROBE") {
             g_ctx.enable_probe = (v == "1");
+        } else if (k == "META:FORCE_SPOOF_SDK") {
+            g_ctx.force_spoof_sdk = (v == "1");
         } else if (k == "GLES:VENDOR") {
             g_ctx.gl_vendor = v;
             if (v.find("ARM") != std::string::npos || v.find("Mali") != std::string::npos) {
                 g_ctx.vulkan_vendor_id = 0x13B5;
-                g_ctx.cpu_midr_el1 = "0x00000000410fd851"; // ARM Cortex-X925 MIDR
+                g_ctx.cpu_midr_el1 = "0x00000000410fd851";
             } else {
                 g_ctx.vulkan_vendor_id = 0x5143;
-                g_ctx.cpu_midr_el1 = "0x00000000511f8000"; // Qualcomm Oryon MIDR
+                g_ctx.cpu_midr_el1 = "0x00000000511f8000";
             }
         } else if (k == "GLES:RENDERER") {
             g_ctx.gl_renderer = v;
@@ -176,6 +190,10 @@ private:
             g_ctx.cpu_max_freq_khz = std::atoi(v.c_str());
         } else if (k == "VFS:RAM_GB") {
             g_ctx.ram_gb = std::atoi(v.c_str());
+        } else if (k == "VFS:DDR_TYPE") {
+            g_ctx.ddr_type = v;
+        } else if (k == "VFS:DDR_VENDOR") {
+            g_ctx.ddr_vendor = v;
         } else if (k == "VFS:SOC_ID") {
             g_ctx.soc_id = v;
         } else if (k == "VFS:SOC_MACHINE") {
@@ -200,7 +218,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程：深度接入 `/data/adb/modules/mirage_forge/bin/mirageforge_cli`
+// Root Companion 守护进程：极速直读 + CLI 自愈同步
 // ============================================================================
 static bool is_valid_pkg_name(const std::string &s) {
     if (s.empty() || s.size() > 128) return false;
@@ -213,52 +231,24 @@ static bool is_valid_pkg_name(const std::string &s) {
     return s.find("..") == std::string::npos;
 }
 
-// 检查 routes.db 是否比编译缓存更新，若是则调用 mirageforge_cli sync 自动重编译
-static void ensure_cli_synced_for_pkg(const std::string &conf_path) {
-    struct stat db_st{}, conf_st{};
-    if (stat(ROUTES_DB_PATH, &db_st) != 0) return;
-
-    bool need_sync = false;
-    if (stat(conf_path.c_str(), &conf_st) != 0) {
-        // 如果 routes.db 存在但可能还没生成 .conf，检查时间戳
-        static time_t last_sync_db_mtime = 0;
-        if (db_st.st_mtime > last_sync_db_mtime) {
-            need_sync = true;
-            last_sync_db_mtime = db_st.st_mtime;
-        }
-    } else if (db_st.st_mtime > conf_st.st_mtime) {
-        need_sync = true;
-    }
-
-    if (need_sync && access(CLI_BIN_PATH, X_OK) == 0) {
-        std::string sync_cmd = std::string(CLI_BIN_PATH) + " sync >/dev/null 2>&1";
-        std::system(sync_cmd.c_str());
-    }
-}
-
-// 通过 mirageforge_cli zygisk-fetch <pkg> 拉取配置（带直接读文件兜底）
-static std::string fetch_profile_via_cli(const std::string &pkg_name) {
+static std::string fetch_profile_fast(const std::string &pkg_name) {
     std::string conf_path = std::string(APPS_CONF_DIR) + "/" + pkg_name + ".conf";
-    ensure_cli_synced_for_pkg(conf_path);
 
-    if (access(CLI_BIN_PATH, X_OK) == 0) {
-        std::string cmd = std::string(CLI_BIN_PATH) + " zygisk-fetch " + pkg_name + " 2>/dev/null";
-        FILE *fp = popen(cmd.c_str(), "r");
-        if (fp) {
-            std::ostringstream ss;
-            char buf[512];
-            while (std::fgets(buf, sizeof(buf), fp)) {
-                ss << buf;
-            }
-            int status = pclose(fp);
-            std::string out = ss.str();
-            if (status == 0 && !out.empty()) {
-                return out;
-            }
+    // 1. 优先极速直读 mirageforge_cli 预编译的 .conf 文件 (< 0.1ms，零 fork 开销)
+    struct stat db_st{}, conf_st{};
+    bool conf_exists = (stat(conf_path.c_str(), &conf_st) == 0);
+    bool db_exists   = (stat(ROUTES_DB_PATH, &db_st) == 0);
+
+    // 仅当 routes.db 比 .conf 更新时，才调用一次 mirageforge_cli sync 重新生成缓存
+    if (db_exists && (!conf_exists || db_st.st_mtime > conf_st.st_mtime)) {
+        static time_t last_synced_mtime = 0;
+        if (db_st.st_mtime > last_synced_mtime && access(CLI_BIN_PATH, X_OK) == 0) {
+            last_synced_mtime = db_st.st_mtime;
+            std::string cmd = std::string(CLI_BIN_PATH) + " sync >/dev/null 2>&1";
+            std::system(cmd.c_str());
         }
     }
 
-    // 兜底通道：直接读取 mirageforge_cli 编译的原子 .conf 文件
     std::ifstream ifs(conf_path);
     if (!ifs.is_open()) return "";
     std::ostringstream ss;
@@ -266,12 +256,13 @@ static std::string fetch_profile_via_cli(const std::string &pkg_name) {
     return ss.str();
 }
 
-// 记录应用注入遥测日志至 /data/adb/mirage_forge/launch_history.log
-static void record_launch_telemetry(const std::string &pkg, int32_t pid, const std::string &model) {
+static void record_launch_telemetry(const std::string &pkg, int32_t pid, const std::string &model, const std::string &gpu, int ram_gb) {
     FILE *fp = std::fopen(LAUNCH_LOG_PATH, "a");
     if (!fp) return;
     std::time_t now = std::time(nullptr);
-    std::fprintf(fp, "%lld|%s|%d|%s\n", static_cast<long long>(now), pkg.c_str(), pid, model.c_str());
+    std::fprintf(fp, "%lld|%s|%d|%s|%s|%dGB\n",
+                 static_cast<long long>(now), pkg.c_str(), pid,
+                 model.c_str(), gpu.c_str(), ram_gb);
     std::fclose(fp);
     chmod(LAUNCH_LOG_PATH, 0600);
 }
@@ -287,7 +278,7 @@ static void companion_handler(int fd) {
         return;
     }
 
-    std::string raw_conf = fetch_profile_via_cli(pkg_name);
+    std::string raw_conf = fetch_profile_fast(pkg_name);
     if (raw_conf.empty()) {
         uint8_t zero = 0;
         write_full(fd, &zero, sizeof(zero));
@@ -324,8 +315,10 @@ static void companion_handler(int fd) {
         write_str(fd, kv.second);
     }
 
-    auto m_it = entries.find("BUILD:MODEL");
-    record_launch_telemetry(pkg_name, app_pid, (m_it != entries.end()) ? m_it->second : "Custom");
+    std::string model = entries.count("BUILD:MODEL") ? entries["BUILD:MODEL"] : "Custom";
+    std::string gpu   = entries.count("GLES:RENDERER") ? entries["GLES:RENDERER"] : "DefaultGPU";
+    int ram_gb        = entries.count("VFS:RAM_GB") ? std::atoi(entries["VFS:RAM_GB"].c_str()) : 16;
+    record_launch_telemetry(pkg_name, app_pid, model, gpu, ram_gb);
 }
 
 REGISTER_ZYGISK_MODULE(MirageForgeModule)
