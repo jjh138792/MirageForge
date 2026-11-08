@@ -15,6 +15,7 @@ public:
         std::string soc_id;
         std::string soc_machine;
         int max_freq_khz;
+        std::string cpu_clusters;
         std::string ddr_type;
     };
 
@@ -23,28 +24,60 @@ public:
         for (char &c : token) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
         if (token.find("sun") != std::string::npos || token.find("sm8750") != std::string::npos) {
-            return {"Qualcomm", "Adreno (TM) 830", "Qualcomm Technologies, Inc SM8750", "618", "SM8750", 4320000, "LPDDR5X"};
+            return {
+                "Qualcomm", "Adreno (TM) 830", "Qualcomm Technologies, Inc SM8750",
+                "618", "SM8750", 4320000,
+                "0-5:614400:3532800;6-7:806400:4320000", "LPDDR5X"
+            };
         }
         if (token.find("pineapple") != std::string::npos || token.find("sm8650") != std::string::npos) {
-            return {"Qualcomm", "Adreno (TM) 750", "Qualcomm Technologies, Inc SM8650", "557", "SM8650", 3300000, "LPDDR5X"};
+            return {
+                "Qualcomm", "Adreno (TM) 750", "Qualcomm Technologies, Inc SM8650",
+                "557", "SM8650", 3302400,
+                "0-1:556800:2265600;2-6:691200:3148800;7-7:806400:3302400", "LPDDR5X"
+            };
         }
         if (token.find("kalama") != std::string::npos || token.find("sm8550") != std::string::npos) {
-            return {"Qualcomm", "Adreno (TM) 740", "Qualcomm Technologies, Inc SM8550", "519", "SM8550", 3190000, "LPDDR5X"};
+            return {
+                "Qualcomm", "Adreno (TM) 740", "Qualcomm Technologies, Inc SM8550",
+                "519", "SM8550", 3187200,
+                "0-2:595200:2016000;3-6:691200:2803200;7-7:806400:3187200", "LPDDR5X"
+            };
         }
         if (token.find("taro") != std::string::npos || token.find("sm8475") != std::string::npos) {
-            return {"Qualcomm", "Adreno (TM) 730", "Qualcomm Technologies, Inc SM8475", "530", "SM8475", 3190000, "LPDDR5"};
+            return {
+                "Qualcomm", "Adreno (TM) 730", "Qualcomm Technologies, Inc SM8475",
+                "530", "SM8475", 3187200,
+                "0-3:595200:2016000;4-6:710400:2745600;7-7:806400:3187200", "LPDDR5"
+            };
         }
         if (token.find("mt6991") != std::string::npos) {
-            return {"ARM", "Immortalis-G925 MC12", "MT6991", "6991", "MT6991", 3620000, "LPDDR5X"};
+            return {
+                "ARM", "Immortalis-G925 MC12", "MT6991",
+                "6991", "MT6991", 3620000,
+                "0-3:800000:2400000;4-6:1000000:3300000;7-7:1200000:3620000", "LPDDR5X"
+            };
         }
         if (token.find("mt6989") != std::string::npos) {
-            return {"ARM", "Immortalis-G720 MC12", "MT6989", "6989", "MT6989", 3250000, "LPDDR5X"};
+            return {
+                "ARM", "Immortalis-G720 MC12", "MT6989",
+                "6989", "MT6989", 3250000,
+                "0-3:800000:2000000;4-6:1000000:2850000;7-7:1100000:3250000", "LPDDR5X"
+            };
         }
         if (token.find("mt6985") != std::string::npos) {
-            return {"ARM", "Immortalis-G715 MC11", "MT6985", "6985", "MT6985", 3050000, "LPDDR5X"};
+            return {
+                "ARM", "Immortalis-G715 MC11", "MT6985",
+                "6985", "MT6985", 3050000,
+                "0-3:600000:1800000;4-6:800000:2850000;7-7:900000:3050000", "LPDDR5X"
+            };
         }
         std::string fallback_soc = !soc_model.empty() ? soc_model : (!board.empty() ? board : "SM8750");
-        return {"Qualcomm", "Adreno (TM) 830", "Qualcomm Technologies, Inc " + fallback_soc, "618", fallback_soc, 4320000, "LPDDR5X"};
+        return {
+            "Qualcomm", "Adreno (TM) 830", "Qualcomm Technologies, Inc " + fallback_soc,
+            "618", fallback_soc, 4320000,
+            "0-5:614400:3532800;6-7:806400:4320000", "LPDDR5X"
+        };
     }
 
     static bool parse_build_prop(const std::string &raw_text, DeviceTemplate *out_tpl, const std::string &custom_id = "") {
@@ -115,7 +148,6 @@ public:
             "ro.vendor.build.fingerprint", "ro.system.build.fingerprint", "ro.odm.build.fingerprint"
         });
 
-        // 提取可能存在的原厂 DDR 信息
         std::string raw_ddr = pick({"ro.boot.hardware.ddr", "ro.boot.ddr_info", "ro.hardware.ddr"});
         std::string raw_ddr_type = pick({"ro.boot.ddr_type"});
         std::string raw_ram_size = pick({"ro.boot.ddr_size", "ro.vendor.hw.ram", "ro.boot.ramsize"});
@@ -179,6 +211,7 @@ public:
         t.cpu_hardware     = topo.cpu_hw;
         t.cpu_cores        = 8;
         t.cpu_max_freq     = topo.max_freq_khz;
+        t.cpu_clusters     = topo.cpu_clusters;
         t.ram_gb           = detected_ram_gb;
         t.ddr_type         = detected_ddr_type;
         t.ddr_vendor       = detected_ddr_vendor;
