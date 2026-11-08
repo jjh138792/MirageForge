@@ -14,6 +14,7 @@ namespace mirage {
 struct CloakedFdEntry {
     std::string fake_target_path;
     size_t content_size;
+    int dynamic_core_id; // >= 0 表示该 fd 是某颗核心的实时动态频率节点 (scaling_cur_freq)
 };
 
 template <typename StatT>
@@ -26,29 +27,34 @@ inline void populate_virtual_stat(StatT *buf, const std::string &fake_path, size
     buf->st_nlink = 1;
     buf->st_uid = 0;
     buf->st_gid = 0;
-    // Linux /proc 与 /sys 伪文件系统下节点 st_size 为 0 或 4096，普通 build.prop 为真实字节数
-    if (fake_path.rfind("/proc/", 0) == 0) {
-        buf->st_size = 0;
-    } else if (fake_path.rfind("/sys/", 0) == 0) {
-        buf->st_size = 4096;
-    } else {
-        buf->st_size = static_cast<decltype(buf->st_size)>(content_size);
-    }
+    // /proc/* 伪文件 st_size 恒为 0；/sys/* 与 build.prop 返回实际内容长度，确保 Java/Kotlin readText() 精确读取
+    buf->st_size = (fake_path.rfind("/proc/", 0) == 0)
+                       ? 0
+                       : static_cast<decltype(buf->st_size)>(content_size);
     buf->st_blksize = 4096;
 }
 
 class FdCloakTracker {
 public:
-    void register_fd(int fd, const std::string &original_path, size_t content_size) {
+    void register_fd(int fd, const std::string &original_path, size_t content_size, int dyn_core_id = -1) {
         if (fd < 0) return;
         std::lock_guard<std::mutex> lock(mtx_);
-        table_[fd] = CloakedFdEntry{original_path, content_size};
+        table_[fd] = CloakedFdEntry{original_path, content_size, dyn_core_id};
     }
 
     void unregister_fd(int fd) {
         if (fd < 0) return;
         std::lock_guard<std::mutex> lock(mtx_);
         table_.erase(fd);
+    }
+
+    bool get_dynamic_core_id(int fd, int *out_core_id) {
+        if (fd < 0) return false;
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = table_.find(fd);
+        if (it == table_.end() || it->second.dynamic_core_id < 0) return false;
+        if (out_core_id) *out_core_id = it->second.dynamic_core_id;
+        return true;
     }
 
     bool resolve_proc_fd_link(const char *pathname, std::string *out_real_path) {
