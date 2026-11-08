@@ -24,7 +24,6 @@ public:
         templates_.clear();
         routes_.clear();
 
-        // 1. 加载 /data/adb/mirage_forge/templates/*.tpl
         DIR *dir = opendir(TPL_DIR);
         if (dir) {
             struct dirent *ent = nullptr;
@@ -41,7 +40,6 @@ public:
             closedir(dir);
         }
 
-        // 2. 加载 /data/adb/mirage_forge/routes.db (兼容 6 列与 v1.0.1 的 7 列格式)
         std::string routes_raw = read_file_to_string(ROUTES_DB);
         for (const std::string &line : split_lines(routes_raw)) {
             if (line.empty() || line[0] == '#') continue;
@@ -156,7 +154,6 @@ public:
         std::system(cmd.c_str());
     }
 
-    // 编译供 Zygisk Native v1.0.1 极速直读的 .conf 内容（包含 DDR 物理内存对称属性与 SDK 保护开关）
     static std::string compile_runtime_conf(const DeviceTemplate &tpl, const AppRoute &route) {
         std::string abis = tpl.supported_abis.empty() ? "arm64-v8a,armeabi-v7a,armeabi" : tpl.supported_abis;
         long long build_utc = std::atoll(tpl.build_time.c_str()) / 1000LL;
@@ -176,21 +173,22 @@ public:
             {"META:ENABLE_PROBE",    route.enable_probe ? "1" : "0"},
             {"META:FORCE_SPOOF_SDK", route.force_spoof_sdk ? "1" : "0"},
             // OpenGL ES & Vulkan
-            {"GLES:VENDOR",       tpl.gl_vendor},
-            {"GLES:RENDERER",     tpl.gl_renderer},
-            {"GLES:VERSION",      tpl.gl_version},
-            // VFS & Syscall & 物理内存对称
-            {"VFS:CPU_HARDWARE",   tpl.cpu_hardware},
-            {"VFS:CPU_ARCH",       "aarch64"},
-            {"VFS:CPU_CORES",      std::to_string(tpl.cpu_cores)},
-            {"VFS:CPU_MAX_FREQ",   std::to_string(tpl.cpu_max_freq)},
-            {"VFS:RAM_GB",         std::to_string(ram_gb)},
-            {"VFS:DDR_TYPE",       ddr_type},
-            {"VFS:DDR_VENDOR",     ddr_vendor},
-            {"VFS:SOC_ID",         tpl.soc_id},
-            {"VFS:SOC_MACHINE",    tpl.soc_machine},
-            {"VFS:KERNEL_RELEASE", tpl.kernel_release},
-            {"VFS:KERNEL_VERSION", tpl.kernel_version},
+            {"GLES:VENDOR",          tpl.gl_vendor},
+            {"GLES:RENDERER",        tpl.gl_renderer},
+            {"GLES:VERSION",         tpl.gl_version},
+            // VFS & 异构多簇单核频率 & 物理内存对称
+            {"VFS:CPU_HARDWARE",     tpl.cpu_hardware},
+            {"VFS:CPU_ARCH",         "aarch64"},
+            {"VFS:CPU_CORES",        std::to_string(tpl.cpu_cores)},
+            {"VFS:CPU_MAX_FREQ",     std::to_string(tpl.cpu_max_freq)},
+            {"VFS:CPU_CLUSTERS",     tpl.cpu_clusters},
+            {"VFS:RAM_GB",           std::to_string(ram_gb)},
+            {"VFS:DDR_TYPE",         ddr_type},
+            {"VFS:DDR_VENDOR",       ddr_vendor},
+            {"VFS:SOC_ID",           tpl.soc_id},
+            {"VFS:SOC_MACHINE",      tpl.soc_machine},
+            {"VFS:KERNEL_RELEASE",   tpl.kernel_release},
+            {"VFS:KERNEL_VERSION",   tpl.kernel_version},
             // Java Build 反射
             {"BUILD:MODEL",                tpl.model},
             {"BUILD:BRAND",                tpl.brand},
@@ -264,7 +262,7 @@ public:
             {"ro.boot.veritymode",              "enforcing"},
             {"ro.debuggable",                   "0"},
             {"ro.secure",                       "1"},
-            // 物理安装内存与 LPDDR 规格对称属性池 (消灭 6GB LPDDR4 vs 16GB MemAvailable 穿帮)
+            // 物理安装内存与 LPDDR 规格对称属性池
             {"ro.boot.hardware.ddr",            ddr_full},
             {"ro.boot.ddr_size",                ram_str},
             {"ro.boot.ddr_type",                ddr_type},
@@ -279,7 +277,6 @@ public:
             {"persist.sys.ram_size",            ram_str}
         };
 
-        // 仅当显式开启 force_spoof_sdk 时才覆写底层 sdk 与 release 属性
         if (route.force_spoof_sdk) {
             entries.emplace_back("ro.build.version.release", tpl.release);
             entries.emplace_back("ro.build.version.sdk", tpl.sdk_int);
@@ -373,6 +370,7 @@ private:
            << "CPU_HARDWARE=" << t.cpu_hardware << "\n"
            << "CPU_CORES=" << t.cpu_cores << "\n"
            << "CPU_MAX_FREQ=" << t.cpu_max_freq << "\n"
+           << "CPU_CLUSTERS=" << t.cpu_clusters << "\n"
            << "RAM_GB=" << t.ram_gb << "\n"
            << "DDR_TYPE=" << t.ddr_type << "\n"
            << "DDR_VENDOR=" << t.ddr_vendor << "\n"
@@ -430,6 +428,7 @@ private:
             t.cpu_hardware = "Qualcomm Technologies, Inc SM8750";
             t.cpu_cores = 8;
             t.cpu_max_freq = 4320000;
+            t.cpu_clusters = "0-5:614400:3532800;6-7:806400:4320000";
             t.ram_gb = 16;
             t.ddr_type = "LPDDR5X";
             t.ddr_vendor = "SKhynix";
@@ -456,6 +455,7 @@ private:
             t.cpu_hardware = "Qualcomm Technologies, Inc SM8750";
             t.cpu_cores = 8;
             t.cpu_max_freq = 4320000;
+            t.cpu_clusters = "0-5:614400:3532800;6-7:806400:4320000";
             t.ram_gb = 24;
             t.ddr_type = "LPDDR5X";
             t.ddr_vendor = "SKhynix";
@@ -482,6 +482,7 @@ private:
             t.cpu_hardware = "Qualcomm Technologies, Inc SM8750";
             t.cpu_cores = 8;
             t.cpu_max_freq = 4320000;
+            t.cpu_clusters = "0-5:614400:3532800;6-7:806400:4320000";
             t.ram_gb = 24;
             t.ddr_type = "LPDDR5T";
             t.ddr_vendor = "SKhynix";
@@ -509,6 +510,7 @@ private:
             t.cpu_hardware = "MT6991";
             t.cpu_cores = 8;
             t.cpu_max_freq = 3620000;
+            t.cpu_clusters = "0-3:800000:2400000;4-6:1000000:3300000;7-7:1200000:3620000";
             t.ram_gb = 16;
             t.ddr_type = "LPDDR5T";
             t.ddr_vendor = "SKhynix";
