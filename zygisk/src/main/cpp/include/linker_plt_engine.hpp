@@ -18,12 +18,20 @@ namespace mirage {
 inline zygisk::Api *g_zygisk_api = nullptr;
 inline std::mutex g_maps_mtx;
 inline std::set<std::pair<dev_t, ino_t>> g_hooked_elves;
+inline void *g_discard_old_slot = nullptr;
 
 inline void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
 inline void *(*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
 inline void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
 
 inline void scan_and_commit_plt_hooks();
+
+// 严格后缀匹配：避免 "/apex/com.android.art/lib64/libjavacore.so" 被 ".art" 误杀！
+inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) {
+    size_t ext_len = std::strlen(ext);
+    if (path_len < ext_len) return false;
+    return std::memcmp(path + path_len - ext_len, ext, ext_len) == 0;
+}
 
 inline void *hook_dlsym(void *handle, const char *symbol) {
     if (symbol && !g_tls_in_hook) {
@@ -46,6 +54,8 @@ inline void *hook_dlsym(void *handle, const char *symbol) {
             if (std::strcmp(symbol, "__openat64_2") == 0) return reinterpret_cast<void *>(hook_openat64_2);
             if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
             if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
+            if (std::strcmp(symbol, "lseek") == 0) return reinterpret_cast<void *>(hook_lseek);
+            if (std::strcmp(symbol, "lseek64") == 0) return reinterpret_cast<void *>(hook_lseek64);
             if (std::strcmp(symbol, "access") == 0) return reinterpret_cast<void *>(hook_access);
             if (std::strcmp(symbol, "faccessat") == 0) return reinterpret_cast<void *>(hook_faccessat);
             if (std::strcmp(symbol, "stat") == 0) return reinterpret_cast<void *>(hook_stat);
@@ -116,6 +126,10 @@ inline void scan_and_commit_plt_hooks() {
         return;
     }
 
+    // 确保 lseek / lseek64 原生指针已初始化
+    if (!orig_lseek) orig_lseek = reinterpret_cast<decltype(orig_lseek)>(dlsym(RTLD_DEFAULT, "lseek"));
+    if (!orig_lseek64) orig_lseek64 = reinterpret_cast<decltype(orig_lseek64)>(dlsym(RTLD_DEFAULT, "lseek64"));
+
     char line[1024];
     bool dirty = false;
 
@@ -139,20 +153,21 @@ inline void scan_and_commit_plt_hooks() {
             path[--len] = '\0';
         }
 
-        // 兼容 extractNativeLibs="false" 直接从 base.apk / split_config.arm64_v8a.apk 映射的未解压可执行段
-        bool is_exec_or_elf = (std::strchr(perms, 'x') != nullptr) ||
-                              (std::strstr(path, ".so") != nullptr) ||
-                              (std::strstr(path, ".apk") != nullptr);
+        // 涵盖所有 .so 动态库与直接从 .apk 映射的未解压 Native 库
+        bool is_target_binary = ends_with_ext(path, len, ".so") ||
+                                ends_with_ext(path, len, ".apk") ||
+                                (std::strstr(path, ".so.") != nullptr);
 
-        if (path[0] != '/' || !is_exec_or_elf ||
-            std::strstr(path, ".oat") != nullptr ||
-            std::strstr(path, ".odex") != nullptr ||
-            std::strstr(path, ".vdex") != nullptr ||
-            std::strstr(path, ".art") != nullptr ||
-            std::strstr(path, ".dex") != nullptr ||
-            std::strstr(path, "/libc.so") != nullptr ||
-            std::strstr(path, "/libdl.so") != nullptr ||
-            std::strstr(path, "/libart.so") != nullptr ||
+        // 仅跳过纯粹的字节码缓存文件与底层 Bionic 自身，绝不误杀 /apex/com.android.art/lib64/libjavacore.so！
+        if (path[0] != '/' || !is_target_binary ||
+            ends_with_ext(path, len, ".oat") ||
+            ends_with_ext(path, len, ".odex") ||
+            ends_with_ext(path, len, ".vdex") ||
+            ends_with_ext(path, len, ".art") ||
+            ends_with_ext(path, len, ".dex") ||
+            ends_with_ext(path, len, "/libc.so") ||
+            ends_with_ext(path, len, "/libdl.so") ||
+            ends_with_ext(path, len, "/libart.so") ||
             std::strstr(path, "/linker") != nullptr ||
             std::strstr(path, "mirage_forge") != nullptr) {
             continue;
@@ -166,9 +181,9 @@ inline void scan_and_commit_plt_hooks() {
         }
         dirty = true;
 
+        // 使用全局静态槽位 g_discard_old_slot 承接不需要覆盖的旧函数地址，避免局部栈地址在 Commit 时失效
         auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
-            void *dummy_old = nullptr;
-            void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &dummy_old;
+            void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &g_discard_old_slot;
             g_zygisk_api->pltHookRegister(dev, inode, sym, new_fn, target_old);
         };
 
@@ -198,6 +213,8 @@ inline void scan_and_commit_plt_hooks() {
             reg("fopen", reinterpret_cast<void *>(hook_fopen), reinterpret_cast<void **>(&orig_fopen));
             reg("fopen64", reinterpret_cast<void *>(hook_fopen64), reinterpret_cast<void **>(&orig_fopen64));
             reg("close", reinterpret_cast<void *>(hook_close), reinterpret_cast<void **>(&orig_close));
+            reg("lseek", reinterpret_cast<void *>(hook_lseek), reinterpret_cast<void **>(&orig_lseek));
+            reg("lseek64", reinterpret_cast<void *>(hook_lseek64), reinterpret_cast<void **>(&orig_lseek64));
             reg("access", reinterpret_cast<void *>(hook_access), reinterpret_cast<void **>(&orig_access));
             reg("faccessat", reinterpret_cast<void *>(hook_faccessat), reinterpret_cast<void **>(&orig_faccessat));
             reg("stat", reinterpret_cast<void *>(hook_stat), reinterpret_cast<void **>(&orig_stat));
