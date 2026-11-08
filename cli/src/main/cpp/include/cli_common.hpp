@@ -30,9 +30,11 @@ constexpr const char *APPS_DIR        = "/data/adb/mirage_forge/apps";
 constexpr const char *ROUTES_DB       = "/data/adb/mirage_forge/routes.db";
 constexpr const char *CONFIG_JSON     = "/data/adb/mirage_forge/config.json";
 constexpr const char *LAUNCH_LOG_FILE = "/data/adb/mirage_forge/launch_history.log";
+constexpr const char *PROBE_LOG_FILE  = "/data/adb/mirage_forge/probe_events.log";
+constexpr const char *CRASH_LOG_FILE  = "/data/adb/mirage_forge/crash_events.log";
 constexpr const char *MODULE_DIR      = "/data/adb/modules/mirage_forge";
 
-// 全息机型模板结构体 (v1.0.1 含物理 DDR 对称规格)
+// 全息机型模板结构体 (含异构 CPU 核心分簇与物理 DDR 对称规格)
 struct DeviceTemplate {
     std::string id;
     std::string name;
@@ -59,10 +61,11 @@ struct DeviceTemplate {
     std::string gl_renderer = "Adreno (TM) 830";
     std::string gl_version = "OpenGL ES 3.2 V@0800.0";
 
-    // VFS & Syscall & 物理内存对称参数
+    // VFS & 异构多簇单核频率 & 物理内存对称参数
     std::string cpu_hardware = "Qualcomm Technologies, Inc SM8750";
     int cpu_cores = 8;
     int cpu_max_freq = 4320000;
+    std::string cpu_clusters = "0-5:614400:3532800;6-7:806400:4320000";
     int ram_gb = 16;
     std::string ddr_type = "LPDDR5X";
     std::string ddr_vendor = "SKhynix";
@@ -83,7 +86,7 @@ struct AppRoute {
     bool enable_gl = true;
     bool enable_vfs = true;
     bool enable_probe = false;
-    bool force_spoof_sdk = false; // 默认 false，防止跨 Android 大版本篡改 SDK_INT 引发应用崩溃
+    bool force_spoof_sdk = false;
 };
 
 inline std::string trim(const std::string &s) {
@@ -168,7 +171,6 @@ inline bool ensure_dir(const char *path, mode_t mode = 0700) {
     return false;
 }
 
-// 原子级文件写入（先写 .tmp + fsync，再 rename 原子覆盖）
 inline bool write_file_atomic(const std::string &path, const std::string &content, mode_t mode = 0600) {
     std::string tmp_path = path + ".tmp." + std::to_string(getpid());
     int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
@@ -299,6 +301,7 @@ inline std::string template_to_json(const DeviceTemplate &t) {
        << "\"CPU_HARDWARE\":\"" << json_escape(t.cpu_hardware) << "\","
        << "\"CPU_CORES\":" << t.cpu_cores << ","
        << "\"CPU_MAX_FREQ\":" << t.cpu_max_freq << ","
+       << "\"CPU_CLUSTERS\":\"" << json_escape(t.cpu_clusters) << "\","
        << "\"RAM_GB\":" << t.ram_gb << ","
        << "\"DDR_TYPE\":\"" << json_escape(t.ddr_type) << "\","
        << "\"DDR_VENDOR\":\"" << json_escape(t.ddr_vendor) << "\","
@@ -342,6 +345,7 @@ inline DeviceTemplate template_from_kv_map(const std::unordered_map<std::string,
     t.cpu_hardware     = get("CPU_HARDWARE", "Qualcomm Technologies, Inc SM8750");
     t.cpu_cores        = std::atoi(get("CPU_CORES", "8").c_str());
     t.cpu_max_freq     = std::atoi(get("CPU_MAX_FREQ", "4320000").c_str());
+    t.cpu_clusters     = get("CPU_CLUSTERS", "0-5:614400:3532800;6-7:806400:4320000");
     t.ram_gb           = std::atoi(get("RAM_GB", "16").c_str());
     t.ddr_type         = get("DDR_TYPE", "LPDDR5X");
     t.ddr_vendor       = get("DDR_VENDOR", "SKhynix");

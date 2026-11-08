@@ -40,6 +40,24 @@ function toBase64(str) {
   return btoa(unescape(encodeURIComponent(str)));
 }
 
+// 将 "0-5:614400:3532800;6-7:806400:4320000" 转化为 "6核@3.53GHz + 2核@4.32GHz"
+function formatClustersSummary(clustersStr, fallbackCores, fallbackMaxFreq) {
+  if (!clustersStr || !clustersStr.includes(":")) {
+    return `${fallbackCores || 8}核 @ ${((fallbackMaxFreq || 4320000) / 1e6).toFixed(2)}GHz`;
+  }
+  const parts = clustersStr.split(";").map(s => s.trim()).filter(Boolean);
+  const desc = [];
+  for (const seg of parts) {
+    const [range, , maxKhz] = seg.split(":");
+    if (!range || !maxKhz) continue;
+    const [start, end] = range.split("-").map(n => parseInt(n, 10));
+    const count = (!isNaN(start) && !isNaN(end) && end >= start) ? (end - start + 1) : 1;
+    const ghz = (parseInt(maxKhz, 10) / 1e6).toFixed(2);
+    desc.push(`${count}核@${ghz}GHz`);
+  }
+  return desc.length > 0 ? desc.join(" + ") : `${fallbackCores || 8}核`;
+}
+
 async function syncStateFromCli() {
   const res = await ksuExec(`"${CLI_BIN}" state --json`);
   if (res.errno === 0 && res.stdout.trim()) {
@@ -115,6 +133,7 @@ function renderTemplates() {
   Object.values(appState.templates).forEach(tpl => {
     const ddrType = tpl.DDR_TYPE || "LPDDR5X";
     const ddrVendor = tpl.DDR_VENDOR || "SKhynix";
+    const clusterSummary = formatClustersSummary(tpl.CPU_CLUSTERS, tpl.CPU_CORES, tpl.CPU_MAX_FREQ);
     const card = document.createElement("div");
     card.className = "tpl-card";
     card.innerHTML = `
@@ -125,8 +144,8 @@ function renderTemplates() {
       <div class="tpl-meta">
         <span>型号: <b>${tpl.MODEL || "-"}</b></span>
         <span>SoC: <b>${tpl.SOC_MACHINE || tpl.SOC_MODEL || "-"} (#${tpl.SOC_ID || "618"})</b></span>
-        <span>对称内存: <b>${tpl.RAM_GB || 16}GB ${ddrType} (${ddrVendor})</b></span>
-        <span>CPU 拓扑: <b>${tpl.CPU_CORES || 8}核 @ ${((tpl.CPU_MAX_FREQ || 4320000) / 1e6).toFixed(2)}GHz</b></span>
+        <span class="full-span">对称内存: <b>${tpl.RAM_GB || 16}GB ${ddrType} (${ddrVendor})</b></span>
+        <span class="full-span">单核分簇: <b>${clusterSummary}</b></span>
       </div>
       <div class="tpl-actions">
         <button class="btn-secondary btn-edit" data-id="${tpl.id}">编辑全息拓扑</button>
@@ -187,7 +206,7 @@ function renderAppList() {
         <div class="app-switches">
           <span class="sw-pill ${route.build ? "on" : ""}" data-sw="build">🧬 Bionic/ART属性: ${route.build ? "开" : "关"}</span>
           <span class="sw-pill ${route.gl ? "on" : ""}" data-sw="gl">🎮 Vulkan/GLES/DRM: ${route.gl ? "开" : "关"}</span>
-          <span class="sw-pill ${route.vfs ? "on" : ""}" data-sw="vfs">🛡️ 对称内存/隐身VFS: ${route.vfs ? "开" : "关"}</span>
+          <span class="sw-pill ${route.vfs ? "on" : ""}" data-sw="vfs">🛡️ 单核频率/对称内存/VFS: ${route.vfs ? "开" : "关"}</span>
           <span class="sw-pill ${route.probe ? "probe-on" : ""}" data-sw="probe">📡 探针与调用栈: ${route.probe ? "嗅探中" : "关"}</span>
           <span class="sw-pill ${route.sdkSpoof ? "sdk-on" : ""}" data-sw="sdkSpoof" title="默认关闭以保护应用不因跨 Android 版本调错 API 闪退">⚠️ 强改SDK版本: ${route.sdkSpoof ? "开" : "关(安全)"}</span>
         </div>
@@ -267,9 +286,9 @@ function renderAppList() {
   });
 }
 
-// 刷新崩溃现场、注入遥测与带调用栈的幻境探针雷达
+// 刷新崩溃现场、注入遥测与带调用栈的幻境探针雷达 (直接从 SCM_RIGHTS 持久化文件读取)
 async function refreshProbeAndTelemetry() {
-  // 1. 查询 Native 崩溃信号日志 (mirageforge_cli probe crashes --json)
+  // 1. 查询 Native 崩溃信号日志
   const crashRes = await ksuExec(`"${CLI_BIN}" probe crashes --limit 25 --json`);
   const crashEl = document.getElementById("crashLogList");
   crashEl.innerHTML = "";
@@ -298,7 +317,7 @@ async function refreshProbeAndTelemetry() {
     });
   }
 
-  // 2. 查询注入遥测 (mirageforge_cli probe telemetry --json)
+  // 2. 查询注入遥测
   const teleRes = await ksuExec(`"${CLI_BIN}" probe telemetry --limit 25 --json`);
   const teleEl = document.getElementById("telemetryList");
   teleEl.innerHTML = "";
@@ -329,7 +348,7 @@ async function refreshProbeAndTelemetry() {
     });
   }
 
-  // 3. 查询带调用栈的探针日志 (mirageforge_cli probe list --json)
+  // 3. 查询带调用栈的探针日志 (probe_events.log)
   const filterVal = document.getElementById("probeFilterInput").value.trim();
   const unmappedFlag = appState.unmappedOnly ? "--unmapped" : "";
   const pkgOpt = filterVal ? `--pkg "${filterVal.replace(/"/g, "")}"` : "";
@@ -344,7 +363,7 @@ async function refreshProbeAndTelemetry() {
   }
 
   if (!Array.isArray(events) || events.length === 0) {
-    listEl.innerHTML = `<div class="probe-empty">暂无匹配的探针审计记录。请先在「应用分流矩阵」中点亮目标应用的 [📡 探针与调用栈] 并启动该应用。</div>`;
+    listEl.innerHTML = `<div class="probe-empty">暂无匹配的探针审计记录。请先在「应用分流矩阵」中点亮目标应用的 [📡 探针与调用栈]，点击右侧 [⚡重启] 并打开该应用。</div>`;
     return;
   }
 
@@ -413,6 +432,7 @@ function openTemplateModal(tpl = null) {
   document.getElementById("tplCpuHw").value = tpl ? (tpl.CPU_HARDWARE || "Qualcomm Technologies, Inc SM8750") : "Qualcomm Technologies, Inc SM8750";
   document.getElementById("tplCpuCores").value = tpl ? (tpl.CPU_CORES || 8) : 8;
   document.getElementById("tplCpuFreq").value = tpl ? (tpl.CPU_MAX_FREQ || 4320000) : 4320000;
+  document.getElementById("tplCpuClusters").value = tpl ? (tpl.CPU_CLUSTERS || "0-5:614400:3532800;6-7:806400:4320000") : "0-5:614400:3532800;6-7:806400:4320000";
   document.getElementById("tplRamGb").value = tpl ? (tpl.RAM_GB || 16) : 16;
   document.getElementById("tplDdrType").value = tpl ? (tpl.DDR_TYPE || "LPDDR5X") : "LPDDR5X";
   document.getElementById("tplDdrVendor").value = tpl ? (tpl.DDR_VENDOR || "SKhynix") : "SKhynix";
@@ -452,6 +472,17 @@ document.addEventListener("DOMContentLoaded", async () => {
       btn.classList.add("active");
       document.getElementById(btn.dataset.tab).classList.add("active");
       if (btn.dataset.tab === "tab-probe") refreshProbeAndTelemetry();
+    };
+  });
+
+  // 异构分簇预设快捷按钮
+  document.querySelectorAll(".preset-tag").forEach(btn => {
+    btn.onclick = () => {
+      document.getElementById("tplCpuClusters").value = btn.dataset.clusters;
+      if (btn.dataset.max) {
+        document.getElementById("tplCpuFreq").value = btn.dataset.max;
+      }
+      toast("已填入异构核心分簇拓扑预设");
     };
   });
 
@@ -502,6 +533,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       CPU_HARDWARE: document.getElementById("tplCpuHw").value.trim(),
       CPU_CORES: String(parseInt(document.getElementById("tplCpuCores").value, 10) || 8),
       CPU_MAX_FREQ: String(parseInt(document.getElementById("tplCpuFreq").value, 10) || 4320000),
+      CPU_CLUSTERS: document.getElementById("tplCpuClusters").value.trim() || "0-5:614400:3532800;6-7:806400:4320000",
       RAM_GB: String(parseInt(document.getElementById("tplRamGb").value, 10) || 16),
       DDR_TYPE: document.getElementById("tplDdrType").value.trim() || "LPDDR5X",
       DDR_VENDOR: document.getElementById("tplDdrVendor").value.trim() || "SKhynix",
@@ -579,7 +611,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("btnClearProbe").onclick = async () => {
     await ksuExec(`"${CLI_BIN}" probe clear`);
     refreshProbeAndTelemetry();
-    toast("已清空探针与崩溃日志缓冲区");
+    toast("已清空持久化探针与崩溃日志文件");
   };
 
   document.getElementById("btnClearTelemetry").onclick = async () => {

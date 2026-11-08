@@ -24,7 +24,7 @@ static void print_usage() {
         << "  template set-stdin                       Create or update template reading JSON from stdin\n"
         << "  template delete <id>                     Delete template and unbind apps\n\n"
         << "Prop Alchemy Commands:\n"
-        << "  parse-prop <file|-> [--save] [--id <id>] Parse build.prop & infer GPU/SoC/DDR/VFS topology\n\n"
+        << "  parse-prop <file|-> [--save] [--id <id>] Parse build.prop & infer GPU/SoC/Clusters/DDR\n\n"
         << "App Route Commands:\n"
         << "  route set <pkg> <tpl_id> [--build 0|1] [--gl 0|1] [--vfs 0|1] [--probe 0|1] [--sdk 0|1] [--restart]\n"
         << "  route remove <pkg> [--restart]           Remove spoofing for package\n\n"
@@ -34,7 +34,7 @@ static void print_usage() {
         << "  probe crashes [--limit <n>] [--json]     Show native crash signal diagnostics & backtraces\n"
         << "  probe telemetry [--limit <n>] [--json]   Show app injection telemetry history\n"
         << "  probe capture <pkg> <key> <val>          Capture unmapped prop into bound template\n"
-        << "  probe clear                              Clear logcat probe & crash buffer\n"
+        << "  probe clear                              Clear persistent probe & crash log files\n"
         << "  probe clear-telemetry                    Clear launch telemetry history\n";
 }
 
@@ -80,6 +80,12 @@ int main(int argc, char **argv) {
 
     if (cmd == "init") {
         store.init_storage(true);
+        // 确保 SCM_RIGHTS 持久化日志文件存在且权限正确
+        int p_fd = open(PROBE_LOG_FILE, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+        if (p_fd >= 0) close(p_fd);
+        int c_fd = open(CRASH_LOG_FILE, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+        if (c_fd >= 0) close(c_fd);
+
         if (json_mode) {
             std::cout << "{\"ok\":true,\"version\":\"" << MIRAGE_VERSION << "\"}\n";
         } else {

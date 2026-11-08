@@ -31,7 +31,7 @@ constexpr const char *ROUTES_DB_PATH        = "/data/adb/mirage_forge/routes.db"
 constexpr const char *APPS_CONF_DIR         = "/data/adb/mirage_forge/apps";
 constexpr const char *LAUNCH_LOG_PATH       = "/data/adb/mirage_forge/launch_history.log";
 
-// 线程局部重入保护器：防止 Hook 函数内部调用 libc 或 unwind 时触发递归死锁
+// 线程局部重入保护器
 inline thread_local bool g_tls_in_hook = false;
 
 struct ScopedHookGuard {
@@ -74,7 +74,6 @@ struct alignas(4) BionicPropInfoCompat {
 
 class SyntheticPropArena {
 public:
-    // 启动阶段预热完毕后，运行期查询完全无锁或极轻量读取
     const prop_info *obtain(const std::string &name, const std::string &val) {
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = by_name_.find(name);
@@ -117,6 +116,17 @@ private:
 
 inline SyntheticPropArena g_prop_arena;
 
+// 异构 CPU 核心分簇描述结构 (用于伪装每一颗核心的最小/最大/实时跳动频率与 policy* 节点)
+struct CpuClusterSpec {
+    int first_core = 0;
+    int last_core = 5;
+    int min_freq_khz = 614400;
+    int max_freq_khz = 3532800;
+    uint32_t cpu_part = 0xd85;
+    int capacity = 768;
+    std::vector<int> opp_freqs_khz;
+};
+
 struct MirageContext {
     bool active = false;
     bool enable_build_props = true;
@@ -124,7 +134,7 @@ struct MirageContext {
     bool enable_vfs_shield = true;
     bool enable_maps_cloak = true;
     bool enable_probe = false;
-    bool force_spoof_sdk = false; // 默认 false，防止跨大版本修改 SDK_INT 导致应用调不存在的 API 闪退
+    bool force_spoof_sdk = false;
 
     std::string pkg_name;
 
@@ -136,13 +146,14 @@ struct MirageContext {
     uint32_t vulkan_vendor_id = 0x5143;
     uint32_t vulkan_device_id = 0x43050000;
 
-    // VFS & Syscall & DDR 内存对称参数
+    // VFS & 异构多簇 CPU & DDR 物理内存对称参数
     std::string cpu_hardware = "Qualcomm Technologies, Inc SM8750";
     std::string cpu_arch = "aarch64";
     std::string soc_id = "618";
     std::string soc_family = "Snapdragon";
     std::string soc_machine = "SM8750";
     std::string cpu_midr_el1 = "0x00000000511f8000";
+    std::string cpu_clusters_spec; // 可选自定义分簇配置，如 "0-5:614400:3532800;6-7:806400:4320000"
     int cpu_cores = 8;
     int cpu_max_freq_khz = 4320000;
     int ram_gb = 16;
@@ -151,6 +162,7 @@ struct MirageContext {
     std::string kernel_release = "6.6.30-android15-8-g94b8f12ab4c1";
     std::string kernel_version = "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025";
 
+    std::vector<CpuClusterSpec> clusters;
     std::unordered_map<std::string, std::string> prop_map;
     std::unordered_map<std::string, std::string> build_map;
     std::unordered_map<std::string, std::string> version_map;
@@ -161,20 +173,21 @@ inline MirageContext g_ctx;
 inline std::mutex g_probe_mtx;
 inline std::unordered_set<uint64_t> g_probe_dedup;
 
-// 输出携带实时 Native 调用栈的探针审计日志
-// 格式: [PROBE][pkg][DOMAIN] key => val @@ caller_chain
+// 输出携带实时 Native 调用栈的探针审计日志（直写 SCM_RIGHTS 文件描述符，无视商业 ROM 禁日志）
 inline void emit_probe(const char *domain, const std::string &key, const std::string &val) {
     if (!g_ctx.enable_probe) return;
     std::string composite = std::string(domain) + ":" + key;
     uint64_t h = hash_str(composite);
     {
         std::lock_guard<std::mutex> lock(g_probe_mtx);
-        if (g_probe_dedup.size() > 1024) return;
+        if (g_probe_dedup.size() > 1500) return;
         if (!g_probe_dedup.insert(h).second) return;
     }
-    std::string stack = capture_caller_chain(2, 4);
-    LOGI("[PROBE][%s][%s] %s => %s @@ %s",
-         g_ctx.pkg_name.c_str(), domain, key.c_str(), val.c_str(), stack.c_str());
+    std::string stack = capture_caller_chain(2, 5);
+    std::ostringstream ss;
+    ss << "[PROBE][" << g_ctx.pkg_name << "][" << domain << "] "
+       << key << " => " << val << " @@ " << stack;
+    write_direct_log_line(g_probe_log_fd, ANDROID_LOG_INFO, ss.str());
 }
 
 inline bool write_full(int fd, const void *buf, size_t len) {

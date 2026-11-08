@@ -12,9 +12,30 @@
 namespace mirage {
 
 struct CloakedFdEntry {
-    std::string fake_target_path; // 例如 "/proc/cpuinfo" 或 "/system/build.prop"
+    std::string fake_target_path;
     size_t content_size;
 };
+
+template <typename StatT>
+inline void populate_virtual_stat(StatT *buf, const std::string &fake_path, size_t content_size) {
+    if (!buf) return;
+    std::memset(buf, 0, sizeof(StatT));
+    buf->st_dev = 0xFE00;
+    buf->st_ino = static_cast<decltype(buf->st_ino)>(hash_str(fake_path) & 0x7FFFFFFFull);
+    buf->st_mode = S_IFREG | S_IRUSR | S_IRGRP | S_IROTH; // 0100444
+    buf->st_nlink = 1;
+    buf->st_uid = 0;
+    buf->st_gid = 0;
+    // Linux /proc 与 /sys 伪文件系统下节点 st_size 为 0 或 4096，普通 build.prop 为真实字节数
+    if (fake_path.rfind("/proc/", 0) == 0) {
+        buf->st_size = 0;
+    } else if (fake_path.rfind("/sys/", 0) == 0) {
+        buf->st_size = 4096;
+    } else {
+        buf->st_size = static_cast<decltype(buf->st_size)>(content_size);
+    }
+    buf->st_blksize = 4096;
+}
 
 class FdCloakTracker {
 public:
@@ -30,16 +51,15 @@ public:
         table_.erase(fd);
     }
 
-    // 检查如 "/proc/self/fd/42" 或 "/proc/12345/fd/42" 是否指向我们的虚拟 memfd
     bool resolve_proc_fd_link(const char *pathname, std::string *out_real_path) {
         if (!pathname) return false;
-        const char *fd_Segment = std::strstr(pathname, "/fd/");
-        if (!fd_Segment) return false;
+        const char *fd_seg = std::strstr(pathname, "/fd/");
+        if (!fd_seg) return false;
         if (std::strncmp(pathname, "/proc/", 6) != 0) return false;
 
         char *endptr = nullptr;
-        long fd_num = std::strtol(fd_Segment + 4, &endptr, 10);
-        if (endptr == fd_Segment + 4 || *endptr != '\0' || fd_num < 0) return false;
+        long fd_num = std::strtol(fd_seg + 4, &endptr, 10);
+        if (endptr == fd_seg + 4 || *endptr != '\0' || fd_num < 0) return false;
 
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = table_.find(static_cast<int>(fd_num));
@@ -48,23 +68,13 @@ public:
         return true;
     }
 
-    bool get_cloaked_stat(int fd, struct stat *buf) {
+    template <typename StatT>
+    bool get_cloaked_stat(int fd, StatT *buf) {
         if (fd < 0 || !buf) return false;
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = table_.find(fd);
         if (it == table_.end()) return false;
-
-        std::memset(buf, 0, sizeof(struct stat));
-        buf->st_dev = 0xFE00; // 伪装块设备号，隐藏匿名 tmpfs/memfd 特征
-        buf->st_ino = static_cast<ino_t>(hash_str(it->second.fake_target_path) & 0x7FFFFFFFull);
-        buf->st_mode = S_IFREG | S_IRUSR | S_IRGRP | S_IROTH; // 0100444 只读普通文件
-        buf->st_nlink = 1;
-        buf->st_uid = 0;
-        buf->st_gid = 0;
-        buf->st_size = (it->second.fake_target_path.rfind("/proc/", 0) == 0)
-                           ? 0 // 真实 Linux /proc 伪文件 st_size 恒为 0！
-                           : static_cast<off_t>(it->second.content_size);
-        buf->st_blksize = 4096;
+        populate_virtual_stat(buf, it->second.fake_target_path, it->second.content_size);
         return true;
     }
 

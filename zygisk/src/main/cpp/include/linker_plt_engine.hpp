@@ -27,7 +27,7 @@ inline void scan_and_commit_plt_hooks();
 
 inline void *hook_dlsym(void *handle, const char *symbol) {
     if (symbol && !g_tls_in_hook) {
-        if (g_ctx.enable_build_props) {
+        if (g_ctx.enable_build_props || g_ctx.enable_probe) {
             if (std::strcmp(symbol, "__system_property_find") == 0) return reinterpret_cast<void *>(hook_system_property_find);
             if (std::strcmp(symbol, "__system_property_read_callback") == 0) return reinterpret_cast<void *>(hook_system_property_read_callback);
             if (std::strcmp(symbol, "__system_property_read") == 0) return reinterpret_cast<void *>(hook_system_property_read);
@@ -37,13 +37,27 @@ inline void *hook_dlsym(void *handle, const char *symbol) {
             if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
         }
         if (g_ctx.enable_vfs_shield) {
-            if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
-            if (std::strcmp(symbol, "__openat_2") == 0) return reinterpret_cast<void *>(hook_openat_2);
             if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
+            if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
+            if (std::strcmp(symbol, "__open_2") == 0) return reinterpret_cast<void *>(hook_open_2);
+            if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
+            if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
+            if (std::strcmp(symbol, "__openat_2") == 0) return reinterpret_cast<void *>(hook_openat_2);
+            if (std::strcmp(symbol, "__openat64_2") == 0) return reinterpret_cast<void *>(hook_openat64_2);
             if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
+            if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
+            if (std::strcmp(symbol, "access") == 0) return reinterpret_cast<void *>(hook_access);
+            if (std::strcmp(symbol, "faccessat") == 0) return reinterpret_cast<void *>(hook_faccessat);
+            if (std::strcmp(symbol, "stat") == 0) return reinterpret_cast<void *>(hook_stat);
+            if (std::strcmp(symbol, "stat64") == 0) return reinterpret_cast<void *>(hook_stat64);
+            if (std::strcmp(symbol, "lstat") == 0) return reinterpret_cast<void *>(hook_lstat);
+            if (std::strcmp(symbol, "lstat64") == 0) return reinterpret_cast<void *>(hook_lstat64);
+            if (std::strcmp(symbol, "fstatat") == 0) return reinterpret_cast<void *>(hook_fstatat);
+            if (std::strcmp(symbol, "fstatat64") == 0) return reinterpret_cast<void *>(hook_fstatat64);
+            if (std::strcmp(symbol, "fstat") == 0) return reinterpret_cast<void *>(hook_fstat);
+            if (std::strcmp(symbol, "fstat64") == 0) return reinterpret_cast<void *>(hook_fstat64);
             if (std::strcmp(symbol, "readlink") == 0) return reinterpret_cast<void *>(hook_readlink);
             if (std::strcmp(symbol, "readlinkat") == 0) return reinterpret_cast<void *>(hook_readlinkat);
-            if (std::strcmp(symbol, "fstat") == 0) return reinterpret_cast<void *>(hook_fstat);
             if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
             if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
             if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
@@ -59,7 +73,6 @@ inline void *hook_dlsym(void *handle, const char *symbol) {
     return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
 }
 
-// 判断动态加载的库是否需要触发增量 PLT 扫描（跳过早已在 Zygote 中扫描过的系统基础库，消除启动卡顿）
 inline bool should_rescan_on_dlopen(const char *filename) {
     if (!filename) return false;
     if (std::strncmp(filename, "/system/", 8) == 0 ||
@@ -95,7 +108,7 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
 
 inline void scan_and_commit_plt_hooks() {
     if (!g_zygisk_api) return;
-    if (!g_maps_mtx.try_lock()) return; // 使用 try_lock 避免多线程并发 dlopen 阻塞主线程
+    if (!g_maps_mtx.try_lock()) return;
 
     FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
     if (!fp) {
@@ -126,9 +139,17 @@ inline void scan_and_commit_plt_hooks() {
             path[--len] = '\0';
         }
 
-        // 只扫描真实 ELF 动态库 (.so)，跳过 .dex/.vdex/.art/.apk/.jar/字体/资源映射，大幅提速！
-        if (path[0] != '/' ||
-            std::strstr(path, ".so") == nullptr ||
+        // 兼容 extractNativeLibs="false" 直接从 base.apk / split_config.arm64_v8a.apk 映射的未解压可执行段
+        bool is_exec_or_elf = (std::strchr(perms, 'x') != nullptr) ||
+                              (std::strstr(path, ".so") != nullptr) ||
+                              (std::strstr(path, ".apk") != nullptr);
+
+        if (path[0] != '/' || !is_exec_or_elf ||
+            std::strstr(path, ".oat") != nullptr ||
+            std::strstr(path, ".odex") != nullptr ||
+            std::strstr(path, ".vdex") != nullptr ||
+            std::strstr(path, ".art") != nullptr ||
+            std::strstr(path, ".dex") != nullptr ||
             std::strstr(path, "/libc.so") != nullptr ||
             std::strstr(path, "/libdl.so") != nullptr ||
             std::strstr(path, "/libart.so") != nullptr ||
@@ -145,7 +166,6 @@ inline void scan_and_commit_plt_hooks() {
         }
         dirty = true;
 
-        // 关键修复：若 orig_fn 已在 onLoad 中通过 dlsym 拿到真实地址，则传入 dummy 槽位，绝不覆写 orig_fn！
         auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
             void *dummy_old = nullptr;
             void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &dummy_old;
@@ -168,15 +188,28 @@ inline void scan_and_commit_plt_hooks() {
         }
 
         if (g_ctx.enable_vfs_shield) {
-            reg("openat", reinterpret_cast<void *>(hook_openat), reinterpret_cast<void **>(&orig_openat));
-            reg("__openat_2", reinterpret_cast<void *>(hook_openat_2), reinterpret_cast<void **>(&orig_openat_2));
             reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
+            reg("open64", reinterpret_cast<void *>(hook_open64), reinterpret_cast<void **>(&orig_open64));
+            reg("__open_2", reinterpret_cast<void *>(hook_open_2), reinterpret_cast<void **>(&orig_open_2));
+            reg("openat", reinterpret_cast<void *>(hook_openat), reinterpret_cast<void **>(&orig_openat));
+            reg("openat64", reinterpret_cast<void *>(hook_openat64), reinterpret_cast<void **>(&orig_openat64));
+            reg("__openat_2", reinterpret_cast<void *>(hook_openat_2), reinterpret_cast<void **>(&orig_openat_2));
+            reg("__openat64_2", reinterpret_cast<void *>(hook_openat64_2), reinterpret_cast<void **>(&orig_openat64_2));
             reg("fopen", reinterpret_cast<void *>(hook_fopen), reinterpret_cast<void **>(&orig_fopen));
             reg("fopen64", reinterpret_cast<void *>(hook_fopen64), reinterpret_cast<void **>(&orig_fopen64));
             reg("close", reinterpret_cast<void *>(hook_close), reinterpret_cast<void **>(&orig_close));
+            reg("access", reinterpret_cast<void *>(hook_access), reinterpret_cast<void **>(&orig_access));
+            reg("faccessat", reinterpret_cast<void *>(hook_faccessat), reinterpret_cast<void **>(&orig_faccessat));
+            reg("stat", reinterpret_cast<void *>(hook_stat), reinterpret_cast<void **>(&orig_stat));
+            reg("stat64", reinterpret_cast<void *>(hook_stat64), reinterpret_cast<void **>(&orig_stat64));
+            reg("lstat", reinterpret_cast<void *>(hook_lstat), reinterpret_cast<void **>(&orig_lstat));
+            reg("lstat64", reinterpret_cast<void *>(hook_lstat64), reinterpret_cast<void **>(&orig_lstat64));
+            reg("fstatat", reinterpret_cast<void *>(hook_fstatat), reinterpret_cast<void **>(&orig_fstatat));
+            reg("fstatat64", reinterpret_cast<void *>(hook_fstatat64), reinterpret_cast<void **>(&orig_fstatat64));
+            reg("fstat", reinterpret_cast<void *>(hook_fstat), reinterpret_cast<void **>(&orig_fstat));
+            reg("fstat64", reinterpret_cast<void *>(hook_fstat64), reinterpret_cast<void **>(&orig_fstat64));
             reg("readlink", reinterpret_cast<void *>(hook_readlink), reinterpret_cast<void **>(&orig_readlink));
             reg("readlinkat", reinterpret_cast<void *>(hook_readlinkat), reinterpret_cast<void **>(&orig_readlinkat));
-            reg("fstat", reinterpret_cast<void *>(hook_fstat), reinterpret_cast<void **>(&orig_fstat));
             reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo));
             reg("sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf));
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));

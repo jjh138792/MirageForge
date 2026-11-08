@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdio>
+#include <unordered_set>
 #include "store_engine.hpp"
 
 namespace mirage::cli {
@@ -10,7 +11,7 @@ struct ProbeEvent {
     std::string domain;
     std::string key;
     std::string value;
-    std::string stack; // v1.0.1 新增: 精确到 .so!symbol+0xoffset 的调用栈回溯链
+    std::string stack;
     bool unmapped = false;
 };
 
@@ -32,33 +33,72 @@ struct TelemetryEvent {
 
 class ProbeDoctor {
 public:
+    // 自动检查日志文件大小，超过 2MB 时裁剪保留最新 800KB
+    static void rotate_log_if_needed(const char *path) {
+        struct stat st{};
+        if (stat(path, &st) == 0 && st.st_size > 2 * 1024 * 1024) {
+            std::string raw = read_file_to_string(path);
+            if (raw.size() > 800 * 1024) {
+                size_t pos = raw.find('\n', raw.size() - 800 * 1024);
+                if (pos != std::string::npos) {
+                    write_file_atomic(path, raw.substr(pos + 1), 0600);
+                }
+            }
+        }
+    }
+
     static std::vector<ProbeEvent> query_probe_logs(const std::string &filter_pkg = "",
                                                     bool unmapped_only = false,
                                                     size_t limit = 150) {
-        std::vector<ProbeEvent> events;
-        FILE *fp = popen("logcat -d -s MirageForge:I 2>/dev/null", "r");
-        if (!fp) return events;
+        rotate_log_if_needed(PROBE_LOG_FILE);
 
-        char buf[1536];
         std::vector<std::string> raw_lines;
-        while (std::fgets(buf, sizeof(buf), fp)) {
-            const char *tag_pos = std::strstr(buf, "[PROBE][");
-            if (tag_pos) {
-                raw_lines.emplace_back(tag_pos);
+
+        // 1. 主通道：直接从 SCM_RIGHTS 持久化的 /data/adb/mirage_forge/probe_events.log 读取
+        std::string file_content = read_file_to_string(PROBE_LOG_FILE);
+        if (!file_content.empty()) {
+            for (const std::string &line : split_lines(file_content)) {
+                size_t pos = line.find("[PROBE][");
+                if (pos != std::string::npos) {
+                    raw_lines.push_back(line.substr(pos));
+                }
             }
         }
-        pclose(fp);
 
+        // 2. 兜底合并通道：若持久化文件为空，顺带扫描一次 logcat 缓冲区
+        if (raw_lines.empty()) {
+            FILE *fp = popen("logcat -d -s MirageForge:I 2>/dev/null", "r");
+            if (fp) {
+                char buf[1536];
+                while (std::fgets(buf, sizeof(buf), fp)) {
+                    const char *tag_pos = std::strstr(buf, "[PROBE][");
+                    if (tag_pos) {
+                        raw_lines.emplace_back(tag_pos);
+                    }
+                }
+                pclose(fp);
+            }
+        }
+
+        std::vector<ProbeEvent> events;
+        std::unordered_set<std::string> dedup;
+
+        // 逆序遍历（最新触发的探针与调用栈排在最前）
         for (auto it = raw_lines.rbegin(); it != raw_lines.rend(); ++it) {
             ProbeEvent ev;
             if (!parse_probe_line(*it, &ev)) continue;
+
             if (!filter_pkg.empty() &&
                 ev.pkg.find(filter_pkg) == std::string::npos &&
                 ev.key.find(filter_pkg) == std::string::npos &&
+                ev.domain.find(filter_pkg) == std::string::npos &&
                 ev.stack.find(filter_pkg) == std::string::npos) {
                 continue;
             }
             if (unmapped_only && !ev.unmapped) continue;
+
+            std::string sig = ev.pkg + "|" + ev.domain + "|" + ev.key + "|" + ev.value;
+            if (!dedup.insert(sig).second) continue;
 
             events.push_back(ev);
             if (events.size() >= limit) break;
@@ -67,20 +107,37 @@ public:
     }
 
     static std::vector<CrashEvent> query_crash_logs(size_t limit = 50) {
-        std::vector<CrashEvent> crashes;
-        FILE *fp = popen("logcat -d -s MirageForge:E 2>/dev/null", "r");
-        if (!fp) return crashes;
+        rotate_log_if_needed(CRASH_LOG_FILE);
 
-        char buf[1536];
         std::vector<std::string> raw_lines;
-        while (std::fgets(buf, sizeof(buf), fp)) {
-            const char *tag_pos = std::strstr(buf, "[CRASH][");
-            if (tag_pos) {
-                raw_lines.emplace_back(tag_pos);
+
+        // 1. 主通道：直接从 /data/adb/mirage_forge/crash_events.log 读取
+        std::string file_content = read_file_to_string(CRASH_LOG_FILE);
+        if (!file_content.empty()) {
+            for (const std::string &line : split_lines(file_content)) {
+                size_t pos = line.find("[CRASH][");
+                if (pos != std::string::npos) {
+                    raw_lines.push_back(line.substr(pos));
+                }
             }
         }
-        pclose(fp);
 
+        // 2. 兜底通道
+        if (raw_lines.empty()) {
+            FILE *fp = popen("logcat -d -s MirageForge:E 2>/dev/null", "r");
+            if (fp) {
+                char buf[1536];
+                while (std::fgets(buf, sizeof(buf), fp)) {
+                    const char *tag_pos = std::strstr(buf, "[CRASH][");
+                    if (tag_pos) {
+                        raw_lines.emplace_back(tag_pos);
+                    }
+                }
+                pclose(fp);
+            }
+        }
+
+        std::vector<CrashEvent> crashes;
         for (auto it = raw_lines.rbegin(); it != raw_lines.rend(); ++it) {
             CrashEvent ce;
             if (!parse_crash_line(*it, &ce)) continue;
@@ -206,7 +263,12 @@ public:
         return store.save_all_and_compile();
     }
 
+    // 清空持久化探针日志文件、崩溃日志文件及 logcat 缓存
     static void clear_logs() {
+        int p_fd = open(PROBE_LOG_FILE, O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+        if (p_fd >= 0) close(p_fd);
+        int c_fd = open(CRASH_LOG_FILE, O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+        if (c_fd >= 0) close(c_fd);
         std::system("logcat -c >/dev/null 2>&1");
     }
 
@@ -215,7 +277,6 @@ public:
     }
 
 private:
-    // 解析格式: [PROBE][com.pkg][DOMAIN] key => val @@ caller_chain
     static bool parse_probe_line(const std::string &s, ProbeEvent *out) {
         if (s.rfind("[PROBE][", 0) != 0) return false;
         size_t p1 = s.find(']', 8);
@@ -253,7 +314,6 @@ private:
         return true;
     }
 
-    // 解析格式: [CRASH][com.pkg][SIGSEGV] code=1 fault_addr=0x0 | Stack: libA.so!sym+0x10 <- ...
     static bool parse_crash_line(const std::string &s, CrashEvent *out) {
         if (s.rfind("[CRASH][", 0) != 0) return false;
         size_t p1 = s.find(']', 8);
