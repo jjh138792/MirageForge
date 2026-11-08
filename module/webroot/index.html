@@ -14,7 +14,7 @@
         <div class="logo-badge">蜃</div>
         <div>
           <h1>蜃楼工坊 <span class="ver-tag">v1.0.1 Hypervisor</span></h1>
-          <p class="subtitle">DDR 物理内存对称 · 调用栈回溯 · 崩溃诊断 · 隐身 VFS</p>
+          <p class="subtitle">单核动态频率 · DDR 对称内存 · SCM_RIGHTS 探针 · 调用栈回溯</p>
         </div>
       </div>
       <div class="stat-pill" id="statusPill">连接 CLI 中...</div>
@@ -44,7 +44,7 @@
     <main id="tab-parser" class="tab-panel">
       <div class="glass-card">
         <h2>C++ 原生 build.prop 炼金引擎 (mirageforge_cli parse-prop)</h2>
-        <p class="hint-text">上传或粘贴提取自任意 ROM 的 <code>build.prop</code>，底层 <code>mirageforge_cli</code> 将自动提取机型、指纹、安全补丁，并根据平台代号自动推导配套的 <b>Vulkan/GLES GPU 渲染器</b>、<b>LPDDR 内存规格</b>、<b>SoC ID</b> 及全量跨品牌私有属性。</p>
+        <p class="hint-text">上传或粘贴提取自任意 ROM 的 <code>build.prop</code>，底层 <code>mirageforge_cli</code> 将自动提取机型、指纹、安全补丁，并根据平台代号自动推导配套的 <b>异构 CPU 分簇单核频率表</b>、<b>Vulkan/GLES 渲染器</b>、<b>LPDDR 规格</b> 及全量跨品牌私有属性。</p>
         
         <div class="upload-zone" id="uploadZone">
           <input type="file" id="propFileInput" accept=".prop,.txt,.conf,*/*" hidden />
@@ -82,8 +82,8 @@
       <div class="glass-card crash-card" id="crashCard">
         <div class="section-header">
           <div>
-            <h2>💥 Native 崩溃信号现场捕获 (SIGSEGV / SIGABRT)</h2>
-            <p class="hint-text">当开启探针的应用发生底层闪退时，信号拦截器会自动捕获故障地址与崩溃调用栈。</p>
+            <h2>💥 Native 崩溃信号现场捕获 (crash_events.log)</h2>
+            <p class="hint-text">基于 <code>SCM_RIGHTS</code> 跨进程文件描述符直写磁盘，无视系统 logd 限制，实时捕获崩溃信号、故障地址与调用栈。</p>
           </div>
         </div>
         <div id="crashLogList" class="probe-list" style="max-height: 180px;">
@@ -94,7 +94,7 @@
       <!-- 2. 注入遥测卡片 -->
       <div class="glass-card">
         <div class="section-header">
-          <h2>🚀 Zygisk 实时注入遥测 (probe telemetry)</h2>
+          <h2>🚀 Zygisk 实时注入遥测 (launch_history.log)</h2>
           <button class="btn-secondary" id="btnClearTelemetry">清空遥测</button>
         </div>
         <div id="telemetryList" class="probe-list" style="max-height: 160px;">
@@ -106,12 +106,12 @@
       <div class="glass-card">
         <div class="section-header">
           <div>
-            <h2>📡 幻境探针 · 硬件嗅探审计与 Native 调用栈回溯</h2>
-            <p class="hint-text">不仅记录应用读取了哪个属性或硬件节点，还通过 <code>_Unwind_Backtrace</code> + <code>dladdr</code> 实时还原调用者所在的 <code>.so!函数+偏移量</code>。点击 <b>「+ 捕获入库」</b> 可将未映射属性一键写入对应模板。</p>
+            <h2>📡 幻境探针 · 硬件嗅探审计与 Native 调用栈回溯 (probe_events.log)</h2>
+            <p class="hint-text">由 Root 守护进程通过 <code>SCM_RIGHTS</code> 授予目标应用直写句柄，记录属性读取、VFS 单核频率访问与 <code>_Unwind_Backtrace</code> 调用栈。点击 <b>「+ 捕获入库」</b> 可将未映射属性一键写入对应模板。</p>
           </div>
         </div>
         <div class="probe-toolbar">
-          <input type="text" id="probeFilterInput" placeholder="过滤包名、属性名或调用库 (如 libtersafe / UNMAPPED)..." />
+          <input type="text" id="probeFilterInput" placeholder="过滤包名、属性名或调用库 (如 cpufreq / libtersafe / UNMAPPED)..." />
           <div class="btn-group">
             <button class="chip" id="btnToggleUnmapped">仅看未映射</button>
             <button class="btn-danger" id="btnClearProbe">清空日志</button>
@@ -119,7 +119,7 @@
           </div>
         </div>
         <div id="probeLogList" class="probe-list">
-          <div class="probe-empty">点击「刷新」通过 mirageforge_cli 扫描底层硬件探测行为与调用栈...</div>
+          <div class="probe-empty">点击「刷新」从 probe_events.log 读取底层硬件探测行为与调用栈...</div>
         </div>
       </div>
     </main>
@@ -199,17 +199,28 @@
         </label>
       </div>
 
-      <div class="modal-section-title">三、隐身 VFS 节点与物理内存 (DDR) 对称拓扑</div>
+      <div class="modal-section-title">三、异构单核频率 (cpufreq/policy*) 与对称物理内存 (DDR)</div>
       <div class="form-grid">
         <label class="full-width">/proc/cpuinfo Hardware 描述
           <input type="text" id="tplCpuHw" placeholder="Qualcomm Technologies, Inc SM8750" />
         </label>
-        <label>虚拟 CPU 核心数
+        <label>虚拟 CPU 总核心数
           <input type="text" id="tplCpuCores" placeholder="8" />
         </label>
-        <label>CPU 最高主频 (kHz)
+        <label>最高峰值主频 (kHz)
           <input type="text" id="tplCpuFreq" placeholder="4320000" />
         </label>
+        <div class="full-width cluster-box">
+          <div class="cluster-head">
+            <span>异构每核心频率分簇拓扑 (CPU_CLUSTERS: <code>起始核-结束核:最小kHz:最大kHz</code>)</span>
+            <div class="cluster-presets">
+              <button type="button" class="preset-tag" data-clusters="0-5:614400:3532800;6-7:806400:4320000" data-max="4320000">骁龙8至尊 (6+2)</button>
+              <button type="button" class="preset-tag" data-clusters="0-1:556800:2265600;2-6:691200:3148800;7-7:806400:3302400" data-max="3302400">8Gen3 (2+5+1)</button>
+              <button type="button" class="preset-tag" data-clusters="0-3:800000:2400000;4-6:1000000:3300000;7-7:1200000:3620000" data-max="3620000">天玑9400 (4+3+1)</button>
+            </div>
+          </div>
+          <input type="text" id="tplCpuClusters" placeholder="0-5:614400:3532800;6-7:806400:4320000" />
+        </div>
         <label>物理安装内存 (RAM GB)
           <input type="text" id="tplRamGb" placeholder="16 或 24" />
         </label>
