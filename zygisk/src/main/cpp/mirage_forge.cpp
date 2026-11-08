@@ -6,6 +6,7 @@
 #include <sstream>
 #include <fstream>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 
 #include "zygisk.hpp"
@@ -41,15 +42,30 @@ public:
         orig_system_property_foreach = reinterpret_cast<decltype(orig_system_property_foreach)>(dlsym(RTLD_DEFAULT, "__system_property_foreach"));
         orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 
-        orig_openat = reinterpret_cast<decltype(orig_openat)>(dlsym(RTLD_DEFAULT, "openat"));
-        orig_openat_2 = reinterpret_cast<decltype(orig_openat_2)>(dlsym(RTLD_DEFAULT, "__openat_2"));
         orig_open = reinterpret_cast<decltype(orig_open)>(dlsym(RTLD_DEFAULT, "open"));
+        orig_open64 = reinterpret_cast<decltype(orig_open64)>(dlsym(RTLD_DEFAULT, "open64"));
+        orig_open_2 = reinterpret_cast<decltype(orig_open_2)>(dlsym(RTLD_DEFAULT, "__open_2"));
+        orig_openat = reinterpret_cast<decltype(orig_openat)>(dlsym(RTLD_DEFAULT, "openat"));
+        orig_openat64 = reinterpret_cast<decltype(orig_openat64)>(dlsym(RTLD_DEFAULT, "openat64"));
+        orig_openat_2 = reinterpret_cast<decltype(orig_openat_2)>(dlsym(RTLD_DEFAULT, "__openat_2"));
+        orig_openat64_2 = reinterpret_cast<decltype(orig_openat64_2)>(dlsym(RTLD_DEFAULT, "__openat64_2"));
         orig_fopen = reinterpret_cast<decltype(orig_fopen)>(dlsym(RTLD_DEFAULT, "fopen"));
         orig_fopen64 = reinterpret_cast<decltype(orig_fopen64)>(dlsym(RTLD_DEFAULT, "fopen64"));
         orig_close = reinterpret_cast<decltype(orig_close)>(dlsym(RTLD_DEFAULT, "close"));
+
+        orig_access = reinterpret_cast<decltype(orig_access)>(dlsym(RTLD_DEFAULT, "access"));
+        orig_faccessat = reinterpret_cast<decltype(orig_faccessat)>(dlsym(RTLD_DEFAULT, "faccessat"));
+        orig_stat = reinterpret_cast<decltype(orig_stat)>(dlsym(RTLD_DEFAULT, "stat"));
+        orig_stat64 = reinterpret_cast<decltype(orig_stat64)>(dlsym(RTLD_DEFAULT, "stat64"));
+        orig_lstat = reinterpret_cast<decltype(orig_lstat)>(dlsym(RTLD_DEFAULT, "lstat"));
+        orig_lstat64 = reinterpret_cast<decltype(orig_lstat64)>(dlsym(RTLD_DEFAULT, "lstat64"));
+        orig_fstatat = reinterpret_cast<decltype(orig_fstatat)>(dlsym(RTLD_DEFAULT, "fstatat"));
+        orig_fstatat64 = reinterpret_cast<decltype(orig_fstatat64)>(dlsym(RTLD_DEFAULT, "fstatat64"));
+        orig_fstat = reinterpret_cast<decltype(orig_fstat)>(dlsym(RTLD_DEFAULT, "fstat"));
+        orig_fstat64 = reinterpret_cast<decltype(orig_fstat64)>(dlsym(RTLD_DEFAULT, "fstat64"));
+
         orig_readlink = reinterpret_cast<decltype(orig_readlink)>(dlsym(RTLD_DEFAULT, "readlink"));
         orig_readlinkat = reinterpret_cast<decltype(orig_readlinkat)>(dlsym(RTLD_DEFAULT, "readlinkat"));
-        orig_fstat = reinterpret_cast<decltype(orig_fstat)>(dlsym(RTLD_DEFAULT, "fstat"));
         orig_popen = reinterpret_cast<decltype(orig_popen)>(dlsym(RTLD_DEFAULT, "popen"));
         orig_uname = reinterpret_cast<decltype(orig_uname)>(dlsym(RTLD_DEFAULT, "uname"));
         orig_sysinfo = reinterpret_cast<decltype(orig_sysinfo)>(dlsym(RTLD_DEFAULT, "sysinfo"));
@@ -107,31 +123,47 @@ public:
             if (k.empty() || v.empty()) continue;
             parse_config_kv(k, v);
         }
+
+        // 接收 Root Companion 通过 SCM_RIGHTS 传递的跨进程日志文件描述符
+        uint8_t has_scm_fds = 0;
+        if (read_full(fd, &has_scm_fds, sizeof(has_scm_fds)) && has_scm_fds == 1) {
+            int p_fd = -1, c_fd = -1;
+            if (recv_log_fds(fd, &p_fd, &c_fd)) {
+                if (p_fd >= 0) {
+                    api->exemptFd(p_fd);
+                    g_probe_log_fd = p_fd;
+                }
+                if (c_fd >= 0) {
+                    api->exemptFd(c_fd);
+                    g_crash_log_fd = c_fd;
+                }
+            }
+        }
         if (orig_close) orig_close(fd); else close(fd);
 
-        // 若未强制要求篡改 SDK 版本，则移除 ro.build.version.sdk 覆盖，防止应用调错高版本 API 崩溃
         if (!g_ctx.force_spoof_sdk) {
             g_ctx.prop_map.erase("ro.build.version.sdk");
             g_ctx.prop_map.erase("ro.product.build.version.sdk");
             g_ctx.prop_map.erase("ro.system.build.version.sdk");
         }
 
-        // 1. 预热 AOSP 1:1 内存布局的 Bionic prop_info 句柄池 (含 LPDDR 物理内存对称属性)
+        // 1. 预热 AOSP 1:1 内存布局的 Bionic prop_info 句柄池
         prewarm_bionic_prop_arena();
 
-        // 2. 预合成全套 VFS 硬件拓扑节点 (含 Carveout 折算后的 /proc/meminfo 与 /proc/ddr_info)
+        // 2. 预合成全套 VFS 硬件拓扑节点 (含异构多簇单核频率与 policy* 节点)
         build_vfs_topology();
 
-        // 3. 若开启了幻境探针，同时挂载崩溃信号诊断器
+        // 3. 若开启了幻境探针，挂载崩溃信号捕获器并写入首条启动探针日志
         if (g_ctx.enable_probe) {
             install_crash_signal_logger(pkg_name);
+            emit_probe("SESSION", "MirageForge_Hook_Attached",
+                       g_ctx.build_map["MODEL"] + " | " + g_ctx.gl_renderer);
         }
 
         g_ctx.active = true;
-        LOGI("MirageForge v%s Active -> %s [Props:%zu, VFS:%zu, RAM:%dGB(%s), GPU:%s, Probe:%d]",
+        LOGI("MirageForge v%s Active -> %s [Props:%zu, VFS:%zu, Clusters:%zu, ProbeFD:%d]",
              MIRAGE_ENGINE_VERSION, pkg_name.c_str(), g_ctx.prop_map.size(),
-             g_ctx.vfs_files.size(), g_ctx.ram_gb, g_ctx.ddr_type.c_str(),
-             g_ctx.gl_renderer.c_str(), g_ctx.enable_probe);
+             g_ctx.vfs_files.size(), g_ctx.clusters.size(), g_probe_log_fd);
 
         if (g_ctx.enable_build_props) {
             reflect_java_build_fields(env);
@@ -188,6 +220,8 @@ private:
             g_ctx.cpu_cores = std::atoi(v.c_str());
         } else if (k == "VFS:CPU_MAX_FREQ") {
             g_ctx.cpu_max_freq_khz = std::atoi(v.c_str());
+        } else if (k == "VFS:CPU_CLUSTERS") {
+            g_ctx.cpu_clusters_spec = v;
         } else if (k == "VFS:RAM_GB") {
             g_ctx.ram_gb = std::atoi(v.c_str());
         } else if (k == "VFS:DDR_TYPE") {
@@ -218,7 +252,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程：极速直读 + CLI 自愈同步
+// Root Companion 守护进程：直读配置 + 通过 SCM_RIGHTS 下发跨进程日志句柄
 // ============================================================================
 static bool is_valid_pkg_name(const std::string &s) {
     if (s.empty() || s.size() > 128) return false;
@@ -234,12 +268,10 @@ static bool is_valid_pkg_name(const std::string &s) {
 static std::string fetch_profile_fast(const std::string &pkg_name) {
     std::string conf_path = std::string(APPS_CONF_DIR) + "/" + pkg_name + ".conf";
 
-    // 1. 优先极速直读 mirageforge_cli 预编译的 .conf 文件 (< 0.1ms，零 fork 开销)
     struct stat db_st{}, conf_st{};
     bool conf_exists = (stat(conf_path.c_str(), &conf_st) == 0);
     bool db_exists   = (stat(ROUTES_DB_PATH, &db_st) == 0);
 
-    // 仅当 routes.db 比 .conf 更新时，才调用一次 mirageforge_cli sync 重新生成缓存
     if (db_exists && (!conf_exists || db_st.st_mtime > conf_st.st_mtime)) {
         static time_t last_synced_mtime = 0;
         if (db_st.st_mtime > last_synced_mtime && access(CLI_BIN_PATH, X_OK) == 0) {
@@ -313,6 +345,27 @@ static void companion_handler(int fd) {
     for (const auto &kv : entries) {
         write_str(fd, kv.first);
         write_str(fd, kv.second);
+    }
+
+    // 若该应用启用了探针 (META:ENABLE_PROBE=1)，在 Root Companion 中打开日志文件并通过 SCM_RIGHTS 传递句柄
+    bool probe_enabled = (entries.count("META:ENABLE_PROBE") && entries["META:ENABLE_PROBE"] == "1");
+    if (probe_enabled) {
+        mkdir(DATA_ROOT_DIR, 0700);
+        int p_fd = open(PROBE_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+        int c_fd = open(CRASH_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+        if (p_fd >= 0 && c_fd >= 0) {
+            uint8_t has_scm = 1;
+            write_full(fd, &has_scm, sizeof(has_scm));
+            send_log_fds(fd, p_fd, c_fd);
+        } else {
+            uint8_t no_scm = 0;
+            write_full(fd, &no_scm, sizeof(no_scm));
+        }
+        if (p_fd >= 0) close(p_fd);
+        if (c_fd >= 0) close(c_fd);
+    } else {
+        uint8_t no_scm = 0;
+        write_full(fd, &no_scm, sizeof(no_scm));
     }
 
     std::string model = entries.count("BUILD:MODEL") ? entries["BUILD:MODEL"] : "Custom";
