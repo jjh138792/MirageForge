@@ -54,11 +54,12 @@ jobs:
       - name: Compile C++ Zygisk Engine & Rust mirageforge_cli (All 4 ABIs)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           ROOT_DIR="$(pwd)"
           mkdir -p "$ROOT_DIR/module/zygisk" "$ROOT_DIR/module/bin"
 
-          # 自动查找仓库中 Cargo.toml 所在的目录（兼容 cli/ 或 cli/src/main/cpp/ 等任意位置）
           CARGO_TOML_PATH="$(find . -path ./webui -prune -o -name "Cargo.toml" -print | head -n 1)"
           if [ -z "$CARGO_TOML_PATH" ]; then
             echo "! 错误：在仓库中未找到 Cargo.toml，请确认已将 cli/Cargo.toml 提交到仓库！"
@@ -95,7 +96,7 @@ jobs:
             echo "=========================================="
             (
               cd "$CLI_DIR"
-              cargo ndk -t "$ABI" -p 26 build --release
+              cargo ndk -t "$ABI" --platform 26 build --release
             )
             mkdir -p "$ROOT_DIR/module/bin/$ABI"
             cp -f "$CLI_DIR/target/$TRIPLE/release/mirageforge_cli" "$ROOT_DIR/module/bin/$ABI/mirageforge_cli"
