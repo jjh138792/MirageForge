@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#06080f" />
+  <title>MirageForge · 蜃楼工坊</title>
+  <!-- 接入 WebUI-X / KernelSU 原生安全区 Insets 与 Monet 动态取色变量 -->
+  <link rel="stylesheet" type="text/css" href="https://mui.kernelsu.org/internal/insets.css" />
+  <link rel="stylesheet" type="text/css" href="https://mui.kernelsu.org/internal/colors.css" />
+</head>
+<body>
+  <!-- 隐藏的 SVG 光学折射滤镜：为液态玻璃 (Liquid Glass) 提供真实物理边缘折射与高光色散 -->
+  <svg style="position: absolute; width: 0; height: 0; pointer-events: none;" aria-hidden="true">
+    <defs>
+      <filter id="liquid-refraction" x="-10%" y="-10%" width="120%" height="120%" color-interpolation-filters="sRGB">
+        <feTurbulence type="fractalNoise" baseFrequency="0.018 0.018" numOctaves="2" result="noise" seed="7" />
+        <feGaussianBlur in="noise" stdDeviation="1.8" result="smoothedNoise" />
+        <feDisplacementMap in="SourceGraphic" in2="smoothedNoise" scale="6" xChannelSelector="R" yChannelSelector="G" />
+      </filter>
+    </defs>
+  </svg>
+
+  <div id="app"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
