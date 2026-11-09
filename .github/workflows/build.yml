@@ -39,8 +39,10 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      - name: Install cargo-ndk (Prebuilt Fast Binary)
-        uses: taiki-e/install-action@cargo-ndk
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
 
       - name: Fetch Official zygisk.hpp (Single Canonical Path)
         run: |
@@ -53,7 +55,18 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          mkdir -p module/zygisk module/bin
+          ROOT_DIR="$(pwd)"
+          mkdir -p "$ROOT_DIR/module/zygisk" "$ROOT_DIR/module/bin"
+
+          # 自动查找仓库中 Cargo.toml 所在的目录（兼容 cli/ 或 cli/src/main/cpp/ 等任意位置）
+          CARGO_TOML_PATH="$(find . -path ./webui -prune -o -name "Cargo.toml" -print | head -n 1)"
+          if [ -z "$CARGO_TOML_PATH" ]; then
+            echo "! 错误：在仓库中未找到 Cargo.toml，请确认已将 cli/Cargo.toml 提交到仓库！"
+            exit 1
+          fi
+          CLI_DIR="$(dirname "$CARGO_TOML_PATH")"
+          echo ">>> Found Rust CLI project at: $CLI_DIR"
+
           ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
           TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake"
 
@@ -68,27 +81,27 @@ jobs:
             echo "=========================================="
             echo ">>> [1/2] Building Zygisk Library ($ABI)"
             echo "=========================================="
-            cmake -B build/zygisk_$ABI \
+            cmake -B "$ROOT_DIR/build/zygisk_$ABI" \
               -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
               -DANDROID_ABI=$ABI \
               -DANDROID_PLATFORM=android-26 \
               -DCMAKE_BUILD_TYPE=Release \
-              zygisk/src/main/cpp
-            cmake --build build/zygisk_$ABI --config Release --parallel $(nproc)
-            cp -f build/zygisk_$ABI/libmirage_forge.so module/zygisk/$ABI.so
+              "$ROOT_DIR/zygisk/src/main/cpp"
+            cmake --build "$ROOT_DIR/build/zygisk_$ABI" --config Release --parallel $(nproc)
+            cp -f "$ROOT_DIR/build/zygisk_$ABI/libmirage_forge.so" "$ROOT_DIR/module/zygisk/$ABI.so"
 
             echo "=========================================="
             echo ">>> [2/2] Building Rust mirageforge_cli ($ABI -> $TRIPLE)"
             echo "=========================================="
             (
-              cd cli
+              cd "$CLI_DIR"
               cargo ndk -t "$ABI" -p 26 build --release
             )
-            mkdir -p module/bin/$ABI
-            cp -f "cli/target/$TRIPLE/release/mirageforge_cli" "module/bin/$ABI/mirageforge_cli"
+            mkdir -p "$ROOT_DIR/module/bin/$ABI"
+            cp -f "$CLI_DIR/target/$TRIPLE/release/mirageforge_cli" "$ROOT_DIR/module/bin/$ABI/mirageforge_cli"
           done
 
-          cp -f module/bin/arm64-v8a/mirageforge_cli module/bin/mirageforge_cli
+          cp -f "$ROOT_DIR/module/bin/arm64-v8a/mirageforge_cli" "$ROOT_DIR/module/bin/mirageforge_cli"
 
       - name: Package Flashable Zip (Magisk / KSU / APatch / Recovery)
         run: |
