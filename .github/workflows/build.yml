@@ -1,4 +1,4 @@
-name: Build MirageForge v1.0.1 (Zygisk + CLI)
+name: Build MirageForge v1.1.0 (Vue WebUI + Rust CLI + Zygisk)
 
 on:
   push:
@@ -8,11 +8,24 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-mirageforge:
+  build-mirageforge-v1_1_0:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Setup Node.js 20 for Vue 3 WebUI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Vue 3 + TypeScript Liquid Glass WebUI
+        working-directory: ./webui
+        run: |
+          npm install
+          npm run build
+          ls -la ../module/webroot
+          ls -la ../module/webroot/assets
 
       - name: Setup Android NDK r26d
         uses: nttld/setup-ndk@v1
@@ -21,6 +34,14 @@ jobs:
           ndk-version: r26d
           add-to-path: true
 
+      - name: Setup Rust Toolchain & Android Targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
       - name: Fetch Official zygisk.hpp (Single Canonical Path)
         run: |
           rm -f zygisk/src/main/cpp/zygisk.hpp
@@ -28,7 +49,9 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
             -o zygisk/src/main/cpp/include/zygisk.hpp
 
-      - name: Compile Zygisk Engine & mirageforge_cli (All 4 ABIs)
+      - name: Compile Rust mirageforge_cli & C++ Zygisk Engine (All 4 ABIs)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           mkdir -p module/zygisk module/bin
           ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
@@ -48,17 +71,11 @@ jobs:
             cp -f build/zygisk_$ABI/libmirage_forge.so module/zygisk/$ABI.so
 
             echo "=========================================="
-            echo ">>> [2/2] Building mirageforge_cli ($ABI)"
+            echo ">>> [2/2] Building Rust mirageforge_cli ($ABI)"
             echo "=========================================="
-            cmake -B build/cli_$ABI \
-              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-              -DANDROID_ABI=$ABI \
-              -DANDROID_PLATFORM=android-26 \
-              -DCMAKE_BUILD_TYPE=Release \
-              cli/src/main/cpp
-            cmake --build build/cli_$ABI --config Release --parallel $(nproc)
             mkdir -p module/bin/$ABI
-            cp -f build/cli_$ABI/mirageforge_cli module/bin/$ABI/mirageforge_cli
+            cargo ndk -t $ABI -p 26 -o ./build/rust_out build --manifest-path cli/Cargo.toml --release
+            cp -f ./build/rust_out/$ABI/mirageforge_cli module/bin/$ABI/mirageforge_cli
           done
 
           cp -f module/bin/arm64-v8a/mirageforge_cli module/bin/mirageforge_cli
@@ -69,10 +86,10 @@ jobs:
           chmod +x module/customize.sh module/action.sh module/uninstall.sh
           chmod +x module/bin/mirageforge_cli module/bin/*/mirageforge_cli
           cd module
-          zip -r9 ../MirageForge-Zygisk-v1.0.1.zip . -x "*.DS_Store"
+          zip -r9 ../MirageForge-Zygisk-v1.1.0.zip . -x "*.DS_Store"
 
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MirageForge-Zygisk-v1.0.1
-          path: MirageForge-Zygisk-v1.0.1.zip
+          name: MirageForge-Zygisk-v1.1.0
+          path: MirageForge-Zygisk-v1.1.0.zip
