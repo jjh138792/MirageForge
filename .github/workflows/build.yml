@@ -39,8 +39,8 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+      - name: Install cargo-ndk (Prebuilt Fast Binary)
+        uses: taiki-e/install-action@cargo-ndk
 
       - name: Fetch Official zygisk.hpp (Single Canonical Path)
         run: |
@@ -49,7 +49,7 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
             -o zygisk/src/main/cpp/include/zygisk.hpp
 
-      - name: Compile Rust mirageforge_cli & C++ Zygisk Engine (All 4 ABIs)
+      - name: Compile C++ Zygisk Engine & Rust mirageforge_cli (All 4 ABIs)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -58,6 +58,13 @@ jobs:
           TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake"
 
           for ABI in "${ABIS[@]}"; do
+            case "$ABI" in
+              "arm64-v8a")   TRIPLE="aarch64-linux-android" ;;
+              "armeabi-v7a") TRIPLE="armv7-linux-androideabi" ;;
+              "x86_64")      TRIPLE="x86_64-linux-android" ;;
+              "x86")         TRIPLE="i686-linux-android" ;;
+            esac
+
             echo "=========================================="
             echo ">>> [1/2] Building Zygisk Library ($ABI)"
             echo "=========================================="
@@ -71,11 +78,14 @@ jobs:
             cp -f build/zygisk_$ABI/libmirage_forge.so module/zygisk/$ABI.so
 
             echo "=========================================="
-            echo ">>> [2/2] Building Rust mirageforge_cli ($ABI)"
+            echo ">>> [2/2] Building Rust mirageforge_cli ($ABI -> $TRIPLE)"
             echo "=========================================="
+            (
+              cd cli
+              cargo ndk -t "$ABI" -p 26 build --release
+            )
             mkdir -p module/bin/$ABI
-            cargo ndk -t $ABI -p 26 -o ./build/rust_out build --manifest-path cli/Cargo.toml --release
-            cp -f ./build/rust_out/$ABI/mirageforge_cli module/bin/$ABI/mirageforge_cli
+            cp -f "cli/target/$TRIPLE/release/mirageforge_cli" "module/bin/$ABI/mirageforge_cli"
           done
 
           cp -f module/bin/arm64-v8a/mirageforge_cli module/bin/mirageforge_cli
