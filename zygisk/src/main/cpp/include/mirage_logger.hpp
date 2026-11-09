@@ -7,6 +7,8 @@
 #include <cerrno>
 #include <string>
 #include <sstream>
+#include <unordered_set>
+#include <atomic>
 #include <algorithm>
 #include <unwind.h>
 #include <dlfcn.h>
@@ -14,21 +16,18 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <android/log.h>
-
-#ifndef LOG_TAG
-#define LOG_TAG "MirageForge"
-#endif
+#include "mirage_config.hpp"
 
 namespace mirage {
 
 constexpr const char *PROBE_LOG_PATH = "/data/adb/mirage_forge/probe_events.log";
 constexpr const char *CRASH_LOG_PATH = "/data/adb/mirage_forge/crash_events.log";
 
-// 由 Root Companion 通过 SCM_RIGHTS 传递并经 api->exemptFd() 豁免的日志文件描述符
 inline int g_probe_log_fd = -1;
 inline int g_crash_log_fd = -1;
+inline std::atomic_flag g_probe_spinlock = ATOMIC_FLAG_INIT;
+inline std::unordered_set<uint64_t> g_probe_dedup;
 
-// 通过 Unix Domain Socket 发送两个已打开的日志文件描述符 (Companion 端调用)
 inline bool send_log_fds(int sock_fd, int probe_fd, int crash_fd) {
     struct msghdr msg{};
     char dummy = 'M';
@@ -57,7 +56,6 @@ inline bool send_log_fds(int sock_fd, int probe_fd, int crash_fd) {
     return n == 1;
 }
 
-// 接收 Root Companion 传递过来的两个日志文件描述符 (App 进程端调用)
 inline bool recv_log_fds(int sock_fd, int *out_probe_fd, int *out_crash_fd) {
     if (!out_probe_fd || !out_crash_fd) return false;
     *out_probe_fd = -1;
@@ -111,9 +109,8 @@ inline _Unwind_Reason_Code unwind_callback(struct _Unwind_Context *context, void
     return _URC_NO_REASON;
 }
 
-// 捕获当前 Native 调用栈，兼容直接从 base.apk 内存映射的未解压 .so
-inline std::string capture_caller_chain(size_t skip_frames = 2, size_t max_frames = 5) {
-    constexpr size_t kMaxCap = 14;
+inline std::string capture_caller_chain(size_t skip_frames = 2, size_t max_frames = 4) {
+    constexpr size_t kMaxCap = 12;
     void *buffer[kMaxCap];
     size_t total_to_cap = std::min(kMaxCap, skip_frames + max_frames);
 
@@ -154,7 +151,6 @@ inline std::string capture_caller_chain(size_t skip_frames = 2, size_t max_frame
     return res.empty() ? "app_runtime" : res;
 }
 
-// 直接向 SCM_RIGHTS 继承的文件描述符追加一行日志（同时双写 logcat 备用）
 inline void write_direct_log_line(int fd, int prio, const std::string &line) {
     __android_log_print(prio, LOG_TAG, "%s", line.c_str());
     if (fd >= 0) {
@@ -164,7 +160,24 @@ inline void write_direct_log_line(int fd, int prio, const std::string &line) {
     }
 }
 
-// 崩溃信号现场诊断器
+// 极速探针记录：未开启探针时 1 周期内联返回，零开销
+inline void emit_probe(const char *domain, const std::string &key, const std::string &val) {
+    if (__builtin_expect(!g_cfg.probe.enabled, 1)) return;
+
+    uint64_t h = hash_str(std::string(domain) + ":" + key);
+    while (g_probe_spinlock.test_and_set(std::memory_order_acquire)) {}
+    bool should_log = (g_probe_dedup.size() < 1500) && g_probe_dedup.insert(h).second;
+    g_probe_spinlock.clear(std::memory_order_release);
+
+    if (!should_log) return;
+
+    std::string stack = capture_caller_chain(2, 4);
+    std::ostringstream ss;
+    ss << "[PROBE][" << g_cfg.pkg_name << "][" << domain << "] "
+       << key << " => " << val << " @@ " << stack;
+    write_direct_log_line(g_probe_log_fd, ANDROID_LOG_INFO, ss.str());
+}
+
 inline struct sigaction g_old_sigsegv{};
 inline struct sigaction g_old_sigabrt{};
 inline struct sigaction g_old_sigbus{};

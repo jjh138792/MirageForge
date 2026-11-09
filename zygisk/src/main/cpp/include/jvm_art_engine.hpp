@@ -2,12 +2,13 @@
 
 #include <cstdlib>
 #include <jni.h>
-#include "mirage_shared.hpp"
-#include "bionic_prop_engine.hpp"
+#include "mirage_config.hpp"
 
 namespace mirage {
 
 inline void reflect_java_build_fields(JNIEnv *env) {
+    if (!g_cfg.build.enabled || !env) return;
+
     auto set_str = [&](jclass cls, const char *name, const std::string &val) {
         jfieldID fid = env->GetStaticFieldID(cls, name, "Ljava/lang/String;");
         if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
@@ -51,7 +52,7 @@ inline void reflect_java_build_fields(JNIEnv *env) {
 
     jclass build_cls = env->FindClass("android/os/Build");
     if (build_cls) {
-        for (const auto &kv : g_ctx.build_map) {
+        for (const auto &kv : g_cfg.build.build_map) {
             if (kv.first == "TIME") {
                 long long t = std::atoll(kv.second.c_str());
                 if (t > 0) set_long(build_cls, "TIME", t);
@@ -70,16 +71,15 @@ inline void reflect_java_build_fields(JNIEnv *env) {
 
     jclass ver_cls = env->FindClass("android/os/Build$VERSION");
     if (ver_cls) {
-        for (const auto &kv : g_ctx.version_map) {
+        for (const auto &kv : g_cfg.build.version_map) {
             if (kv.first == "SDK_INT" || kv.first == "DEVICE_INITIAL_SDK_INT" || kv.first == "PREVIEW_SDK_INT") {
-                // 仅在显式开启 force_spoof_sdk 时才覆写 SDK_INT，防止跨 API 版本触发 NoSuchMethodError
-                if (g_ctx.force_spoof_sdk) {
+                if (g_cfg.build.force_spoof_sdk) {
                     int sdk = std::atoi(kv.second.c_str());
                     if (sdk > 0) set_int(ver_cls, kv.first.c_str(), sdk);
                 }
             } else if (kv.first == "SECURITY_PATCH" || kv.first == "INCREMENTAL") {
                 set_str(ver_cls, kv.first.c_str(), kv.second);
-            } else if (kv.first == "RELEASE" && g_ctx.force_spoof_sdk) {
+            } else if (kv.first == "RELEASE" && g_cfg.build.force_spoof_sdk) {
                 set_str(ver_cls, kv.first.c_str(), kv.second);
             }
         }

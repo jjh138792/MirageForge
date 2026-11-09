@@ -8,7 +8,7 @@
 #include <dlfcn.h>
 #include <sys/sysmacros.h>
 #include "zygisk.hpp"
-#include "mirage_shared.hpp"
+#include "mirage_config.hpp"
 #include "bionic_prop_engine.hpp"
 #include "vfs_sysinfo_engine.hpp"
 #include "graphics_vulkan_gles.hpp"
@@ -26,25 +26,91 @@ inline void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
 
 inline void scan_and_commit_plt_hooks();
 
-// 严格后缀匹配：避免 "/apex/com.android.art/lib64/libjavacore.so" 被 ".art" 误杀！
-inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) {
+inline void init_linker_symbols() {
+    if (orig_dlopen) return;
+    orig_dlopen = reinterpret_cast<decltype(orig_dlopen)>(dlsym(RTLD_DEFAULT, "dlopen"));
+    orig_android_dlopen_ext = reinterpret_cast<decltype(orig_android_dlopen_ext)>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
+    orig_dlsym = reinterpret_cast<decltype(orig_dlsym)>(dlsym(RTLD_DEFAULT, "dlsym"));
+}
+
+inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) noexcept {
     size_t ext_len = std::strlen(ext);
     if (path_len < ext_len) return false;
     return std::memcmp(path + path_len - ext_len, ext, ext_len) == 0;
 }
 
+// 外科手术式 ELF 过滤器：
+// 1. 应用私有库 (/data/*, /mnt/*, .apk 内置库) -> 100% Hook
+// 2. 系统分区库 (/system/*, /apex/*, /vendor/*) -> 仅 Hook 核心运行时与硬件/图形桥接库，跳过上百个无关 UI/字体/解码库
+inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
+    if (path[0] != '/') return false;
+
+    bool is_binary = ends_with_ext(path, len, ".so") ||
+                     ends_with_ext(path, len, ".apk") ||
+                     (std::strstr(path, ".so.") != nullptr);
+    if (!is_binary) return false;
+
+    // 排除应用私有库以外的系统库时，先提取文件名
+    const char *slash = std::strrchr(path, '/');
+    const char *fname = slash ? (slash + 1) : path;
+
+    // 永远不 Hook Bionic 自身与本模块自身
+    if (std::strcmp(fname, "libc.so") == 0 ||
+        std::strcmp(fname, "libdl.so") == 0 ||
+        std::strcmp(fname, "libart.so") == 0 ||
+        std::strncmp(fname, "linker", 6) == 0 ||
+        std::strstr(fname, "mirage_forge") != nullptr) {
+        return false;
+    }
+
+    // 应用自身目录 (/data/app, /data/user, /data/data, /mnt/asec 等) 下的所有库 100% 挂载
+    if (std::strncmp(path, "/data/", 6) == 0 ||
+        std::strncmp(path, "/mnt/", 5) == 0 ||
+        ends_with_ext(path, len, ".apk")) {
+        return true;
+    }
+
+    // 系统与 APEX 目录下，仅精准拦截负责 Java I/O、SystemProperties、OpenGL/Vulkan、DRM 的核心桥接库
+    static const char *const kSystemBridgeLibs[] = {
+        "libandroid_runtime.so",
+        "libjavacore.so",
+        "libopenjdk.so",
+        "libc++.so",
+        "libcutils.so",
+        "libutils.so",
+        "libbase.so",
+        "libandroid.so",
+        "libEGL.so",
+        "libGLESv1_CM.so",
+        "libGLESv2.so",
+        "libGLESv3.so",
+        "libvulkan.so",
+        "libmediandk.so",
+        "libgui.so",
+        "libhwui.so"
+    };
+
+    for (const char *bridge : kSystemBridgeLibs) {
+        if (std::strcmp(fname, bridge) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline void *hook_dlsym(void *handle, const char *symbol) {
     if (symbol && !g_tls_in_hook) {
-        if (g_ctx.enable_build_props || g_ctx.enable_probe) {
+        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
             if (std::strcmp(symbol, "__system_property_find") == 0) return reinterpret_cast<void *>(hook_system_property_find);
             if (std::strcmp(symbol, "__system_property_read_callback") == 0) return reinterpret_cast<void *>(hook_system_property_read_callback);
             if (std::strcmp(symbol, "__system_property_read") == 0) return reinterpret_cast<void *>(hook_system_property_read);
             if (std::strcmp(symbol, "__system_property_get") == 0) return reinterpret_cast<void *>(hook_system_property_get);
             if (std::strcmp(symbol, "__system_property_foreach") == 0) return reinterpret_cast<void *>(hook_system_property_foreach);
-            if (std::strcmp(symbol, "popen") == 0) return reinterpret_cast<void *>(hook_popen);
-            if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
         }
-        if (g_ctx.enable_vfs_shield) {
+        if (g_cfg.build.enabled) {
+            if (std::strcmp(symbol, "popen") == 0) return reinterpret_cast<void *>(hook_popen);
+        }
+        if (g_cfg.vfs.enabled) {
             if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
             if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
             if (std::strcmp(symbol, "__open_2") == 0) return reinterpret_cast<void *>(hook_open_2);
@@ -72,21 +138,23 @@ inline void *hook_dlsym(void *handle, const char *symbol) {
             if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
             if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
         }
-        if (g_ctx.enable_gl_vulkan) {
+        if (g_cfg.gl.enabled) {
             if (std::strcmp(symbol, "glGetString") == 0) return reinterpret_cast<void *>(hook_glGetString);
             if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hook_eglGetProcAddress);
             if (std::strcmp(symbol, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<void *>(hook_vkGetInstanceProcAddr);
             if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties") == 0) return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties);
             if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties2") == 0) return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2);
+            if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
         }
     }
     return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
 }
 
-inline bool should_rescan_on_dlopen(const char *filename) {
+inline bool should_rescan_on_dlopen(const char *filename) noexcept {
     if (!filename) return false;
     if (std::strncmp(filename, "/system/", 8) == 0 ||
-        std::strncmp(filename, "/apex/", 6) == 0) {
+        std::strncmp(filename, "/apex/", 6) == 0 ||
+        std::strncmp(filename, "/vendor/", 8) == 0) {
         return false;
     }
     return true;
@@ -126,10 +194,6 @@ inline void scan_and_commit_plt_hooks() {
         return;
     }
 
-    // 确保 lseek / lseek64 原生指针已初始化
-    if (!orig_lseek) orig_lseek = reinterpret_cast<decltype(orig_lseek)>(dlsym(RTLD_DEFAULT, "lseek"));
-    if (!orig_lseek64) orig_lseek64 = reinterpret_cast<decltype(orig_lseek64)>(dlsym(RTLD_DEFAULT, "lseek64"));
-
     char line[1024];
     bool dirty = false;
 
@@ -153,23 +217,7 @@ inline void scan_and_commit_plt_hooks() {
             path[--len] = '\0';
         }
 
-        // 涵盖所有 .so 动态库与直接从 .apk 映射的未解压 Native 库
-        bool is_target_binary = ends_with_ext(path, len, ".so") ||
-                                ends_with_ext(path, len, ".apk") ||
-                                (std::strstr(path, ".so.") != nullptr);
-
-        // 仅跳过纯粹的字节码缓存文件与底层 Bionic 自身，绝不误杀 /apex/com.android.art/lib64/libjavacore.so！
-        if (path[0] != '/' || !is_target_binary ||
-            ends_with_ext(path, len, ".oat") ||
-            ends_with_ext(path, len, ".odex") ||
-            ends_with_ext(path, len, ".vdex") ||
-            ends_with_ext(path, len, ".art") ||
-            ends_with_ext(path, len, ".dex") ||
-            ends_with_ext(path, len, "/libc.so") ||
-            ends_with_ext(path, len, "/libdl.so") ||
-            ends_with_ext(path, len, "/libart.so") ||
-            std::strstr(path, "/linker") != nullptr ||
-            std::strstr(path, "mirage_forge") != nullptr) {
+        if (!should_hook_elf_path(path, len)) {
             continue;
         }
 
@@ -181,7 +229,6 @@ inline void scan_and_commit_plt_hooks() {
         }
         dirty = true;
 
-        // 使用全局静态槽位 g_discard_old_slot 承接不需要覆盖的旧函数地址，避免局部栈地址在 Commit 时失效
         auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
             void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &g_discard_old_slot;
             g_zygisk_api->pltHookRegister(dev, inode, sym, new_fn, target_old);
@@ -191,18 +238,21 @@ inline void scan_and_commit_plt_hooks() {
         reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
         reg("dlsym", reinterpret_cast<void *>(hook_dlsym), reinterpret_cast<void **>(&orig_dlsym));
 
-        if (g_ctx.enable_build_props || g_ctx.enable_probe) {
+        // 模块 1：仅当开启了 Build 或 Probe 时才注册 Bionic 属性 Hook
+        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
             reg("__system_property_find", reinterpret_cast<void *>(hook_system_property_find), reinterpret_cast<void **>(&orig_system_property_find));
             reg("__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read_callback), reinterpret_cast<void **>(&orig_system_property_read_callback));
             reg("__system_property_read", reinterpret_cast<void *>(hook_system_property_read), reinterpret_cast<void **>(&orig_system_property_read));
             reg("__system_property_get", reinterpret_cast<void *>(hook_system_property_get), reinterpret_cast<void **>(&orig_system_property_get));
             reg("__system_property_foreach", reinterpret_cast<void *>(hook_system_property_foreach), reinterpret_cast<void **>(&orig_system_property_foreach));
             reg("__system_property_find_nth", reinterpret_cast<void *>(hook_system_property_find_nth), reinterpret_cast<void **>(&orig_system_property_find_nth));
+        }
+        if (g_cfg.build.enabled) {
             reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
-            reg("AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString));
         }
 
-        if (g_ctx.enable_vfs_shield) {
+        // 模块 2：仅当开启了 VFS 护盾时才注册文件 I/O 与 sysinfo/sysconf/uname Hook
+        if (g_cfg.vfs.enabled) {
             reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
             reg("open64", reinterpret_cast<void *>(hook_open64), reinterpret_cast<void **>(&orig_open64));
             reg("__open_2", reinterpret_cast<void *>(hook_open_2), reinterpret_cast<void **>(&orig_open_2));
@@ -232,12 +282,14 @@ inline void scan_and_commit_plt_hooks() {
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
         }
 
-        if (g_ctx.enable_gl_vulkan) {
+        // 模块 3：仅当开启了 GL/Vulkan 模块时才注册图形与 DRM Hook
+        if (g_cfg.gl.enabled) {
             reg("glGetString", reinterpret_cast<void *>(hook_glGetString), reinterpret_cast<void **>(&orig_glGetString));
             reg("eglGetProcAddress", reinterpret_cast<void *>(hook_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
             reg("vkGetInstanceProcAddr", reinterpret_cast<void *>(hook_vkGetInstanceProcAddr), reinterpret_cast<void **>(&orig_vkGetInstanceProcAddr));
             reg("vkGetPhysicalDeviceProperties", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties));
             reg("vkGetPhysicalDeviceProperties2", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties2));
+            reg("AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString));
         }
     }
     std::fclose(fp);
