@@ -2,13 +2,14 @@
 
 # 蜃楼工坊 · MirageForge
 
-**「千面万象，一念幻化」—— 新一代全息硬件虚拟化与逆向探针 Zygisk 引擎**
+**「千面万象，一念幻化」—— 应用级硬件拓扑虚拟化与逆向探针 Zygisk 模块**
 
 [![Version](https://img.shields.io/badge/Version-v1.1.0-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
 [![Zygisk](https://img.shields.io/badge/Zygisk-API%20v4%20(C%2B%2B17)-06b6d4?style=flat-square)](https://github.com/topjohnwu/zygisk-module-sample)
 [![CLI](https://img.shields.io/badge/CLI-Rust%202021-f97316?style=flat-square)](https://www.rust-lang.org/)
-[![WebUI](https://img.shields.io/badge/WebUI-Vue%203%20%2B%20TS%20Liquid%20Glass-10b981?style=flat-square)](https://kernelsu.org/zh_CN/guide/module-webui.html)
 [![License](https://img.shields.io/badge/License-GPL--3.0--only-f43f5e?style=flat-square)](LICENSE)
+
+**简体中文** | **[English](docs/en_README.md)**
 
 </div>
 
@@ -16,183 +17,112 @@
 
 ## 📖 写在前面
 
-这是一款基于 **Zygisk** 的应用级机型与硬件拓扑伪装模块。
+如你所见，这是一个基于 **Zygisk** 的机型与硬件信息伪装模块。
 
-老实说，市面上做机型伪装的模块已经很多了，前辈和大佬们的作品显然都比我这个要成熟得多，所以这个项目起初也就是自己随手写写、折腾着玩的产物。不过既然取名叫 **「蜃楼工坊 · MirageForge」**，写着写着还是忍不住把架构往死里堆了堆料——从 **AOSP 1:1 内存对齐的 Bionic 属性池**、**Vulkan/GLES 渲染管线劫持**、**异构单核动态频率与对称物理内存虚拟化**，到 **Rust 编写的原生 CLI 控制中枢** 与 **Vue 3 液态玻璃 WebUI**，全给塞进去了。
+说实话，做机型伪装的模块在圈子里早就满大街都是了，前辈和大佬们的作品肯定比我这个要成熟稳定得多。这个项目起初就是我自己闲着没事随便写写、折腾着玩的。但本着“来都来了，名字都叫**蜃楼工坊**了，总不能只改两行 `build.prop` 就收工吧”的心态，不知不觉把 **Bionic 底层属性池**、**Vulkan/OpenGL 渲染器伪装**、**单核动态频率**、**Rust 命令行中枢**和一套现代化的 **WebUI** 全给缝进去了。
 
-代码肯定还有不少粗糙的地方，非常欢迎各位大佬提交 **Issue** 或 **PR** 一起交流改进！
-
----
-
-## ✨ 核心特性与技术架构
-
-不同于传统仅修改 `build.prop` 或反射几个 `android.os.Build` 字符串的简单方案，**MirageForge v1.1.0** 采用 **「C++17 Zygisk 按需微模块 + Rust CLI 原子编译器 + Vue 3 液态玻璃前端」** 三层解耦架构：
-
-### 1. 🛡️ 绝对「零改动」按需微模块架构 (Zero-Touch On-Demand)
-* **未伪装应用 0 干扰**：`onLoad` 阶段执行 **0 次 `dlsym`、0 次内存分配**。未在分流矩阵中绑定的应用在 `preAppSpecialize` 阶段经 Companion 内存缓存 `O(1)` 判定后立即调用 `DLCLOSE_MODULE_LIBRARY` 卸载，不留任何注入痕迹。
-* **子模块开关级完全隔离**：每个应用支持独立开关 **`[Bionic/ART 属性]`**、**`[Vulkan/GLES/DRM]`**、**`[单核频率/对称内存/VFS]`**、**`[探针与调用栈]`**、**`[强改 SDK 版本]`** 五大微模块。**未开启的选项绝不注册对应的 PLT Hook、绝不触碰原系统数据**（杜绝“先改再改回来”的伪零改动）。
-* **外科手术式 PLT 挂载**：精准过滤系统核心桥接库与应用私有库（含 `extractNativeLibs="false"` 的 APK 内置库），搭配 ThinLTO 编译优化，应用启动零卡顿。
-
-### 2. 🧬 AOSP 1:1 无锁 Bionic 属性内存池 (Lock-Free Prop Arena)
-* **防裸指针偏移强转检测**：严格按照 AOSP Bionic `struct prop_info` 的真实二进制内存布局（`uint32_t serial` [4B] + `char value[92]` [92B] + `char name[]`）铸造只读冻结态虚拟句柄。即使风控 SDK 不调 API、直接通过 `(const char*)pi + 4` 强转读取内存，也能拿到合法伪装值且绝不崩溃。
-* **全链路属性合围**：完整接管 `__system_property_find`、`__system_property_read_callback`、`__system_property_read`、`__system_property_get`、`__system_property_foreach`（全表遍历注入跨品牌属性，如在 Pixel 上伪装澎湃 OS 的 `ro.miui.*`）、`__system_property_find_nth` 以及 `popen("getprop ...")` 管道命令。
-
-### 3. 🎮 Vulkan + OpenGL ES + MediaDrm 渲染管线幻化
-* **双图形 API 劫持**：同时拦截 OpenGL ES（`glGetString` / `eglGetProcAddress`）与现代手游默认启用的 **Vulkan**（`vkGetInstanceProcAddr` / `vkGetPhysicalDeviceProperties` / `vkGetPhysicalDeviceProperties2`），同步篡改 `VkPhysicalDeviceProperties.deviceName` 与 PCI `vendorID`（如 `Adreno (TM) 830` 或 `Immortalis-G925 MC12`），真正解锁绑定 GPU 型号的游戏极高帧率与极致画质。
-* **DRM 硬件标识同步**：拦截 `libmediandk.so` 的 `AMediaDrm_getPropertyString`，同步伪装底层 `vendor` 与 `description`。
-
-### 4. ⚡ 异构单核动态频率与对称物理内存 (On-Demand VFS & FdCloak)
-* **对称物理内存（告别“6GB 物理内存 vs 16GB 可用内存”穿帮）**：
-  * 引入真实硬件 Carveout 折算算法生成 `/proc/meminfo`，并与 `sysinfo()`、`sysconf(_SC_PHYS_PAGES)` 保持字节级一致。
-  * 同步合成 `/proc/ddr_info`、`/sys/devices/system/chip-info/ddr_info` 及 12 项底层 Bootloader DDR 属性（如 `ro.boot.hardware.ddr=16GB,SKhynix,LPDDR5X`），确保系统信息与硬件检测工具显示的「已安装物理内存」与「可用内存」严丝合缝。
-* **异构多簇单核频率微抖动引擎**：
-  * 支持自定义异构分簇拓扑（如骁龙 8 至尊版 `6+2`：`0-5:614400:3532800;6-7:806400:4320000`、天玑 9400 `4+3+1` 等）。
-  * 按需合成 `cpu0~7/cpufreq/*` 与 `cpufreq/policy0~7/*` 全部节点。当检测软件读取每颗核心的实时频率（`scaling_cur_freq` / `cpuinfo_cur_freq`）或通过 `lseek(fd, 0, SEEK_SET)` 循环刷新时，引擎根据真实 19.2MHz 晶振步进的 OPP 频点表返回动态微抖动频率。
-* **`FdCloakTracker` 无锁位图隐身衣 + Maps 实时脱敏**：
-  * 采用 `O(1)` 原子位图追踪虚拟 `memfd`，拦截 `readlink`、`readlinkat`、`fstat(64)`、`stat(64)`、`lstat(64)`、`fstatat(64)`、`access`，反查 `/proc/self/fd/<N>` 时完美还原为真实系统路径，隐藏 `/memfd:` 痕迹。
-  * 当目标应用读取 `/proc/self/maps`、`/proc/self/smaps` 或 `/proc/self/mountinfo` 时，实时剥离包含 `zygisk`、`mirage_forge`、`magisk`、`kernelsu`、`/data/adb` 的敏感行。
-
-### 5. 📡 幻境探针与 Native 调用栈回溯雷达 (Mirage Probe)
-* **精准定位风控探测点**：内置基于 `<unwind.h>` `_Unwind_Backtrace` 与 `dladdr` 的符号反解器。开启探针后，目标应用读取了哪个属性、打开了哪个硬件节点、由哪个 `.so` 的哪个函数偏移量（如 `libtersafe2.so+0x8f410 <- libc.so!__system_property_read_callback+0x28`）发起，全部由 Root Companion 异步守护线程实时落盘至 `probe_events.log`。
-* **未映射属性一键捕获**：探针一旦发现目标应用读取了模板中尚未配置的敏感属性（标记为 `UNMAPPED`），在 WebUI 中点击 **「+ 捕获入库」** 即可一键写入对应模板并立即重编译。
-* **Native 崩溃信号诊断台**：内置 `SIGSEGV` / `SIGABRT` / `SIGBUS` / `SIGILL` 信号捕获器，应用闪退时自动记录故障地址与崩溃调用栈至 `crash_events.log`。
-
-### 6. 🦀 Rust 原生 CLI 中枢 + 🔮 Vue 3 液态玻璃 WebUI
-* **Rust `mirageforge_cli`**：纯 Rust 编写并静态编译，提供 `Write-Fsync-Rename` 原子级配置编译、`.prop` 文件一键炼金解析（自动推导 SoC、GPU、异构分簇与 LPDDR 规格）及探针日志管理。
-* **Vue 3 + TypeScript 液态玻璃界面**：内置 SVG 光学折射滤镜（`#liquid-refraction`）、动态流体极光画布、手指追光折射高光（`v-touch-glass`）、多级物理触觉振动反馈以及 **简 / 繁 / EN** 三语实时热切换，全面兼容 **KernelSU / APatch / MMRL WebUI-X**。
+虽然功能堆得挺杂，但肯定还有很多考虑不周的地方，非常欢迎各位提交 **Issue** 或 **PR** 一起交流（或者帮我修 Bug）。
 
 ---
 
-## 📂 项目目录结构
+## ✨ 它到底能干嘛？
+
+市面上普通改机模块能改的 `android.os.Build` 和系统属性它都能改；普通模块懒得管或者容易露馅的细节，它也顺手填了坑：
+
+### 1. 🛑 真正的「零改动」按需加载 (Zero-Touch On-Demand)
+* **不改的应用绝不乱动**：在 `onLoad` 阶段不做任何符号解析或内存分配。只要不是你在配置里指定的应用，模块在启动瞬间直接调用 `DLCLOSE_MODULE_LIBRARY` 卸载走人，0 内存占用、0 注入痕迹。
+* **没开的开关绝不瞎 Hook**：每个应用都有 5 个独立子开关（`属性/Build`、`GPU/DRM`、`CPU/内存/VFS`、`探针与调用栈`、`强改SDK`）。你没开的选项，底层直接跳过注册，绝不搞“先改掉再改回来”的假把式。
+* **外科手术式 PLT 过滤**：只针对系统核心运行时桥接库与应用自身 `.so`（含未解压直映的 `.apk` 内置库）挂载 Hook，不扫无关的字体/UI 库，告别开启模块后的应用启动卡顿。
+
+### 2. 🧬 AOSP 1:1 内存对齐的 Bionic 属性池
+* **防裸指针强转刺探**：严格按照 Android Bionic `struct prop_info` 的真实内存布局（`4字节 serial + 92字节 value + 柔性数组 name`）铸造无锁只读句柄。就算遇到不讲武德的风控 SDK 直接用 `(const char*)pi + 4` 强转读内存，也能读出合法的伪装值而不会闪退。
+* **全表遍历与跨品牌属性注入**：不仅拦截 `find` / `read_callback` / `get` / `popen("getprop")`，还完整接管了 `__system_property_foreach`。哪怕你在原生 Pixel 上伪装小米澎湃 OS，遍历全表时也能看到完整的 `ro.miui.*` 属性。
+
+### 3. 🎮 Vulkan + OpenGL ES + MediaDrm 显卡幻化
+* **解锁高帧率与极致画质**：现在的大型手游早就默认切到 Vulkan 管线了。本模块同时拦截 OpenGL ES（`glGetString`）与 **Vulkan**（`vkGetPhysicalDeviceProperties` / `Properties2`），同步修改 `deviceName` 与 `vendorID`（比如把你的老芯片伪装成 `Adreno (TM) 830` 或 `Immortalis-G925 MC12`），顺带连 `libmediandk.so` 的 DRM 硬件厂商信息也一并改掉。
+
+### 4. ⚡ 异构单核动态频率 & 对称物理内存 (VFS 护盾)
+* **拒绝「6GB 物理内存配 16GB 可用内存」的医学奇迹**：
+  * 按照真实旗舰机的硬件 Carveout 预留比例生成 `/proc/meminfo`，并与 `sysinfo()`、`sysconf(_SC_PHYS_PAGES)` 保持严格一致。
+  * 同步伪装 `/proc/ddr_info` 及 12 项底层 Bootloader DDR 属性（如 `16GB LPDDR5X (SKhynix)`），让检测软件里的“已安装物理内存”和“可用内存”彻底对称。
+* **每颗核心都有自己的脾气（异构分簇动态频率）**：
+  * 支持按核心分簇配置频率范围（如骁龙 8 至尊版的 `6+2` 架构、天玑 9400 的 `4+3+1` 架构），自动覆盖 `cpu0~7/cpufreq/*` 与 `policy0~7/*`。
+  * 当应用读取单核实时频率（`scaling_cur_freq`）时，引擎会按照 19.2MHz 晶振步进的真实 OPP 频点表返回微抖动频率，8 颗核心各自跳动，不再死板卡死在同一个数字。
+* **句柄隐身衣与 Maps 自动脱水**：
+  * 内置无锁原子位图 `FdCloakTracker`，拦截 `readlink("/proc/self/fd/N")` 与 `fstat`，抹除 `memfd` 匿名文件特征。
+  * 当应用偷偷读取 `/proc/self/maps` 或 `mountinfo` 查岗时，自动过滤掉包含 `zygisk`、`mirage_forge`、`magisk`、`kernelsu` 的敏感行。
+
+### 5. 📡 幻境探针与调用栈回溯雷达 (Mirage Probe)
+* **看看应用到底在查你什么**：给目标应用点亮「探针」开关后，它在后台偷偷读了哪个属性、开了哪个硬件文件、甚至是由哪个 `.so` 的哪个函数偏移量（例如 `libtersafe2.so+0x8f410 <- libc.so!...`）发起的调用，都会通过 Root 守护进程异步落盘记录。
+* **一键抓包入库**：看到探针里标黄的 `UNMAPPED`（未映射敏感属性），在面板里点一下 **「+ 捕获入库」** 就能直接写进当前机型模板。
+* **崩溃现场抓拍**：自带 `SIGSEGV` / `SIGABRT` 信号拦截器，万一应用崩了，第一时间把故障内存地址和 Native 崩溃调用栈拍下来留档。
+
+### 6. 🦀 Rust 命令行中枢 + 顺眼的现代化 WebUI
+* **Rust `mirageforge_cli`**：配置管理、`.prop` 文件一键解析推导、原子级 `.conf` 编译全部由静态编译的 Rust 二进制接管，稳且快。
+* **好用的 WebUI**：兼容 KernelSU / APatch / MMRL (WebUI-X)，自带预设模板、`.prop` 一键导入炼金、应用分流矩阵和探针查看器，支持简/繁/英切换。毕竟都这年头了，把界面做得顺眼点、带点流畅动效和触感反馈是基本修养。
+
+---
+
+## 📂 目录结构
 
 ```text
 MirageForge/
-├── .github/workflows/
-│   └── build.yml                  # 全自动 CI：构建 Vue 3 WebUI + Rust CLI + 四架构 Zygisk .so
-├── zygisk/src/main/cpp/           # [C++17] Zygisk API v4 核心虚拟化引擎
-│   ├── CMakeLists.txt
-│   ├── mirage_forge.cpp           # Zygisk 生命周期主控与 Root Companion 内存缓存/异步落盘服务
-│   └── include/
-│       ├── mirage_config.hpp      # 按需微模块隔离配置容器
-│       ├── mirage_logger.hpp      # _Unwind_Backtrace 调用栈回溯与崩溃信号捕获器
-│       ├── fd_cloak_tracker.hpp   # O(1) 原子位图 memfd 隐身追踪器
-│       ├── bionic_prop_engine.hpp # AOSP 1:1 无锁 Bionic 属性内存池
-│       ├── vfs_sysinfo_engine.hpp # 按需懒加载 VFS、异构单核动态频率与 sysinfo/sysconf 引擎
-│       ├── graphics_vulkan_gles.hpp # Vulkan + OpenGL ES + MediaDrm 劫持引擎
-│       ├── linker_plt_engine.hpp  # 外科手术式 ELF 过滤器与增量 dlopen 追踪器
-│       └── jvm_art_engine.hpp     # Java Build 全类型反射引擎
-├── cli/                           # [Rust 2021] 独立二进制控制中枢 (mirageforge_cli)
-│   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs                # CLI 命令路由入口
-│       ├── models.rs              # Serde 强类型数据模型
-│       ├── fs_atomic.rs           # Write-Fsync-Rename 原子文件 IO
-│       ├── alchemy.rs             # build.prop 炼金解析与硬件拓扑自动推导
-│       ├── compiler.rs            # 微模块 .conf 按需编译器 (未开启项 0 输出)
-│       ├── store.rs               # 模板库与分流路由持久化管理
-│       └── probe.rs               # 探针日志、崩溃栈与注入遥测收割分析器
-├── webui/                         # [Vue 3 + TS + Vite] 液态玻璃 WebUI 工程
-│   ├── package.json
-│   ├── vite.config.ts             # 编译打包至 ../module/webroot
-│   └── src/
-│       ├── styles/liquid-glass.css
-│       ├── bridge/webui-x.ts      # WebUI-X & KSU 桥接 + 触觉振动 + 追光指令
-│       ├── i18n/index.ts          # 简 / 繁 / EN 国际化字典
-│       ├── store/mirageStore.ts   # 对接 Rust CLI 的响应式状态库
-│       ├── App.vue                # 悬浮灵动岛导航主框架
-│       └── components/            # 全息熔炉 / 属性炼金 / 分流矩阵 / 探针雷达四大组件
-└── module/                        # 刷入包模板目录 (支持 Manager 与 TWRP Recovery 双栖刷入)
-    ├── META-INF/com/google/android/
-    ├── module.prop
-    ├── customize.sh
-    ├── action.sh
-    └── uninstall.sh
+├── .github/workflows/build.yml    # 云端打工人：自动编译前端 + Rust CLI + 四架构 Zygisk 库
+├── zygisk/src/main/cpp/           # [C++] Zygisk API v4 核心注入与按需 Hook 引擎
+├── cli/                           # [Rust] mirageforge_cli 独立命令行控制中枢
+├── webui/                         # [Vue + TS] WebUI 前端工程 (构建产物自动输出至 module/webroot)
+└── module/                        # 模块刷入包骨架 (支持 Manager 与 TWRP Recovery 刷入)
 ```
 
 ---
 
-## 🚀 安装与使用指南
+## 🚀 怎么用？
 
-### 1. 环境要求
-* **Android 版本**：Android 8.0 (API 26) ~ Android 16
-* **Root 与 Zygisk 环境**：
-  * **Magisk** (v26.0+)：开启内置 Zygisk 或安装 **Zygisk Next / ReZygisk**
-  * **KernelSU / KernelSU Next / APatch**：需配合安装 **Zygisk Next** 或 **ReZygisk** 模块
-* **刷入方式**：支持在 Magisk / KernelSU / APatch 管理器内直接刷入，同时也支持在 **TWRP / OrangeFox Recovery** 下刷入。
+### 1. 刷入模块
+1. 去 [Releases](https://github.com/jjh138792/MirageForge/releases)（或者 GitHub Actions 构建产物）下载最新的刷入包。
+2. 确保你的设备已启用 **Zygisk**（Magisk 内置 Zygisk，或者 KernelSU / APatch 安装 **Zygisk Next / ReZygisk**）。
+3. 在管理器内刷入（也支持在 TWRP 等 Recovery 下直接刷入），重启手机。
 
-### 2. WebUI 可视化配置
-刷入模块并重启手机后，在 **KernelSU / APatch / MMRL / KSUWebUI** 管理器中点击「蜃楼工坊 · MirageForge」打开 WebUI：
-1. **全息熔炉**：查看预置的 4 套满血旗舰模板（小米 15 Pro、ROG 9 Pro、红魔 10 Pro+、vivo X200 Pro），或点击「铸造新机型」自定义机型、GPU 渲染器、异构 CPU 分簇频率与 LPDDR 内存规格。
-2. **属性炼金**：上传从任意 ROM 提取的 `build.prop` 文件或直接粘贴属性文本，Rust 引擎会自动提取机型指纹并推导出配套的 GPU 与 CPU 分簇拓扑。
-3. **分流矩阵**：为指定应用选择要伪装的机型模板，并按需点亮下方的 5 个微模块胶囊开关，点击右侧 ⚡ 即可强行停止目标应用并立即生效。
-4. **幻境探针**：为目标应用开启 `📡 探针与调用栈` 后运行应用，即可在此页面查看实时注入遥测、Native 崩溃诊断以及每一条属性/文件读取背后的 `.so!函数+偏移量` 调用栈。
+### 2. 打开 WebUI 配置
+重启后在管理器里点击模块的 **WebUI** 按钮即可进入控制台：
+* **全息熔炉**：直接使用内置的旗舰模板（小米 15 Pro、ROG 9 Pro、红魔 10 Pro+、vivo X200 Pro），或者自己新建/编辑机型、GPU 与 CPU 分簇频率。
+* **属性炼金**：把从别的 ROM 提取出来的 `build.prop` 扔进去，一键解析生成全套模板。
+* **分流矩阵**：给不同的 App 绑定不同的机型模板，按需勾选下方的微模块开关，点右侧的 ⚡ 按钮即可强行停止该应用并立即生效。
+* **幻境探针**：开启某应用的探针开关后运行一下该应用，回来刷新就能看到带 `.so` 调用栈的硬件读取记录。
 
-### 3. `mirageforge_cli` 终端命令行用法
-安装模块后，`mirageforge_cli` 会自动挂载至系统 `PATH`（位于 `/system/bin/mirageforge_cli` 或 `/data/adb/modules/mirage_forge/bin/mirageforge_cli`），支持在 Termux 或 ADB Shell 中直接调用：
+### 3. 终端命令 (`mirageforge_cli`)
+如果你喜欢敲命令，模块刷入后已经把 `mirageforge_cli` 软链到了 `/system/bin/mirageforge_cli`，打开 Termux 或 ADB Shell 就能直接调戏：
 
 ```bash
-# 1. 查看引擎状态与当前生效的分流路由
+# 查看当前模块状态与生效列表
 su -c "mirageforge_cli status"
 
-# 2. 解析本地 build.prop 文件并自动保存为新模板
+# 一键解析 build.prop 并保存为模板
 su -c "mirageforge_cli parse-prop /sdcard/Download/build.prop --save"
 
-# 3. 为指定应用绑定模板并设置微模块开关 (--restart 自动重启目标应用)
+# 为指定应用绑定模板并立即重启该应用
 su -c "mirageforge_cli route set com.tencent.tmgp.sgame rog_9_pro --build 1 --gl 1 --vfs 1 --probe 0 --sdk 0 --restart"
 
-# 4. 解除指定应用的伪装
-su -c "mirageforge_cli route remove com.tencent.tmgp.sgame --restart"
-
-# 5. 查看最近的硬件探测与 Native 调用栈回溯 (--unmapped 仅看未映射属性)
+# 查看最近捕获到的探针与调用栈日志
 su -c "mirageforge_cli probe list --limit 30"
-
-# 6. 查看捕获到的 Native 崩溃信号与故障调用栈
-su -c "mirageforge_cli probe crashes"
 ```
 
 ---
 
-## 🛠️ 编译构建
+## 🤣 关于本仓库的 Commit 历史与坦白局
 
-本项目已配置完整的 **GitHub Actions** 流水线（[`.github/workflows/build.yml`](.github/workflows/build.yml)），每次 Push 或 Pull Request 都会自动完成三端构建并产出刷入包。如需在本地编译：
-
-```bash
-# 1. 构建 Vue 3 + TypeScript 液态玻璃 WebUI (产物自动输出至 module/webroot)
-cd webui
-npm install && npm run build
-cd ..
-
-# 2. 使用 cargo-ndk 交叉编译 Rust CLI (以 arm64-v8a 为例)
-cd cli
-cargo ndk -t arm64-v8a --platform 26 build --release
-cp target/aarch64-linux-android/release/mirageforge_cli ../module/bin/mirageforge_cli
-cd ..
-
-# 3. 使用 Android NDK & CMake 编译 Zygisk 引擎
-cmake -B build/arm64-v8a \
-  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-26 \
-  -DCMAKE_BUILD_TYPE=Release \
-  zygisk/src/main/cpp
-cmake --build build/arm64-v8a --config Release
-cp build/arm64-v8a/libmirage_forge.so module/zygisk/arm64-v8a.so
-
-# 4. 打包刷入包
-cd module && zip -r9 ../MirageForge-Zygisk-v1.1.0.zip .
-```
+1. **请勿模仿我的 Git 习惯**：
+   如果你不幸点开了本仓库的 Commit 记录，你会看到大量诸如 `Update`、`fix`、甚至为了改一行拼写错误反复触发 GitHub Actions 的抽象操作。没错，我就是把 GitHub Actions 当成了免费的云端交叉编译器在用，属于典型的“只要能跑通 CI，Commit 信息写什么都行”的野生派写法，请各位代码洁癖大佬高抬贵手。
+   
+2. **诚实坦白局（Powered by Gemini）**：
+   不装了，摊牌了——本项目我在写的时候其实用过辅助的，不管是代码，还是你现在看到的这篇 README，**其实 Google Gemini都有辅助功劳**。
+   
+   我在这个项目里扮演的核心角色是：**写部分代码 + 提出各种刁钻需求的产品经理 + 真机刷入抓 Bug 的人肉测试员 + 当 Gemini 写出弱智错误或逻辑漏洞时负责骂醒它的监工**。事实证明，只要监工盯得紧，AI 还是能搓出点好玩意儿的。
 
 ---
 
-## 🤝 贡献与反馈 (Issues / PRs)
+## 📄 开源协议
 
-* 如果你在测试某款应用或硬件检测工具时发现了漏网的硬件节点、属性字段或兼容性问题，欢迎直接开启模块的 **「📡 探针与调用栈」** 抓取日志，并提交 [Issue](https://github.com/jjh138792/MirageForge/issues)！
-* 非常欢迎提交 [Pull Request](https://github.com/jjh138792/MirageForge/pulls) 补充更多旗舰机型的异构拓扑预设、优化 Hook 逻辑或改进 WebUI 动效。
+本项目采用 **[GPL-3.0-only](LICENSE)** 协议开源。
 
----
-
-## 📄 开源协议 (License)
-
-本项目基于 **[GPL-3.0-only](LICENSE)** 协议开源。
-
-* 你可以自由地使用、修改和分发本项目源码，但任何基于本项目的衍生作品或修改版本在分发时**必须同样以 GPL-3.0-only 协议开放完整源代码**，且不得用于闭源商业倒卖。
+欢迎随便拿去研究、修改或者提 PR，但任何基于本项目的修改版或衍生品也必须保持 **GPL-3.0-only** 开源，严禁闭源打包拿去卖钱。
