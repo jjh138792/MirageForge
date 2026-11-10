@@ -8,14 +8,12 @@
 
 namespace mirage {
 
-// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构
 struct alignas(4) BionicPropInfoCompat {
     uint32_t serial;              // 偏移 0..3
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
     char name[1];                 // 偏移 96..N
 };
 
-// 冻结态无锁属性句柄池：在 preAppSpecialize 单线程初始化后，运行期 100% 只读无锁查询
 class LockFreePropArena {
 public:
     void insert_before_freeze(const std::string &name, const std::string &val) {
@@ -40,14 +38,17 @@ public:
         by_ptr_.emplace(pi, val);
     }
 
-    // 运行期无锁 O(1) 查询属性名
-    inline const prop_info *find_lockfree(const char *name) const noexcept {
+    inline const prop_info *find_lockfree(const char *name, const std::string **out_val = nullptr) const noexcept {
         if (!name) return nullptr;
         auto it = by_name_.find(name);
-        return (it != by_name_.end()) ? reinterpret_cast<const prop_info *>(it->second) : nullptr;
+        if (it == by_name_.end()) return nullptr;
+        if (out_val) {
+            auto v_it = by_ptr_.find(it->second);
+            if (v_it != by_ptr_.end()) *out_val = &v_it->second;
+        }
+        return reinterpret_cast<const prop_info *>(it->second);
     }
 
-    // 运行期无锁 O(1) 判断指针是否属于虚拟句柄池（先做极速指针边界过滤）
     inline bool is_synthetic_lockfree(const prop_info *pi, const char **out_name, const std::string **out_val) const noexcept {
         if (!pi) return false;
         uintptr_t addr = reinterpret_cast<uintptr_t>(pi);
@@ -81,7 +82,6 @@ inline int (*orig_system_property_get)(const char *name, char *value) = nullptr;
 inline int (*orig_system_property_foreach)(T_ForeachCallback propfn, void *cookie) = nullptr;
 inline const prop_info *(*orig_system_property_find_nth)(unsigned n) = nullptr;
 
-// 仅在目标应用启用了 Build 或 Probe 模块时才按需解析符号
 inline void init_bionic_prop_symbols() {
     if (orig_system_property_find) return;
     orig_system_property_find = reinterpret_cast<decltype(orig_system_property_find)>(dlsym(RTLD_DEFAULT, "__system_property_find"));
@@ -92,7 +92,6 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
-// 单线程阶段冻结属性池（若未开启 Build 模块，则完全不填充任何虚拟属性）
 inline void freeze_bionic_prop_arena() {
     if (!g_cfg.build.enabled) return;
     for (const auto &kv : g_cfg.build.prop_map) {
@@ -105,13 +104,20 @@ inline bool is_interesting_unmapped_prop(const char *name) noexcept {
     return std::strncmp(name, "ro.", 3) == 0 ||
            std::strncmp(name, "persist.", 8) == 0 ||
            std::strncmp(name, "sys.", 4) == 0 ||
-           std::strncmp(name, "gsm.", 4) == 0;
+           std::strncmp(name, "gsm.", 4) == 0 ||
+           std::strncmp(name, "ril.", 4) == 0 ||
+           std::strncmp(name, "dalvik.vm.", 10) == 0;
 }
 
 inline const prop_info *hook_system_property_find(const char *name) {
     if (name) {
         if (g_cfg.build.enabled) {
-            if (const prop_info *syn = g_prop_arena.find_lockfree(name)) {
+            const std::string *syn_val = nullptr;
+            if (const prop_info *syn = g_prop_arena.find_lockfree(name, &syn_val)) {
+                if (__builtin_expect(g_cfg.probe.enabled, 0)) {
+                    ScopedHookGuard guard;
+                    if (guard && syn_val) emit_probe("PROP_FIND", name, *syn_val);
+                }
                 return syn;
             }
         }
