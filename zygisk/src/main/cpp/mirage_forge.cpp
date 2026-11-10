@@ -7,9 +7,11 @@
 #include <unordered_map>
 #include <sstream>
 #include <fstream>
+#include <mutex>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <pthread.h>
 #include <sys/stat.h>
 
 #include "zygisk.hpp"
@@ -30,7 +32,6 @@ using namespace mirage;
 class MirageForgeModule : public zygisk::ModuleBase {
 public:
     void onLoad(Api *api, JNIEnv *env) override {
-        // 绝对 0 开销：onLoad 阶段不做任何 dlsym 符号查找或内存分配！
         this->api = api;
         this->env = env;
         g_zygisk_api = api;
@@ -42,7 +43,6 @@ public:
             return;
         }
 
-        // 快速排除系统 UID (如 system_server 或核心 radio/bluetooth 守护进程)
         if (args->uid < 10000 && args->uid != 2000) {
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
@@ -74,7 +74,6 @@ public:
         uint8_t hit = 0;
         if (!read_full(fd, &hit, sizeof(hit)) || !hit) {
             close(fd);
-            // 未配置的应用：0 dlsym、0 内存改动，直接卸载动态库！
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
@@ -93,26 +92,26 @@ public:
             }
         }
 
-        uint8_t has_scm_fds = 0;
-        if (read_full(fd, &has_scm_fds, sizeof(has_scm_fds)) && has_scm_fds == 1) {
-            int p_fd = -1, c_fd = -1;
-            if (recv_log_fds(fd, &p_fd, &c_fd)) {
-                if (p_fd >= 0) { api->exemptFd(p_fd); g_probe_log_fd = p_fd; }
-                if (c_fd >= 0) { api->exemptFd(c_fd); g_crash_log_fd = c_fd; }
-            }
-        }
-        close(fd);
+        uint8_t sink_ready = 0;
+        read_full(fd, &sink_ready, sizeof(sink_ready));
 
         // 两阶段严格按需加载微模块配置
         load_modular_config(raw_kvs);
 
-        // 若所有 4 个子开关均处于关闭状态，直接卸载模块，保证绝对 0 改动
         if (!g_cfg.build.enabled && !g_cfg.gl.enabled && !g_cfg.vfs.enabled && !g_cfg.probe.enabled) {
+            close(fd);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        // 按需初始化被激活子模块的原生符号与数据结构
+        // 若开启了探针且 Companion 已就绪异步落盘线程，则豁免此 Socket 供运行期实时回传日志
+        if (g_cfg.probe.enabled && sink_ready == 1) {
+            api->exemptFd(fd);
+            g_probe_log_fd = fd;
+        } else {
+            close(fd);
+        }
+
         init_linker_symbols();
         if (g_cfg.build.enabled || g_cfg.probe.enabled) {
             init_bionic_prop_symbols();
@@ -132,7 +131,6 @@ public:
         }
         if (g_cfg.probe.enabled) {
             install_crash_signal_logger(pkg_name);
-            emit_probe("SESSION", "MirageForge_v1.1.0_Attached", pkg_name);
         }
 
         g_cfg.active = true;
@@ -156,18 +154,16 @@ private:
     JNIEnv *env = nullptr;
 
     void load_modular_config(const std::vector<std::pair<std::string, std::string>> &raw_kvs) {
-        // 第一遍：读取模块级开关
         for (const auto &kv : raw_kvs) {
             const std::string &k = kv.first;
             const std::string &v = kv.second;
-            if (k == "META:ENABLE_BUILD")      g_cfg.build.enabled = (v == "1");
-            else if (k == "META:ENABLE_GL")    g_cfg.gl.enabled = (v == "1");
-            else if (k == "META:ENABLE_VFS")   g_cfg.vfs.enabled = (v == "1");
-            else if (k == "META:ENABLE_PROBE") g_cfg.probe.enabled = (v == "1");
+            if (k == "META:ENABLE_BUILD")         g_cfg.build.enabled = (v == "1");
+            else if (k == "META:ENABLE_GL")       g_cfg.gl.enabled = (v == "1");
+            else if (k == "META:ENABLE_VFS")      g_cfg.vfs.enabled = (v == "1");
+            else if (k == "META:ENABLE_PROBE")    g_cfg.probe.enabled = (v == "1");
             else if (k == "META:FORCE_SPOOF_SDK") g_cfg.build.force_spoof_sdk = (v == "1");
         }
 
-        // 第二遍：严格只装载已开启模块的数据，未开启模块完全跳过（杜绝先写后删）
         for (const auto &kv : raw_kvs) {
             const std::string &k = kv.first;
             const std::string &v = kv.second;
@@ -203,7 +199,6 @@ private:
                 continue;
             }
 
-            // 其余为 BUILD:*, VERSION:*, ro.*, persist.*，仅在开启了 Build 模块时载入
             if (!g_cfg.build.enabled) continue;
 
             if (k.rfind("BUILD:", 0) == 0) {
@@ -217,7 +212,7 @@ private:
                 std::string v_field = k.substr(8);
                 if ((v_field == "SDK_INT" || v_field == "DEVICE_INITIAL_SDK_INT" || v_field == "RELEASE") &&
                     !g_cfg.build.force_spoof_sdk) {
-                    continue; // 未开启强制 SDK 伪装时，直接不载入，绝不触碰原值
+                    continue;
                 }
                 g_cfg.build.version_map[v_field] = v;
             } else {
@@ -233,21 +228,79 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程：内存级缓存 (0 磁盘 I/O 快速判定未配置应用)
+// Root Companion 守护进程：内存缓存 + 异步 Socket 日志落盘引擎
 // ============================================================================
+static std::mutex g_file_write_mtx;
+
+static void append_line_as_root(const char *path, const std::string &line) {
+    std::lock_guard<std::mutex> lock(g_file_write_mtx);
+    FILE *fp = std::fopen(path, "a");
+    if (!fp) return;
+    std::fwrite(line.data(), 1, line.size(), fp);
+    std::fputc('\n', fp);
+    std::fflush(fp);
+    std::fclose(fp);
+    chmod(path, 0600);
+}
+
+// 后台守护线程：持续从豁免的 Companion Socket 接收应用发来的探针与崩溃日志并写入磁盘
+static void *companion_log_sink_thread(void *arg) {
+    int sock_fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    std::string pending;
+    char buf[1024];
+
+    while (true) {
+        ssize_t n;
+        do {
+            n = read(sock_fd, buf, sizeof(buf));
+        } while (n == -1 && errno == EINTR);
+
+        if (n <= 0) break;
+        pending.append(buf, static_cast<size_t>(n));
+
+        size_t nl_pos = 0;
+        while ((nl_pos = pending.find('\n')) != std::string::npos) {
+            std::string line = pending.substr(0, nl_pos);
+            pending.erase(0, nl_pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+
+            if (line.rfind("[CRASH]", 0) == 0) {
+                append_line_as_root(CRASH_LOG_PATH, line);
+            } else {
+                append_line_as_root(PROBE_LOG_PATH, line);
+            }
+        }
+    }
+
+    if (!pending.empty()) {
+        if (pending.rfind("[CRASH]", 0) == 0) {
+            append_line_as_root(CRASH_LOG_PATH, pending);
+        } else {
+            append_line_as_root(PROBE_LOG_PATH, pending);
+        }
+    }
+    close(sock_fd);
+    return nullptr;
+}
+
 struct CompanionCache {
-    time_t last_db_mtime = 0;
+    time_t last_sec = 0;
+    long last_nsec = 0;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> pkg_configs;
 
     void refresh_if_needed() {
         struct stat db_st{};
         if (stat(ROUTES_DB_PATH, &db_st) != 0) {
             pkg_configs.clear();
-            last_db_mtime = 0;
+            last_sec = 0;
+            last_nsec = 0;
             return;
         }
-        if (db_st.st_mtime == last_db_mtime && !pkg_configs.empty()) {
-            return; // 缓存命中，0 磁盘读取！
+        if (db_st.st_mtim.tv_sec == last_sec &&
+            db_st.st_mtim.tv_nsec == last_nsec &&
+            !pkg_configs.empty()) {
+            return;
         }
 
         pkg_configs.clear();
@@ -279,21 +332,20 @@ struct CompanionCache {
             }
         }
         closedir(dir);
-        last_db_mtime = db_st.st_mtime;
+        last_sec = db_st.st_mtim.tv_sec;
+        last_nsec = db_st.st_mtim.tv_nsec;
     }
 };
 
 static CompanionCache g_companion_cache;
 
 static void record_launch_telemetry(const std::string &pkg, int32_t pid, const std::string &model, const std::string &gpu, int ram_gb) {
-    FILE *fp = std::fopen(LAUNCH_LOG_PATH, "a");
-    if (!fp) return;
+    char buf[512];
     std::time_t now = std::time(nullptr);
-    std::fprintf(fp, "%lld|%s|%d|%s|%s|%dGB\n",
-                 static_cast<long long>(now), pkg.c_str(), pid,
-                 model.c_str(), gpu.c_str(), ram_gb);
-    std::fclose(fp);
-    chmod(LAUNCH_LOG_PATH, 0600);
+    std::snprintf(buf, sizeof(buf), "%lld|%s|%d|%s|%s|%dGB",
+                  static_cast<long long>(now), pkg.c_str(), pid,
+                  model.c_str(), gpu.c_str(), ram_gb);
+    append_line_as_root(LAUNCH_LOG_PATH, buf);
 }
 
 static void companion_handler(int fd) {
@@ -310,7 +362,6 @@ static void companion_handler(int fd) {
     g_companion_cache.refresh_if_needed();
     auto it = g_companion_cache.pkg_configs.find(pkg_name);
     if (it == g_companion_cache.pkg_configs.end()) {
-        // 未配置伪装的应用：直接从内存哈希表返回 0，零文件打开开销！
         uint8_t zero = 0;
         write_full(fd, &zero, sizeof(zero));
         return;
@@ -326,29 +377,43 @@ static void companion_handler(int fd) {
         write_str(fd, kv.second);
     }
 
-    bool probe_enabled = (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
-    if (probe_enabled) {
-        mkdir(DATA_ROOT_DIR, 0700);
-        int p_fd = open(PROBE_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        int c_fd = open(CRASH_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        if (p_fd >= 0 && c_fd >= 0) {
-            uint8_t has_scm = 1;
-            write_full(fd, &has_scm, sizeof(has_scm));
-            send_log_fds(fd, p_fd, c_fd);
-        } else {
-            uint8_t no_scm = 0;
-            write_full(fd, &no_scm, sizeof(no_scm));
-        }
-        if (p_fd >= 0) close(p_fd);
-        if (c_fd >= 0) close(c_fd);
-    } else {
-        uint8_t no_scm = 0;
-        write_full(fd, &no_scm, sizeof(no_scm));
-    }
-
     std::string model = entries.count("BUILD:MODEL") ? entries.at("BUILD:MODEL") : "Custom";
     std::string gpu   = entries.count("GLES:RENDERER") ? entries.at("GLES:RENDERER") : "DefaultGPU";
     int ram_gb        = entries.count("VFS:RAM_GB") ? std::atoi(entries.at("VFS:RAM_GB").c_str()) : 16;
+
+    bool probe_enabled = (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
+    if (probe_enabled) {
+        mkdir(DATA_ROOT_DIR, 0700);
+        // 1. 先由 Root Companion 立即写入首条 SESSION 探针激活记录至 probe_events.log
+        append_line_as_root(
+            PROBE_LOG_PATH,
+            "[PROBE][" + pkg_name + "][SESSION] MirageForge_v1.1.0_Attached => " +
+                model + " | " + gpu + " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
+        );
+
+        // 2. 复制当前已连通的 Companion Socket 并启动 Root 异步落盘线程
+        int sink_fd = dup(fd);
+        if (sink_fd >= 0) {
+            pthread_t tid;
+            if (pthread_create(&tid, nullptr, companion_log_sink_thread,
+                               reinterpret_cast<void *>(static_cast<intptr_t>(sink_fd))) == 0) {
+                pthread_detach(tid);
+                uint8_t ready = 1;
+                write_full(fd, &ready, sizeof(ready));
+            } else {
+                close(sink_fd);
+                uint8_t no_ready = 0;
+                write_full(fd, &no_ready, sizeof(no_ready));
+            }
+        } else {
+            uint8_t no_ready = 0;
+            write_full(fd, &no_ready, sizeof(no_ready));
+        }
+    } else {
+        uint8_t no_ready = 0;
+        write_full(fd, &no_ready, sizeof(no_ready));
+    }
+
     record_launch_telemetry(pkg_name, app_pid, model, gpu, ram_gb);
 }
 
