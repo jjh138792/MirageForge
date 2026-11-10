@@ -23,73 +23,10 @@ namespace mirage {
 constexpr const char *PROBE_LOG_PATH = "/data/adb/mirage_forge/probe_events.log";
 constexpr const char *CRASH_LOG_PATH = "/data/adb/mirage_forge/crash_events.log";
 
+// 指向经 api->exemptFd() 豁免的 Companion Unix Socket 描述符 (由 Root 守护线程代写磁盘)
 inline int g_probe_log_fd = -1;
-inline int g_crash_log_fd = -1;
 inline std::atomic_flag g_probe_spinlock = ATOMIC_FLAG_INIT;
 inline std::unordered_set<uint64_t> g_probe_dedup;
-
-inline bool send_log_fds(int sock_fd, int probe_fd, int crash_fd) {
-    struct msghdr msg{};
-    char dummy = 'M';
-    struct iovec io{};
-    io.iov_base = &dummy;
-    io.iov_len = 1;
-
-    int fds[2] = {probe_fd, crash_fd};
-    alignas(struct cmsghdr) char cmsg_buf[CMSG_SPACE(sizeof(fds))] = {0};
-
-    msg.msg_iov = &io;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf;
-    msg.msg_controllen = sizeof(cmsg_buf);
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(fds));
-    std::memcpy(CMSG_DATA(cmsg), fds, sizeof(fds));
-
-    ssize_t n;
-    do {
-        n = sendmsg(sock_fd, &msg, 0);
-    } while (n == -1 && errno == EINTR);
-    return n == 1;
-}
-
-inline bool recv_log_fds(int sock_fd, int *out_probe_fd, int *out_crash_fd) {
-    if (!out_probe_fd || !out_crash_fd) return false;
-    *out_probe_fd = -1;
-    *out_crash_fd = -1;
-
-    struct msghdr msg{};
-    char dummy = 0;
-    struct iovec io{};
-    io.iov_base = &dummy;
-    io.iov_len = 1;
-
-    int fds[2] = {-1, -1};
-    alignas(struct cmsghdr) char cmsg_buf[CMSG_SPACE(sizeof(fds))] = {0};
-
-    msg.msg_iov = &io;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf;
-    msg.msg_controllen = sizeof(cmsg_buf);
-
-    ssize_t n;
-    do {
-        n = recvmsg(sock_fd, &msg, 0);
-    } while (n == -1 && errno == EINTR);
-    if (n <= 0) return false;
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-        std::memcpy(fds, CMSG_DATA(cmsg), sizeof(fds));
-        *out_probe_fd = fds[0];
-        *out_crash_fd = fds[1];
-        return true;
-    }
-    return false;
-}
 
 struct BacktraceState {
     void **current;
@@ -151,16 +88,21 @@ inline std::string capture_caller_chain(size_t skip_frames = 2, size_t max_frame
     return res.empty() ? "app_runtime" : res;
 }
 
-inline void write_direct_log_line(int fd, int prio, const std::string &line) {
+// 通过 Companion Socket 实时发送给 Root 守护线程写盘，同时使用 WARN 级别写 logd 突破国产 ROM 过滤
+inline void write_direct_log_line(int prio, const std::string &line) {
     __android_log_print(prio, LOG_TAG, "%s", line.c_str());
-    if (fd >= 0) {
+    int sock = g_probe_log_fd;
+    if (sock >= 0) {
         std::string with_nl = line + "\n";
-        ssize_t unused = write(fd, with_nl.data(), with_nl.size());
-        (void)unused;
+        ssize_t sent = send(sock, with_nl.data(), with_nl.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent < 0 && (errno == ENOTSOCK || errno == EBADF)) {
+            ssize_t unused = write(sock, with_nl.data(), with_nl.size());
+            (void)unused;
+        }
     }
 }
 
-// 极速探针记录：未开启探针时 1 周期内联返回，零开销
+// 极速探针记录：未开启探针时 1 周期内联返回，开启后实时回溯调用栈并发送给 Root 守护线程
 inline void emit_probe(const char *domain, const std::string &key, const std::string &val) {
     if (__builtin_expect(!g_cfg.probe.enabled, 1)) return;
 
@@ -175,7 +117,7 @@ inline void emit_probe(const char *domain, const std::string &key, const std::st
     std::ostringstream ss;
     ss << "[PROBE][" << g_cfg.pkg_name << "][" << domain << "] "
        << key << " => " << val << " @@ " << stack;
-    write_direct_log_line(g_probe_log_fd, ANDROID_LOG_INFO, ss.str());
+    write_direct_log_line(ANDROID_LOG_WARN, ss.str());
 }
 
 inline struct sigaction g_old_sigsegv{};
@@ -197,7 +139,7 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
                   info ? info->si_addr : nullptr,
                   bt.c_str());
 
-    write_direct_log_line(g_crash_log_fd, ANDROID_LOG_ERROR, crash_buf);
+    write_direct_log_line(ANDROID_LOG_ERROR, crash_buf);
 
     struct sigaction *prev = (sig == SIGSEGV) ? &g_old_sigsegv :
                              (sig == SIGABRT) ? &g_old_sigabrt :
