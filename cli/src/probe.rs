@@ -2,7 +2,8 @@ use crate::fs_atomic::{is_safe_token, read_file_str, truncate_file, write_file_a
 use crate::models::*;
 use crate::store::StoreEngine;
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::process::Command;
 
 pub struct ProbeDoctor;
@@ -22,7 +23,63 @@ impl ProbeDoctor {
         }
     }
 
+    // 从 logcat 缓冲区收割任何漏网的 [PROBE] / [CRASH] 记录并自动持久化追加写入磁盘文件
+    fn harvest_logcat_into_files() {
+        let output = Command::new("logcat")
+            .args(["-d", "-s", "MirageForge:W", "MirageForge:E", "MirageForge:I"])
+            .output();
+
+        let stdout = match output {
+            Ok(out) if !out.stdout.is_empty() => String::from_utf8_lossy(&out.stdout).to_string(),
+            _ => return,
+        };
+
+        let existing_probes = read_file_str(PROBE_LOG_FILE);
+        let existing_crashes = read_file_str(CRASH_LOG_FILE);
+
+        let mut known_probes: HashSet<&str> = existing_probes.lines().collect();
+        let mut known_crashes: HashSet<&str> = existing_crashes.lines().collect();
+
+        let mut new_probes = Vec::new();
+        let mut new_crashes = Vec::new();
+
+        for line in stdout.lines() {
+            if let Some(pos) = line.find("[PROBE][") {
+                let clean = line[pos..].trim();
+                if !known_probes.contains(clean) {
+                    known_probes.insert(clean);
+                    new_probes.push(clean.to_string());
+                }
+            } else if let Some(pos) = line.find("[CRASH][") {
+                let clean = line[pos..].trim();
+                if !known_crashes.contains(clean) {
+                    known_crashes.insert(clean);
+                    new_crashes.push(clean.to_string());
+                }
+            }
+        }
+
+        if !new_probes.is_empty() {
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(PROBE_LOG_FILE) {
+                for p in new_probes {
+                    let _ = writeln!(f, "{}", p);
+                }
+                let _ = f.sync_all();
+            }
+        }
+
+        if !new_crashes.is_empty() {
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(CRASH_LOG_FILE) {
+                for c in new_crashes {
+                    let _ = writeln!(f, "{}", c);
+                }
+                let _ = f.sync_all();
+            }
+        }
+    }
+
     pub fn query_probe_logs(filter_pkg: &str, unmapped_only: bool, limit: usize) -> Vec<ProbeEvent> {
+        Self::harvest_logcat_into_files();
         Self::rotate_log_if_needed(PROBE_LOG_FILE);
         let raw = read_file_str(PROBE_LOG_FILE);
 
@@ -59,6 +116,7 @@ impl ProbeDoctor {
     }
 
     pub fn query_crash_logs(limit: usize) -> Vec<CrashEvent> {
+        Self::harvest_logcat_into_files();
         Self::rotate_log_if_needed(CRASH_LOG_FILE);
         let raw = read_file_str(CRASH_LOG_FILE);
         let mut crashes = Vec::new();
