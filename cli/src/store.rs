@@ -8,6 +8,7 @@ use std::fs;
 use std::process::Command;
 
 pub struct StoreEngine {
+    pub meta: ModuleMeta,
     pub templates: BTreeMap<String, DeviceTemplate>,
     pub routes: BTreeMap<String, AppRoute>,
 }
@@ -15,6 +16,7 @@ pub struct StoreEngine {
 impl StoreEngine {
     pub fn new() -> Self {
         Self {
+            meta: read_module_meta(),
             templates: BTreeMap::new(),
             routes: BTreeMap::new(),
         }
@@ -35,10 +37,10 @@ impl StoreEngine {
     }
 
     pub fn load_all(&mut self) {
+        self.meta = read_module_meta();
         self.templates.clear();
         self.routes.clear();
 
-        // 1. 优先从 templates/*.tpl 加载模板
         if let Ok(entries) = fs::read_dir(TPL_DIR) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -54,7 +56,6 @@ impl StoreEngine {
             }
         }
 
-        // 2. 若 templates/*.tpl 为空但存在旧版 config.json，自动迁移导入
         if self.templates.is_empty() {
             let cfg_raw = read_file_str(CONFIG_JSON);
             if let Ok(parsed) = serde_json::from_str::<FullStateExport>(&cfg_raw) {
@@ -66,7 +67,6 @@ impl StoreEngine {
             }
         }
 
-        // 3. 加载 routes.db
         let routes_raw = read_file_str(ROUTES_DB);
         for line in routes_raw.lines() {
             let tr = line.trim();
@@ -83,6 +83,7 @@ impl StoreEngine {
                     vfs: parts[4] == "1",
                     probe: parts[5] == "1",
                     sdk_spoof: parts.get(6).copied() == Some("1"),
+                    dpi: parts.get(7).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0),
                 };
                 if r.is_any_enabled() {
                     self.routes.insert(r.pkg_name.clone(), r);
@@ -92,19 +93,19 @@ impl StoreEngine {
     }
 
     pub fn save_all_and_compile(&mut self) -> bool {
+        self.meta = read_module_meta();
         ensure_dir(DATA_ROOT_DIR, 0o700);
         ensure_dir(TPL_DIR, 0o700);
         ensure_dir(APPS_DIR, 0o700);
 
-        // 1. 写入 templates/*.tpl
         for (id, tpl) in &self.templates {
             let path = format!("{}/{}.tpl", TPL_DIR, id);
             write_file_atomic(&path, &Self::serialize_tpl(tpl), 0o600);
         }
 
-        // 2. 原子编译 apps/<pkg>.conf（若四个子开关全关，则不生成 .conf，保证绝对 0 改动）
         let mut valid_confs: HashSet<String> = HashSet::new();
-        self.routes.retain(|_, r| self.templates.contains_key(&r.tpl_id) && r.is_any_enabled());
+        self.routes
+            .retain(|_, r| self.templates.contains_key(&r.tpl_id) && r.is_any_enabled());
 
         for (pkg, r) in &self.routes {
             if !is_safe_token(pkg) {
@@ -119,7 +120,6 @@ impl StoreEngine {
             }
         }
 
-        // 清理已解绑应用的残留 .conf
         if let Ok(entries) = fs::read_dir(APPS_DIR) {
             for entry in entries.flatten() {
                 if let Some(fname) = entry.file_name().to_str() {
@@ -130,24 +130,22 @@ impl StoreEngine {
             }
         }
 
-        // 3. 最后写入 routes.db (附加纳秒级注释确保文件变更，触发 Zygisk Companion 刷新内存缓存)
         let mut r_lines = Vec::with_capacity(self.routes.len() + 1);
-        r_lines.push(format!("# MirageForge v{} Routes Table", MIRAGE_VERSION));
+        r_lines.push(format!("# MirageForge v{} Routes Table", self.meta.version));
         for r in self.routes.values() {
             r_lines.push(format!(
-                "{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}",
                 r.pkg_name,
                 r.tpl_id,
                 if r.build { "1" } else { "0" },
                 if r.gl { "1" } else { "0" },
                 if r.vfs { "1" } else { "0" },
                 if r.probe { "1" } else { "0" },
-                if r.sdk_spoof { "1" } else { "0" }
+                if r.sdk_spoof { "1" } else { "0" },
+                r.dpi
             ));
         }
         write_file_atomic(ROUTES_DB, &(r_lines.join("\n") + "\n"), 0o600);
-
-        // 4. 同步导出 config.json
         write_file_atomic(CONFIG_JSON, &self.export_full_json(), 0o600);
         true
     }
@@ -161,6 +159,12 @@ impl StoreEngine {
         }
         if tpl.product.is_empty() {
             tpl.product = tpl.device.clone();
+        }
+        if tpl.display_id.is_empty() {
+            tpl.display_id = format!("{} release-keys", tpl.build_id);
+        }
+        if tpl.incremental.is_empty() {
+            tpl.incremental = tpl.build_id.clone();
         }
         self.templates.insert(tpl.id.clone(), tpl);
         self.save_all_and_compile()
@@ -214,8 +218,8 @@ impl StoreEngine {
 
     pub fn export_full_json(&self) -> String {
         let state = FullStateExport {
-            version: MIRAGE_VERSION.to_string(),
-            version_code: MIRAGE_VERSION_CODE,
+            version: self.meta.version.clone(),
+            version_code: self.meta.version_code,
             active_count: self.routes.len(),
             template_count: self.templates.len(),
             templates: self.templates.clone(),
@@ -229,7 +233,6 @@ impl StoreEngine {
     }
 
     fn deserialize_tpl(raw: &str) -> Option<DeviceTemplate> {
-        // 优先支持 v1.1.0 标准 JSON 格式 .tpl，同时向下兼容旧版 KEY=VALUE 格式 .tpl
         if raw.trim_start().starts_with('{') {
             return serde_json::from_str::<DeviceTemplate>(raw).ok();
         }
@@ -271,6 +274,10 @@ impl StoreEngine {
                 soc_model: "SM8750-AB".into(),
                 supported_abis: "arm64-v8a,armeabi-v7a,armeabi".into(),
                 build_id: "AP3A.240905.015.A2".into(),
+                display_id: "AP3A.240905.015.A2 release-keys".into(),
+                incremental: "OS2.0.102.0.VOBCNXM".into(),
+                build_host: "pangu-build-component-system".into(),
+                build_user: "builder".into(),
                 build_time: "1736899200000".into(),
                 release: "15".into(),
                 sdk_int: "35".into(),
@@ -290,6 +297,7 @@ impl StoreEngine {
                 soc_machine: "SM8750".into(),
                 kernel_release: "6.6.30-android15-8-g94b8f12ab4c1".into(),
                 kernel_version: "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025".into(),
+                default_dpi: 0,
                 custom_props: "ro.miui.ui.version.code=15\nro.miui.ui.version.name=V816\nro.product.marketname=Xiaomi 15 Pro".into(),
             },
             DeviceTemplate {
@@ -307,6 +315,10 @@ impl StoreEngine {
                 soc_model: "SM8750-AB".into(),
                 supported_abis: "arm64-v8a,armeabi-v7a,armeabi".into(),
                 build_id: "AQ3A.240812.002".into(),
+                display_id: "WW_AI2501-35.1810.1810.88-0".into(),
+                incremental: "35.1810.1810.88".into(),
+                build_host: "asus-rog-build".into(),
+                build_user: "jenkins".into(),
                 build_time: "1737504000000".into(),
                 release: "15".into(),
                 sdk_int: "35".into(),
@@ -326,6 +338,7 @@ impl StoreEngine {
                 soc_machine: "SM8750".into(),
                 kernel_release: "6.6.30-android15-8-rog9".into(),
                 kernel_version: "#1 SMP PREEMPT Mon Jan 20 08:30:00 UTC 2025".into(),
+                default_dpi: 0,
                 custom_props: "ro.product.asus.series=ROG Phone 9\nro.vendor.asus.gaming=1".into(),
             },
             DeviceTemplate {
@@ -343,6 +356,10 @@ impl StoreEngine {
                 soc_model: "SM8750-AB".into(),
                 supported_abis: "arm64-v8a,armeabi-v7a,armeabi".into(),
                 build_id: "AP3A.240905.015.A2".into(),
+                display_id: "RedMagicOS10.0.12_NX789J_GB".into(),
+                incremental: "20250110.213512".into(),
+                build_host: "nubia-build-server".into(),
+                build_user: "nubia".into(),
                 build_time: "1736467200000".into(),
                 release: "15".into(),
                 sdk_int: "35".into(),
@@ -362,6 +379,7 @@ impl StoreEngine {
                 soc_machine: "SM8750".into(),
                 kernel_release: "6.6.30-android15-8-redmagic".into(),
                 kernel_version: "#1 SMP PREEMPT Fri Jan 10 21:35:12 CST 2025".into(),
+                default_dpi: 0,
                 custom_props: "ro.product.marketname=红魔 10 Pro+".into(),
             },
             DeviceTemplate {
@@ -379,6 +397,10 @@ impl StoreEngine {
                 soc_model: "MT6991".into(),
                 supported_abis: "arm64-v8a,armeabi-v7a,armeabi".into(),
                 build_id: "AP3A.240905.015.A2".into(),
+                display_id: "OriginOS 5 PD2405_A_15.0.14.2".into(),
+                incremental: "compiler11201512".into(),
+                build_host: "vivo-osc-compile".into(),
+                build_user: "compiler".into(),
                 build_time: "1732105920000".into(),
                 release: "15".into(),
                 sdk_int: "35".into(),
@@ -398,6 +420,7 @@ impl StoreEngine {
                 soc_machine: "MT6991".into(),
                 kernel_release: "6.6.30-android15-8-mt6991".into(),
                 kernel_version: "#1 SMP PREEMPT Wed Nov 20 15:12:00 CST 2024".into(),
+                default_dpi: 0,
                 custom_props: "ro.vivo.os.build.display.id=OriginOS 5\nro.vivo.market.name=vivo X200 Pro".into(),
             },
         ];
