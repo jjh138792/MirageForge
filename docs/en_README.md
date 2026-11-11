@@ -1,11 +1,13 @@
 <div align="center">
 
-# MirageForge (蜃楼工坊)
+<img src="../webui/public/mirageforge-logo.svg" width="88" height="88" alt="MirageForge Logo" />
 
-**Per-App Hardware Topology Virtualization & Native Stacktrace Probe for Zygisk**
+# MirageForge
 
-[![Version](https://img.shields.io/badge/Version-v1.1.0-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
-[![Zygisk](https://img.shields.io/badge/Zygisk-API%20v4%20(C%2B%2B17)-06b6d4?style=flat-square)](https://github.com/topjohnwu/zygisk-module-sample)
+**Per-App Device & Hardware Spoofing Zygisk Module**
+
+[![Version](https://img.shields.io/badge/Version-v1.2.0-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
+[![Zygisk](https://img.shields.io/badge/Zygisk-Supported-06b6d4?style=flat-square)](https://github.com/topjohnwu/zygisk-module-sample)
 [![CLI](https://img.shields.io/badge/CLI-Rust%202021-f97316?style=flat-square)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-GPL--3.0--only-f43f5e?style=flat-square)](../LICENSE)
 
@@ -15,83 +17,85 @@
 
 ---
 
-## 📖 Preface
+## 📖 Foreword
 
-**MirageForge** is a per-app device and hardware topology spoofing module powered by **Zygisk**.
+**MirageForge** is a Zygisk module for per-app device model and hardware spoofing.
 
-To be completely honest, there are already plenty of device spoofing modules out there, and most of them made by veteran developers are probably much better than mine. This project started as a casual side-project just for fun. However, once I named it **MirageForge**, I figured it would be embarrassing if it only modified two lines of `build.prop`. So I ended up throwing in an **AOSP 1:1 Bionic property arena**, **Vulkan/GLES GPU spoofing**, **heterogeneous per-core dynamic CPU frequencies**, a **Rust CLI core**, and a modern **WebUI**.
+To be completely honest, there are already plenty of device spoofing modules out there, and those made by other developers are obviously much better and more mature than mine. I started this project mostly just for fun and to tinker around in my spare time.
 
-It is still a work in progress and definitely has rough edges, so **Issues** and **Pull Requests** are more than welcome!
-
----
-
-## ✨ What Does It Actually Do?
-
-Besides spoofing basic `android.os.Build` fields and system properties like regular modules, MirageForge focuses on fixing the subtle hardware inconsistencies that anti-cheat and device-fingerprinting SDKs love to check:
-
-### 1. 🛑 True "Zero-Touch" On-Demand Architecture
-* **Zero Interference for Unconfigured Apps**: `onLoad` performs **0 `dlsym` lookups and 0 memory allocations**. If an app isn't in your target list, the module immediately unloads itself (`DLCLOSE_MODULE_LIBRARY`) during `preAppSpecialize` via an `O(1)` in-memory cache check in the Root Companion.
-* **Strict Sub-Module Isolation**: Each target app has 5 independent toggles (`Bionic/ART Props`, `Vulkan/GLES/DRM`, `Per-Core Freq/DDR/VFS`, `Probe & Backtrace`, and `Force Spoof SDK`). Disabled sub-modules never register their PLT hooks and never touch original values—no "modify then restore" hacks.
-* **Surgical PLT Filtering**: Only hooks essential system runtime bridge libraries and app-private `.so` libraries (including uncompressed in-APK libraries with `extractNativeLibs="false"`), skipping hundreds of irrelevant UI/font libraries to keep app cold-starts fast.
-
-### 2. 🧬 AOSP 1:1 Lock-Free Bionic Property Arena
-* **Immune to Raw Pointer Dereferencing**: Virtual `prop_info` handles are allocated using the exact binary memory layout of AOSP Bionic (`4-byte serial + 92-byte value + flexible name array`). Even if an aggressive risk-control SDK bypasses libc APIs and reads `(const char*)pi + 4` directly, it gets the spoofed value without crashing.
-* **Full Table Enumeration (`__system_property_foreach`)**: Intercepts `find`, `read_callback`, `read`, `get`, `popen("getprop")`, and `foreach`. Cross-brand properties (e.g., spoofing Xiaomi HyperOS `ro.miui.*` on a Pixel) appear seamlessly even during full property table scans.
-
-### 3. 🎮 Vulkan + OpenGL ES + MediaDrm GPU Spoofing
-* **Unlock High Frame Rates & Graphics Settings**: Modern mobile games default to Vulkan. MirageForge hooks both OpenGL ES (`glGetString` / `eglGetProcAddress`) and **Vulkan** (`vkGetInstanceProcAddr` / `vkGetPhysicalDeviceProperties` / `Properties2`), spoofing `deviceName` and PCI `vendorID` (e.g., `Adreno (TM) 830` or `Immortalis-G925 MC12`), as well as `AMediaDrm_getPropertyString` in `libmediandk.so`.
-
-### 4. ⚡ Heterogeneous Per-Core Cpufreq & Symmetric DDR Memory (VFS Shield)
-* **No More "6GB Installed RAM with 16GB Available RAM"**:
-  * Calculates realistic hardware carveout deductions for `/proc/meminfo` and keeps `sysinfo()` and `sysconf(_SC_PHYS_PAGES)` 100% consistent.
-  * Synthesizes `/proc/ddr_info`, `/sys/devices/system/chip-info/ddr_info`, and 12 bootloader DDR properties (e.g., `16GB LPDDR5X (SKhynix)`) so "Installed Physical RAM" and "Available RAM" match in hardware inspection apps.
-* **Dynamic Per-Core Frequency Jitter**:
-  * Supports heterogeneous CPU cluster definitions (e.g., Snapdragon 8 Elite `6+2` or Dimensity 9400 `4+3+1`) covering `cpu0~7/cpufreq/*` and `policy0~7/*`.
-  * When an app reads `scaling_cur_freq` or rewinds the descriptor via `lseek(fd, 0, SEEK_SET)`, the engine returns live fluctuating frequencies aligned to 19.2MHz crystal oscillator OPP steps.
-* **Lock-Free FD Cloaking & Live Maps Sanitizer**:
-  * `FdCloakTracker` uses an `O(1)` atomic bitmap to disguise virtual `memfd` descriptors when inspected via `readlink("/proc/self/fd/N")` or `fstat`.
-  * Automatically strips lines containing `zygisk`, `mirage_forge`, `magisk`, `kernelsu`, or `/data/adb` when target apps read `/proc/self/maps` or `mountinfo`.
-
-### 5. 📡 Mirage Probe & Native Stacktrace Radar
-* **See What Apps Are Snooping**: Enable the Probe toggle for any app to log which properties, files, or GPU strings it reads, complete with live `_Unwind_Backtrace` + `dladdr` native caller chains (e.g., `libtersafe2.so+0x8f410 <- libc.so!...`), written asynchronously to disk by the Root Companion.
-* **One-Tap Property Capture**: Spot an `UNMAPPED` property in the radar? Click **"+ Capture Prop"** in the WebUI to inject it directly into your active template.
-* **Native Crash Inspector**: Catches `SIGSEGV`, `SIGABRT`, `SIGBUS`, and `SIGILL` to log the fault address and native backtrace into `crash_events.log`.
-
-### 6. 🦀 Rust CLI Core + Modern WebUI
-* **Rust `mirageforge_cli`**: Statically linked Rust binary handling atomic `Write-Fsync-Rename` config compilation, `build.prop` parsing/inference, and log harvesting.
-* **Clean WebUI**: Compatible with KernelSU, APatch, and MMRL (WebUI-X), with built-in English / Simplified Chinese / Traditional Chinese support.
+If you happen to peek into the Git commit history and see a disaster of meaningless commit messages and back-to-back panic fixes, please don't judge—that's just my terrible commit habit in the wild (even the clean commit messages you see recently were written by AI). Still, **Issues** and **Pull Requests** are always more than welcome!
 
 ---
 
-## 🚀 Quick Start
+## 🎯 What Does It Actually Do?
 
-1. Download the flashable zip from [Releases](https://github.com/jjh138792/MirageForge/releases) (or GitHub Actions artifacts).
-2. Flash it in **Magisk** (with Zygisk enabled), **KernelSU**, **APatch** (with Zygisk Next / ReZygisk), or via **TWRP Recovery**, then reboot.
-3. Open the **WebUI** from your root manager, or use `mirageforge_cli` in Termux / ADB Shell:
+In short, it tricks specific apps or games into thinking you are using a different phone—**without modifying your system partition or affecting any other apps**:
+
+### 1. Unlock High Frame Rates & Graphics in Games
+* **Model & GPU Spoofing**: Many mobile games check both your phone model and your GPU model before unlocking 120Hz/165Hz modes or ultra graphics. MirageForge spoofs both device info and OpenGL / Vulkan GPU names (e.g., spoofing as Xiaomi 15 Pro, ROG Phone 9 Pro, RedMagic 10 Pro+, or vivo X200 Pro with `Adreno (TM) 830` or `Immortalis-G925`).
+
+### 2. Comprehensive Hardware & System Info Spoofing
+It goes far beyond changing `Build.MODEL`, covering the details checked by hardware inspection apps (like DevCheck or Device Info HW):
+* **Rich System Properties**: Spoofs Brand, Model, Device, Board (`Build.BOARD`), SoC Model (`Build.SOC_MODEL`), Build ID, Display ID (`Build.DISPLAY`), Incremental version, Security Patch date, Fingerprint, cross-brand ROM properties (like MIUI/HyperOS or OriginOS properties on AOSP), and restricted bootloader/security properties.
+* **CPU & Per-Core Frequencies**: Spoofs processor descriptions, core counts, and **individual min/max/live frequencies for every single CPU core** (simulating real big.LITTLE / Prime core clusters with natural frequency fluctuations).
+* **RAM Specifications**: Spoofs both **installed physical RAM specs** (e.g., `16GB LPDDR5X`, `24GB LPDDR5T`) and **available system memory**.
+
+### 3. Per-App DPI Scaling
+* Change the screen density (DPI) for individual apps or games (e.g., setting a specific app to `320` or `480` DPI) without touching your global system display resolution.
+
+### 4. One-Click `build.prop` Import
+* Don't want to type dozens of fields manually? Just import any `build.prop` file extracted from another ROM. MirageForge automatically extracts the identity, fingerprint, security patch, and DPI, and infers the matching CPU cluster frequencies and GPU model to create a ready-to-use template.
+
+### 5. Hardware Access Sniffer (Probe Radar)
+* Wondering how a stubborn app still detects your device? Turn on the **`📡 Probe & Backtrace`** switch for that app.
+* Run the app for a few seconds, and the WebUI will show you which system properties and hardware files it read, along with the exact native library (`.so`) and function offset that made the call. If you spot an unconfigured property, click **`+ Capture Prop`** to add it to your template on the fly.
+
+### 6. Zero Interference When Turned Off
+* **Granular Per-App Switches**: Every app has independent toggles for Properties, GPU, CPU/RAM VFS, Probe, and SDK version. **Unconfigured apps and disabled switches are not touched at all**, keeping app launches fast and clean.
+* **Crash-Safe by Default**: Keeps your real Android SDK version by default so apps won't crash from calling mismatched system APIs, while still offering an optional per-app SDK spoof toggle when needed.
+
+---
+
+## 🚀 Installation & Usage
+
+### 1. Requirements
+* **Android**: Android 8.0 (API 26) ~ Android 16
+* **Root & Zygisk**:
+  * **Magisk** (v26.0+) with built-in Zygisk enabled, or **Zygisk Next / ReZygisk**
+  * **KernelSU / KernelSU Next / APatch** with **Zygisk Next** or **ReZygisk** installed
+
+### 2. Using the WebUI (Recommended)
+After flashing and rebooting, open **MirageForge** from **KernelSU / APatch / MMRL / KSUWebUI** (supports Auto/Light/Dark themes, English/Chinese switch, and online update checks):
+1. **Templates**: Browse built-in flagship presets or create/edit your own hardware template.
+2. **Prop Alchemy**: Upload or paste a `build.prop` file to generate a template automatically.
+3. **App Matrix**: Pick a target app, select a template, toggle specific spoofing modules or per-app DPI, and tap ⚡ to restart the app.
+4. **Probe Radar**: Inspect launch telemetry, native crash logs, and live property/file access stacktraces.
+
+### 3. Using the CLI (`mirageforge_cli`)
+For terminal lovers and script automation, `mirageforge_cli` is available directly in your `PATH`:
 
 ```bash
 # Check module status and active app routes
 su -c "mirageforge_cli status"
 
-# Parse a ROM's build.prop and save it as a template
+# Parse a build.prop file and save it as a template
 su -c "mirageforge_cli parse-prop /sdcard/Download/build.prop --save"
 
-# Bind a template to an app and force-stop it to apply immediately
-su -c "mirageforge_cli route set com.tencent.tmgp.sgame rog_9_pro --build 1 --gl 1 --vfs 1 --probe 0 --sdk 0 --restart"
+# Bind a template to an app with custom switches and per-app DPI
+su -c "mirageforge_cli route set com.tencent.tmgp.sgame rog_9_pro --build 1 --gl 1 --vfs 1 --probe 0 --sdk 0 --dpi 480 --restart"
 
-# View recent hardware probe events & native stacktraces
-su -c "mirageforge_cli probe list --limit 30"
+# Remove spoofing for an app
+su -c "mirageforge_cli route remove com.tencent.tmgp.sgame --restart"
 ```
 
 ---
 
-## 🤣 About My Commit History
+## 🤖 Honesty Corner & Credits
 
-1. **Please Do Not Look at My Git Commits**:
-   If you check the commit history of this repo, you will witness a crime scene of `Update`, `fix`, and shameless trial-and-error pushes just to use GitHub Actions as my free cloud cross-compiler. If you are a Git hygiene purist, please look away for your own sanity.
+In the spirit of full transparency: **this README (as well as a hefty chunk of the code refactoring in this repository) was written by Google Gemini**. Without AI cleaning up my mess, this README would still be the three-line placeholder it started as.
 
 ---
 
 ## 📄 License
 
-Licensed under the **[GPL-3.0-only](../LICENSE)** license. Feel free to fork, modify, and submit PRs, but any derivative work must remain open-source under GPL-3.0-only.
+Licensed under the **[GPL-3.0-only](../LICENSE)** license.
