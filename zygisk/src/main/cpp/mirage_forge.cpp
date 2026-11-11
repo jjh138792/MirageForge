@@ -79,6 +79,7 @@ public:
         }
 
         g_cfg.pkg_name = pkg_name;
+        g_cfg.module_version = read_str(fd);
         uint32_t entry_count = 0;
         read_full(fd, &entry_count, sizeof(entry_count));
 
@@ -95,8 +96,13 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 两阶段严格按需加载微模块配置
+        // 加载微模块配置后，立即擦除临时接收数组 raw_kvs
         load_modular_config(raw_kvs);
+        for (auto &kv : raw_kvs) {
+            volatile_scrub_string(kv.first);
+            volatile_scrub_string(kv.second);
+        }
+        raw_kvs.clear();
 
         if (!g_cfg.build.enabled && !g_cfg.gl.enabled && !g_cfg.vfs.enabled && !g_cfg.probe.enabled) {
             close(fd);
@@ -104,7 +110,6 @@ public:
             return;
         }
 
-        // 若开启了探针且 Companion 已就绪异步落盘线程，则豁免此 Socket 供运行期实时回传日志
         if (g_cfg.probe.enabled && sink_ready == 1) {
             api->exemptFd(fd);
             g_probe_log_fd = fd;
@@ -119,6 +124,7 @@ public:
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
+            apply_app_dpi_virtualization(env);
         }
         if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
             init_vfs_symbols();
@@ -141,6 +147,9 @@ public:
         if (!g_cfg.active) return;
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
+            apply_app_dpi_virtualization(env);
+            // 阅后即焚：反射完成后立即抹除堆内存中的 build_map 与 version_map
+            g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
     }
@@ -162,6 +171,7 @@ private:
             else if (k == "META:ENABLE_VFS")      g_cfg.vfs.enabled = (v == "1");
             else if (k == "META:ENABLE_PROBE")    g_cfg.probe.enabled = (v == "1");
             else if (k == "META:FORCE_SPOOF_SDK") g_cfg.build.force_spoof_sdk = (v == "1");
+            else if (k == "META:APP_DPI")         g_cfg.build.app_dpi = std::atoi(v.c_str());
         }
 
         for (const auto &kv : raw_kvs) {
@@ -196,6 +206,7 @@ private:
                 else if (k == "VFS:SOC_MACHINE")    g_cfg.vfs.soc_machine = v;
                 else if (k == "VFS:KERNEL_RELEASE") g_cfg.vfs.kernel_release = v;
                 else if (k == "VFS:KERNEL_VERSION") g_cfg.vfs.kernel_version = v;
+                else if (k == "VFS:DPI" && g_cfg.build.app_dpi == 0) g_cfg.build.app_dpi = std::atoi(v.c_str());
                 continue;
             }
 
@@ -228,7 +239,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程：内存缓存 + 异步 Socket 日志落盘引擎
+// Root Companion 守护进程：动态读取 module.prop 版本 + 内存缓存 + 异步日志落盘
 // ============================================================================
 static std::mutex g_file_write_mtx;
 
@@ -243,7 +254,6 @@ static void append_line_as_root(const char *path, const std::string &line) {
     chmod(path, 0600);
 }
 
-// 后台守护线程：持续从豁免的 Companion Socket 接收应用发来的探针与崩溃日志并写入磁盘
 static void *companion_log_sink_thread(void *arg) {
     int sock_fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
     std::string pending;
@@ -287,9 +297,13 @@ static void *companion_log_sink_thread(void *arg) {
 struct CompanionCache {
     time_t last_sec = 0;
     long last_nsec = 0;
+    std::string cached_version;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> pkg_configs;
 
     void refresh_if_needed() {
+        if (cached_version.empty()) {
+            cached_version = read_module_prop_version();
+        }
         struct stat db_st{};
         if (stat(ROUTES_DB_PATH, &db_st) != 0) {
             pkg_configs.clear();
@@ -303,6 +317,7 @@ struct CompanionCache {
             return;
         }
 
+        cached_version = read_module_prop_version();
         pkg_configs.clear();
         DIR *dir = opendir(APPS_CONF_DIR);
         if (!dir) return;
@@ -370,6 +385,7 @@ static void companion_handler(int fd) {
     const auto &entries = it->second;
     uint8_t one = 1;
     write_full(fd, &one, sizeof(one));
+    write_str(fd, g_companion_cache.cached_version);
     uint32_t count = static_cast<uint32_t>(entries.size());
     write_full(fd, &count, sizeof(count));
     for (const auto &kv : entries) {
@@ -384,14 +400,12 @@ static void companion_handler(int fd) {
     bool probe_enabled = (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
     if (probe_enabled) {
         mkdir(DATA_ROOT_DIR, 0700);
-        // 1. 先由 Root Companion 立即写入首条 SESSION 探针激活记录至 probe_events.log
         append_line_as_root(
             PROBE_LOG_PATH,
-            "[PROBE][" + pkg_name + "][SESSION] MirageForge_v1.1.0_Attached => " +
-                model + " | " + gpu + " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
+            "[PROBE][" + pkg_name + "][SESSION] MirageForge_v" + g_companion_cache.cached_version +
+                "_Attached => " + model + " | " + gpu + " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
         );
 
-        // 2. 复制当前已连通的 Companion Socket 并启动 Root 异步落盘线程
         int sink_fd = dup(fd);
         if (sink_fd >= 0) {
             pthread_t tid;
