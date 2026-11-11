@@ -1,0 +1,167 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      changelog:
+        description: '本次发版更新说明 (留空则保持现有 CHANGELOG.md)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read Version from module/module.prop
+        id: meta
+        run: |
+          VERSION=$(grep '^version=' module/module.prop | cut -d'=' -f2 | tr -d '\r ')
+          VERSION_CODE=$(grep '^versionCode=' module/module.prop | cut -d'=' -f2 | tr -d '\r ')
+          SEMVER="${VERSION#v}"
+          ZIP_NAME="MirageForge-Zygisk-${VERSION}.zip"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "semver=$SEMVER" >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo ">>> Preparing Official Release: $VERSION (code: $VERSION_CODE)"
+
+      - name: Setup Node.js 20 for WebUI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Optical Liquid Glass WebUI
+        working-directory: ./webui
+        run: |
+          npm pkg set version="${{ steps.meta.outputs.semver }}"
+          npm install
+          npm run build
+
+      - name: Setup Android NDK r26d
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Setup Rust Toolchain & Android Targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Fetch Official zygisk.hpp
+        run: |
+          rm -f zygisk/src/main/cpp/zygisk.hpp
+          mkdir -p zygisk/src/main/cpp/include
+          curl -sSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
+            -o zygisk/src/main/cpp/include/zygisk.hpp
+
+      - name: Compile C++ Zygisk Engine & Rust mirageforge_cli
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ROOT_DIR="$(pwd)"
+          mkdir -p "$ROOT_DIR/module/zygisk" "$ROOT_DIR/module/bin"
+
+          CARGO_TOML_PATH="$(find . -path ./webui -prune -o -name "Cargo.toml" -print | head -n 1)"
+          CLI_DIR="$(dirname "$CARGO_TOML_PATH")"
+          sed -i "s/^version = .*/version = \"${{ steps.meta.outputs.semver }}\"/" "$CARGO_TOML_PATH"
+
+          ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
+          TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake"
+
+          for ABI in "${ABIS[@]}"; do
+            case "$ABI" in
+              "arm64-v8a")   TRIPLE="aarch64-linux-android" ;;
+              "armeabi-v7a") TRIPLE="armv7-linux-androideabi" ;;
+              "x86_64")      TRIPLE="x86_64-linux-android" ;;
+              "x86")         TRIPLE="i686-linux-android" ;;
+            esac
+
+            cmake -B "$ROOT_DIR/build/zygisk_$ABI" \
+              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+              -DANDROID_ABI=$ABI \
+              -DANDROID_PLATFORM=android-26 \
+              -DCMAKE_BUILD_TYPE=Release \
+              "$ROOT_DIR/zygisk/src/main/cpp"
+            cmake --build "$ROOT_DIR/build/zygisk_$ABI" --config Release --parallel $(nproc)
+            cp -f "$ROOT_DIR/build/zygisk_$ABI/libmirage_forge.so" "$ROOT_DIR/module/zygisk/$ABI.so"
+
+            (
+              cd "$CLI_DIR"
+              cargo ndk -t "$ABI" --platform 26 build --release
+            )
+            mkdir -p "$ROOT_DIR/module/bin/$ABI"
+            cp -f "$CLI_DIR/target/$TRIPLE/release/mirageforge_cli" "$ROOT_DIR/module/bin/$ABI/mirageforge_cli"
+          done
+
+          cp -f "$ROOT_DIR/module/bin/arm64-v8a/mirageforge_cli" "$ROOT_DIR/module/bin/mirageforge_cli"
+
+      - name: Package Release Flashable Zip
+        run: |
+          ZIP_NAME="${{ steps.meta.outputs.zip_name }}"
+          chmod +x module/META-INF/com/google/android/update-binary
+          chmod +x module/customize.sh module/action.sh module/uninstall.sh
+          chmod +x module/bin/mirageforge_cli module/bin/*/mirageforge_cli
+          cd module
+          zip -r9 "../$ZIP_NAME" . -x "*.DS_Store"
+
+      - name: Update update.json & Push to Repository
+        env:
+          INPUT_CHANGELOG: ${{ github.event.inputs.changelog }}
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          VERSION_CODE="${{ steps.meta.outputs.version_code }}"
+          ZIP_NAME="${{ steps.meta.outputs.zip_name }}"
+          REPO="${{ github.repository }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          cat > update.json <<EOF
+          {
+            "version": "${VERSION}",
+            "versionCode": ${VERSION_CODE},
+            "zipUrl": "https://github.com/${REPO}/releases/download/${VERSION}/${ZIP_NAME}",
+            "changelog": "https://raw.githubusercontent.com/${REPO}/${BRANCH}/CHANGELOG.md"
+          }
+          EOF
+
+          if [ -n "$INPUT_CHANGELOG" ]; then
+            cat > CHANGELOG.md <<EOF
+          ## MirageForge ${VERSION}
+
+          ${INPUT_CHANGELOG}
+          EOF
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update.json CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): 同步更新 ${VERSION} (code ${VERSION_CODE}) 的 update.json [skip ci]"
+            git push origin "HEAD:${BRANCH}"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.version }}
+          name: "MirageForge ${{ steps.meta.outputs.version }}"
+          body_path: CHANGELOG.md
+          files: ${{ steps.meta.outputs.zip_name }}
+          draft: false
+          prerelease: false
