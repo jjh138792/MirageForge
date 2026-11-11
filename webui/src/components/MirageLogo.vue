@@ -2,11 +2,15 @@
 defineProps<{
   size?: number;
 }>();
+
+// 使用常量绑定给 :src，绕过 Vite 模板编译器的静态 import 转换，
+// 运行时直接加载由 webui/public/mirageforge-logo.svg 拷贝到 webroot 根目录的图标
+const logoPath = './mirageforge-logo.svg';
 </script>
 
 <template>
   <img
-    src="./mirageforge-logo.svg"
+    :src="logoPath"
     :width="size || 44"
     :height="size || 44"
     alt="MirageForge Logo"
