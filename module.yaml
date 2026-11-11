@@ -7,6 +7,7 @@ description: README.md
 license: GPL-3.0-only
 homepage: https://github.com/jjh138792/MirageForge
 support: https://github.com/jjh138792/MirageForge/issues
+icon: webui/public/mirageforge-logo.svg
 tags: 
   - spoofing
   - tweaks
