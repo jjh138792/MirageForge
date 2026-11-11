@@ -165,12 +165,21 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         "ro.product.odm.name",
         "ro.product.system.name",
     ]);
-    let board = pick(&["ro.board.platform", "ro.product.board"]);
+    let board = pick(&["ro.product.board", "ro.board.platform"]);
     let hardware = pick(&["ro.hardware", "ro.boot.hardware"]);
+    let bootloader = pick(&["ro.bootloader", "ro.boot.bootloader"]);
     let soc_man = pick(&["ro.soc.manufacturer"]);
     let soc_model = pick(&["ro.soc.model", "ro.mediatek.platform", "ro.chipname"]);
     let abis = pick(&["ro.product.cpu.abilist", "ro.system.product.cpu.abilist"]);
     let build_id = pick(&["ro.build.id", "ro.product.build.id", "ro.system.build.id"]);
+    let display_id = pick(&["ro.build.display.id", "ro.system.build.display.id"]);
+    let incremental = pick(&[
+        "ro.build.version.incremental",
+        "ro.system.build.version.incremental",
+        "ro.vendor.build.version.incremental",
+    ]);
+    let build_host = pick(&["ro.build.host", "ro.system.build.host"]);
+    let build_user = pick(&["ro.build.user", "ro.system.build.user"]);
     let utc_sec = pick(&["ro.build.date.utc", "ro.system.build.date.utc"]);
     let release = pick(&["ro.build.version.release", "ro.system.build.version.release"]);
     let sdk = pick(&["ro.build.version.sdk", "ro.system.build.version.sdk"]);
@@ -183,6 +192,7 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         "ro.odm.build.fingerprint",
     ]);
 
+    let raw_dpi = pick(&["ro.sf.lcd_density", "ro.vendor.display.default_dpi"]);
     let raw_ddr = pick(&["ro.boot.hardware.ddr", "ro.boot.ddr_info", "ro.hardware.ddr"]);
     let raw_ddr_type = pick(&["ro.boot.ddr_type"]);
     let raw_ram_size = pick(&["ro.boot.ddr_size", "ro.vendor.hw.ram", "ro.boot.ramsize"]);
@@ -199,6 +209,12 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         .ok()
         .filter(|&r| (4..=32).contains(&r))
         .unwrap_or(16);
+
+    let detected_dpi = raw_dpi
+        .parse::<i32>()
+        .ok()
+        .filter(|&d| (120..=960).contains(&d))
+        .unwrap_or(0);
 
     let detected_ddr_type = if raw_ddr.contains("LPDDR5T") {
         "LPDDR5T"
@@ -251,15 +267,33 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         .map(|s| (s * 1000).to_string())
         .unwrap_or_else(|| "1736899200000".into());
 
+    let final_build_id = if !build_id.is_empty() {
+        build_id
+    } else {
+        "AP3A.240905.015.A2".into()
+    };
+
+    let final_display_id = if !display_id.is_empty() {
+        display_id
+    } else {
+        format!("{} release-keys", final_build_id)
+    };
+
+    let final_incremental = if !incremental.is_empty() {
+        incremental
+    } else {
+        "OS2.0.102.0.VOBCNXM".into()
+    };
+
     let mut extra_lines = Vec::new();
     for k in ordered_keys {
         if consumed.contains(&k) {
             continue;
         }
-        if k.starts_with("ro.") || k.starts_with("persist.") {
+        if k.starts_with("ro.") || k.starts_with("persist.") || k.starts_with("sys.") {
             if let Some(v) = prop_map.get(&k) {
                 extra_lines.push(format!("{}={}", k, v));
-                if extra_lines.len() >= 100 {
+                if extra_lines.len() >= 120 {
                     break;
                 }
             }
@@ -274,9 +308,9 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         manufacturer: if !manufacturer.is_empty() { manufacturer } else { brand },
         device: device.clone(),
         product: if !product.is_empty() { product } else { device },
-        board,
+        board: if !board.is_empty() { board } else { "sun".into() },
         hardware: if !hardware.is_empty() { hardware } else { "qcom".into() },
-        bootloader: "unknown".into(),
+        bootloader: if !bootloader.is_empty() { bootloader } else { "unknown".into() },
         soc_manufacturer: if !soc_man.is_empty() {
             soc_man
         } else if topo.gl_vendor == "ARM" {
@@ -286,7 +320,11 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         },
         soc_model: if !soc_model.is_empty() { soc_model } else { topo.soc_machine.clone() },
         supported_abis: if !abis.is_empty() { abis } else { "arm64-v8a,armeabi-v7a,armeabi".into() },
-        build_id: if !build_id.is_empty() { build_id } else { "AP3A.240905.015.A2".into() },
+        build_id: final_build_id,
+        display_id: final_display_id,
+        incremental: final_incremental,
+        build_host: if !build_host.is_empty() { build_host } else { "pangu-build-component-system".into() },
+        build_user: if !build_user.is_empty() { build_user } else { "builder".into() },
         build_time: build_time_ms,
         release: if !release.is_empty() { release } else { "15".into() },
         sdk_int: if !sdk.is_empty() { sdk } else { "35".into() },
@@ -306,6 +344,7 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         soc_machine: topo.soc_machine,
         kernel_release: "6.6.30-android15-8-g94b8f12ab4c1".into(),
         kernel_version: "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025".into(),
+        default_dpi: detected_dpi,
         custom_props: extra_lines.join("\n"),
     })
 }

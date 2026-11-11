@@ -1,9 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+use std::fs;
 
-pub const MIRAGE_VERSION: &str = "1.1.0";
-pub const MIRAGE_VERSION_CODE: u32 = 110;
-
+pub const MODULE_PROP_PATH: &str = "/data/adb/modules/mirage_forge/module.prop";
 pub const DATA_ROOT_DIR: &str = "/data/adb/mirage_forge";
 pub const TPL_DIR: &str = "/data/adb/mirage_forge/templates";
 pub const APPS_DIR: &str = "/data/adb/mirage_forge/apps";
@@ -13,7 +12,47 @@ pub const LAUNCH_LOG_FILE: &str = "/data/adb/mirage_forge/launch_history.log";
 pub const PROBE_LOG_FILE: &str = "/data/adb/mirage_forge/probe_events.log";
 pub const CRASH_LOG_FILE: &str = "/data/adb/mirage_forge/crash_events.log";
 
-// 兼容 JSON 中的整数 (16) 或字符串 ("16")
+#[derive(Debug, Clone)]
+pub struct ModuleMeta {
+    pub version: String,
+    pub version_code: u32,
+}
+
+/// 从 module.prop 动态读取版本号与 versionCode，告别硬编码
+pub fn read_module_meta() -> ModuleMeta {
+    let candidates = [MODULE_PROP_PATH, "./module.prop", "../module/module.prop"];
+    let mut version = String::new();
+    let mut version_code = 0u32;
+
+    for path in candidates {
+        if let Ok(raw) = fs::read_to_string(path) {
+            for line in raw.lines() {
+                let tr = line.trim();
+                if let Some(v) = tr.strip_prefix("version=") {
+                    version = v.trim().trim_start_matches('v').to_string();
+                } else if let Some(vc) = tr.strip_prefix("versionCode=") {
+                    version_code = vc.trim().parse::<u32>().unwrap_or(0);
+                }
+            }
+            if !version.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if version.is_empty() {
+        version = env!("CARGO_PKG_VERSION").to_string();
+    }
+    if version_code == 0 {
+        version_code = 120;
+    }
+
+    ModuleMeta {
+        version,
+        version_code,
+    }
+}
+
 fn de_i32_flex<'de, D>(deserializer: D) -> Result<i32, D::Error>
 where
     D: Deserializer<'de>,
@@ -35,6 +74,10 @@ fn default_bootloader() -> String { "unknown".into() }
 fn default_soc_man() -> String { "Qualcomm".into() }
 fn default_abis() -> String { "arm64-v8a,armeabi-v7a,armeabi".into() }
 fn default_build_id() -> String { "AP3A.240905.015.A2".into() }
+fn default_display_id() -> String { "AP3A.240905.015.A2 release-keys".into() }
+fn default_incremental() -> String { "OS2.0.102.0.VOBCNXM".into() }
+fn default_build_host() -> String { "pangu-build-component-system".into() }
+fn default_build_user() -> String { "builder".into() }
 fn default_build_time() -> String { "1736899200000".into() }
 fn default_release() -> String { "15".into() }
 fn default_sdk() -> String { "35".into() }
@@ -83,6 +126,14 @@ pub struct DeviceTemplate {
     pub supported_abis: String,
     #[serde(rename = "BUILD_ID", default = "default_build_id")]
     pub build_id: String,
+    #[serde(rename = "DISPLAY_ID", default = "default_display_id")]
+    pub display_id: String,
+    #[serde(rename = "INCREMENTAL", default = "default_incremental")]
+    pub incremental: String,
+    #[serde(rename = "BUILD_HOST", default = "default_build_host")]
+    pub build_host: String,
+    #[serde(rename = "BUILD_USER", default = "default_build_user")]
+    pub build_user: String,
     #[serde(rename = "BUILD_TIME", default = "default_build_time")]
     pub build_time: String,
     #[serde(rename = "RELEASE", default = "default_release")]
@@ -123,6 +174,8 @@ pub struct DeviceTemplate {
     pub kernel_release: String,
     #[serde(rename = "KERNEL_VERSION", default = "default_kernel_ver")]
     pub kernel_version: String,
+    #[serde(rename = "DEFAULT_DPI", default, deserialize_with = "de_i32_flex")]
+    pub default_dpi: i32,
 
     #[serde(rename = "CUSTOM_PROPS", default)]
     pub custom_props: String,
@@ -144,6 +197,8 @@ pub struct AppRoute {
     pub probe: bool,
     #[serde(rename = "sdkSpoof", default)]
     pub sdk_spoof: bool,
+    #[serde(default, deserialize_with = "de_i32_flex")]
+    pub dpi: i32, // 0 表示不额外覆盖或跟随模板 DEFAULT_DPI，120..=960 表示按应用独立 DPI
 }
 
 impl AppRoute {

@@ -1,22 +1,46 @@
 <!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <meta name="theme-color" content="#06080f" />
+  <meta name="theme-color" content="#070a12" />
   <title>MirageForge · 蜃楼工坊</title>
-  <!-- 接入 WebUI-X / KernelSU 原生安全区 Insets 与 Monet 动态取色变量 -->
   <link rel="stylesheet" type="text/css" href="https://mui.kernelsu.org/internal/insets.css" />
   <link rel="stylesheet" type="text/css" href="https://mui.kernelsu.org/internal/colors.css" />
 </head>
 <body>
-  <!-- 隐藏的 SVG 光学折射滤镜：为液态玻璃 (Liquid Glass) 提供真实物理边缘折射与高光色散 -->
-  <svg style="position: absolute; width: 0; height: 0; pointer-events: none;" aria-hidden="true">
+  <!-- 光学级 SVG 折射滤镜引擎：配合 backdrop-filter: url(#...) 实现真正的液态水滴折射与边缘色散 -->
+  <svg style="position: fixed; width: 0; height: 0; pointer-events: none; z-index: -999;" aria-hidden="true">
     <defs>
-      <filter id="liquid-refraction" x="-10%" y="-10%" width="120%" height="120%" color-interpolation-filters="sRGB">
-        <feTurbulence type="fractalNoise" baseFrequency="0.018 0.018" numOctaves="2" result="noise" seed="7" />
-        <feGaussianBlur in="noise" stdDeviation="1.8" result="smoothedNoise" />
-        <feDisplacementMap in="SourceGraphic" in2="smoothedNoise" scale="6" xChannelSelector="R" yChannelSelector="G" />
+      <!-- 1. 底部可拖拽液态玻璃球专用高曲率折射透镜 (含 RGB 微色散) -->
+      <filter id="mirage-orb-lens" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+        <!-- 由 ksu-io.ts 在启动时动态生成球面法线贴图注入 href -->
+        <feImage id="mirage-spherical-map" x="0%" y="0%" width="100%" height="100%" preserveAspectRatio="none" result="lensMap" />
+        <feGaussianBlur in="SourceGraphic" stdDeviation="1.2" result="preBlur" />
+        <!-- 主折射位移通道 -->
+        <feDisplacementMap
+          id="mirage-orb-disp"
+          in="preBlur"
+          in2="lensMap"
+          scale="28"
+          xChannelSelector="R"
+          yChannelSelector="G"
+          result="refracted"
+        />
+        <!-- 提升液态通透饱和度 -->
+        <feColorMatrix
+          in="refracted"
+          type="saturate"
+          values="1.65"
+          result="saturated"
+        />
+      </filter>
+
+      <!-- 2. 卡片边缘微曲面水波折射滤镜 -->
+      <filter id="mirage-card-lens" x="-10%" y="-10%" width="120%" height="120%" color-interpolation-filters="sRGB">
+        <feTurbulence type="fractalNoise" baseFrequency="0.012 0.015" numOctaves="2" seed="11" result="waveNoise" />
+        <feGaussianBlur in="waveNoise" stdDeviation="3.5" result="smoothWave" />
+        <feDisplacementMap in="SourceGraphic" in2="smoothWave" scale="7" xChannelSelector="R" yChannelSelector="G" />
       </filter>
     </defs>
   </svg>

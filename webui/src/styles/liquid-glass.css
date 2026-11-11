@@ -1,27 +1,85 @@
 :root {
-  --inset-top: var(--window-inset-top, env(safe-area-inset-top, 16px));
-  --inset-bottom: var(--window-inset-bottom, env(safe-area-inset-bottom, 20px));
+  --inset-top: var(--window-inset-top, env(safe-area-inset-top, 14px));
+  --inset-bottom: var(--window-inset-bottom, env(safe-area-inset-bottom, 18px));
+  --spring-easing: cubic-bezier(0.22, 1, 0.36, 1);
+  --bounce-easing: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --theme-transition: background-color 0.45s cubic-bezier(0.22, 1, 0.36, 1),
+                      color 0.35s ease,
+                      border-color 0.35s ease,
+                      box-shadow 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+}
 
-  /* 优先使用 WebUI-X / KSU Monet 取色，回退至赛博深空流光色板 */
-  --bg-deep: #05070e;
-  --glass-surface: rgba(20, 26, 42, 0.46);
-  --glass-surface-elevated: rgba(30, 38, 60, 0.58);
-  --glass-border-light: rgba(255, 255, 255, 0.24);
-  --glass-border-subtle: rgba(255, 255, 255, 0.08);
+/* ==========================================================================
+   1. 深色主题 (Dark Obsidian Liquid Glass)
+   ========================================================================== */
+:root[data-theme="dark"] {
+  --bg-base: #060913;
+  --bg-gradient: radial-gradient(circle at 50% 0%, #111a30 0%, #060913 72%);
+  --blob-opacity: 0.42;
 
-  --accent-primary: #8b5cf6;
-  --accent-secondary: #06b6d4;
-  --accent-tertiary: #ec4899;
-  --accent-success: #10b981;
-  --accent-warning: #f59e0b;
-  --accent-danger: #f43f5e;
+  --glass-bg: rgba(18, 25, 43, 0.38);
+  --glass-bg-elevated: rgba(24, 33, 56, 0.48);
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-rim-top: rgba(255, 255, 255, 0.42);
+  --glass-rim-bottom: rgba(56, 189, 248, 0.22);
+  --glass-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.58);
+
+  --orb-bg: radial-gradient(
+    120% 120% at 30% 20%,
+    rgba(255, 255, 255, 0.34) 0%,
+    rgba(139, 92, 246, 0.24) 45%,
+    rgba(6, 182, 212, 0.28) 100%
+  );
+  --orb-rim: inset 0 2px 3px rgba(255, 255, 255, 0.78),
+             inset 0 -2px 4px rgba(6, 182, 212, 0.52),
+             0 10px 28px -4px rgba(139, 92, 246, 0.55);
+
+  --input-bg: rgba(6, 10, 20, 0.52);
+  --subcard-bg: rgba(0, 0, 0, 0.28);
 
   --text-primary: #f8fafc;
   --text-secondary: #94a3b8;
   --text-muted: #64748b;
 
-  --spring-easing: cubic-bezier(0.22, 1, 0.36, 1);
-  --bounce-easing: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --accent-primary: #8b5cf6;
+  --accent-secondary: #06b6d4;
+}
+
+/* ==========================================================================
+   2. 浅色护眼主题 (Light Crystal Water Glass)
+   ========================================================================== */
+:root[data-theme="light"] {
+  --bg-base: #eef2ff;
+  --bg-gradient: radial-gradient(circle at 50% 0%, #e0e7ff 0%, #f1f5f9 65%, #e2e8f0 100%);
+  --blob-opacity: 0.55;
+
+  --glass-bg: rgba(255, 255, 255, 0.42);
+  --glass-bg-elevated: rgba(255, 255, 255, 0.58);
+  --glass-border: rgba(255, 255, 255, 0.68);
+  --glass-rim-top: rgba(255, 255, 255, 0.95);
+  --glass-rim-bottom: rgba(99, 102, 241, 0.24);
+  --glass-shadow: 0 14px 32px -8px rgba(15, 23, 42, 0.11),
+                  0 4px 12px -2px rgba(99, 102, 241, 0.08);
+
+  --orb-bg: radial-gradient(
+    120% 120% at 30% 20%,
+    rgba(255, 255, 255, 0.72) 0%,
+    rgba(139, 92, 246, 0.18) 52%,
+    rgba(6, 182, 212, 0.24) 100%
+  );
+  --orb-rim: inset 0 2px 4px rgba(255, 255, 255, 0.98),
+             inset 0 -2px 5px rgba(99, 102, 241, 0.35),
+             0 10px 26px -4px rgba(99, 102, 241, 0.32);
+
+  --input-bg: rgba(255, 255, 255, 0.62);
+  --subcard-bg: rgba(255, 255, 255, 0.46);
+
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+
+  --accent-primary: #6366f1;
+  --accent-secondary: #0891b2;
 }
 
 * {
@@ -37,107 +95,101 @@ input, textarea {
 }
 
 body {
-  background-color: var(--bg-deep);
+  background-color: var(--bg-base);
   color: var(--text-primary);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "MiSans", "HarmonyOS Sans SC", "Segoe UI", Roboto, sans-serif;
   min-height: 100vh;
   overflow-x: hidden;
   padding-top: var(--inset-top);
-  padding-bottom: calc(var(--inset-bottom) + 92px);
+  padding-bottom: calc(var(--inset-bottom) + 104px);
+  transition: var(--theme-transition);
 }
 
 /* ==========================================================================
-   1. 动态流体极光背景 (Ambient Liquid Aurora Mesh)
+   3. 动态流体背景画布 (使底层有清晰的色块与纹理供液态玻璃折射)
    ========================================================================== */
 .ambient-canvas {
   position: fixed;
   inset: 0;
   z-index: -1;
   overflow: hidden;
-  background: radial-gradient(circle at 50% 0%, #0f172a 0%, #05070e 75%);
+  background: var(--bg-gradient);
+  transition: background 0.5s ease;
 }
 
 .aurora-blob {
   position: absolute;
   border-radius: 50%;
-  filter: blur(85px);
-  opacity: 0.42;
+  filter: blur(72px);
+  opacity: var(--blob-opacity);
   will-change: transform;
-  animation: aurora-float 18s infinite alternate ease-in-out;
+  transition: opacity 0.5s ease;
+  animation: aurora-float 16s infinite alternate ease-in-out;
 }
 
 .aurora-blob.blob-1 {
-  width: 360px;
-  height: 360px;
-  background: radial-gradient(circle, var(--accent-primary), transparent 70%);
-  top: -80px;
-  right: -60px;
+  width: 350px;
+  height: 350px;
+  background: radial-gradient(circle, #8b5cf6, transparent 70%);
+  top: -70px;
+  right: -50px;
 }
 
 .aurora-blob.blob-2 {
   width: 320px;
   height: 320px;
-  background: radial-gradient(circle, var(--accent-secondary), transparent 70%);
-  bottom: 12%;
-  left: -90px;
-  animation-delay: -6s;
-  animation-duration: 22s;
+  background: radial-gradient(circle, #06b6d4, transparent 70%);
+  bottom: 14%;
+  left: -80px;
+  animation-delay: -5s;
 }
 
 .aurora-blob.blob-3 {
   width: 260px;
   height: 260px;
-  background: radial-gradient(circle, var(--accent-tertiary), transparent 70%);
-  top: 42%;
-  right: 15%;
-  opacity: 0.25;
-  animation-delay: -11s;
+  background: radial-gradient(circle, #f43f5e, transparent 70%);
+  top: 40%;
+  right: 12%;
+  opacity: calc(var(--blob-opacity) * 0.65);
+  animation-delay: -9s;
 }
 
 @keyframes aurora-float {
   0% { transform: translate3d(0, 0, 0) scale(1); }
-  50% { transform: translate3d(-25px, 30px, 0) scale(1.12); }
-  100% { transform: translate3d(20px, -20px, 0) scale(0.94); }
+  50% { transform: translate3d(-25px, 28px, 0) scale(1.1); }
+  100% { transform: translate3d(22px, -18px, 0) scale(0.95); }
 }
 
 /* ==========================================================================
-   2. 核心液态玻璃材质 (Liquid Glass Material System)
+   4. 光学折射液态玻璃材质 (Refractive Liquid Glass)
    ========================================================================== */
 .liquid-glass {
   position: relative;
-  background: linear-gradient(
-    145deg,
-    rgba(255, 255, 255, 0.09) 0%,
-    rgba(255, 255, 255, 0.03) 52%,
-    rgba(255, 255, 255, 0.06) 100%
-  ), var(--glass-surface);
-  backdrop-filter: blur(28px) saturate(190%);
-  -webkit-backdrop-filter: blur(28px) saturate(190%);
+  background: var(--glass-bg);
+  /* 同时启用 SVG 边缘水波折射与高饱和半透明背景穿透 */
+  backdrop-filter: url(#mirage-card-lens) blur(14px) saturate(190%);
+  -webkit-backdrop-filter: url(#mirage-card-lens) blur(14px) saturate(190%);
   border-radius: 24px;
-  border: 1px solid var(--glass-border-subtle);
+  border: 1px solid var(--glass-border);
   box-shadow:
-    inset 0 1px 1px 0 rgba(255, 255, 255, 0.32),
-    inset 0 -1px 1px 0 rgba(255, 255, 255, 0.06),
-    0 12px 32px -8px rgba(0, 0, 0, 0.55);
+    inset 0 1.5px 1.5px 0 var(--glass-rim-top),
+    inset 0 -1.5px 2px 0 var(--glass-rim-bottom),
+    var(--glass-shadow);
   overflow: hidden;
-  transition:
-    transform 0.35s var(--spring-easing),
-    box-shadow 0.35s var(--spring-easing),
-    border-color 0.3s ease;
+  transition: var(--theme-transition), transform 0.32s var(--spring-easing);
 }
 
-/* 液态追光高光层：跟随手指触摸坐标 (--px, --py) 实时折射 */
 .liquid-glass::before {
   content: "";
   position: absolute;
   inset: 0;
   background: radial-gradient(
-    280px circle at var(--px, -200px) var(--py, -200px),
-    rgba(255, 255, 255, 0.16),
+    260px circle at var(--px, -200px) var(--py, -200px),
+    rgba(255, 255, 255, 0.22),
     transparent 65%
   );
   opacity: var(--spot-opacity, 0);
-  transition: opacity 0.3s ease;
+  transition: opacity 0.25s ease;
   pointer-events: none;
   z-index: 0;
 }
@@ -147,67 +199,50 @@ body {
   z-index: 1;
 }
 
-/* 高阶悬浮液态玻璃（用于顶栏、悬浮 Dock 与模态窗） */
 .liquid-glass-elevated {
-  background: linear-gradient(
-    135deg,
-    rgba(255, 255, 255, 0.14) 0%,
-    rgba(255, 255, 255, 0.04) 100%
-  ), var(--glass-surface-elevated);
-  backdrop-filter: blur(36px) saturate(220%);
-  -webkit-backdrop-filter: blur(36px) saturate(220%);
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  box-shadow:
-    inset 0 1.5px 1.5px 0 rgba(255, 255, 255, 0.45),
-    inset 0 -1px 2px 0 rgba(6, 182, 212, 0.18),
-    0 20px 45px -10px rgba(0, 0, 0, 0.72);
+  background: var(--glass-bg-elevated);
+  backdrop-filter: url(#mirage-card-lens) blur(20px) saturate(210%);
+  -webkit-backdrop-filter: url(#mirage-card-lens) blur(20px) saturate(210%);
 }
 
 /* ==========================================================================
-   3. 弹簧触摸反馈与微交互 (Tactile Spring Feedback)
+   5. 核心：底部可拖拽、长按放大、带速度阻尼形变的「真·液态玻璃球」(Liquid Orb)
    ========================================================================== */
+.liquid-orb-pill {
+  background: var(--orb-bg);
+  /* 绑定球面法线透镜滤镜：直接对底部的图标与背景产生水滴凸透镜折射！ */
+  backdrop-filter: url(#mirage-orb-lens) blur(2px) saturate(220%);
+  -webkit-backdrop-filter: url(#mirage-orb-lens) blur(2px) saturate(220%);
+  box-shadow: var(--orb-rim);
+  border: 1px solid var(--glass-rim-top);
+  will-change: transform;
+}
+
+/* 按钮与表单组件 */
 .tactile-press {
   cursor: pointer;
-  transition:
-    transform 0.28s var(--bounce-easing),
-    filter 0.2s ease,
-    box-shadow 0.28s var(--spring-easing);
+  transition: transform 0.26s var(--bounce-easing), filter 0.2s ease;
 }
 
 .tactile-press:active {
-  transform: scale(0.958);
-  filter: brightness(1.12);
+  transform: scale(0.94);
 }
 
-.tactile-card {
-  transition:
-    transform 0.32s var(--spring-easing),
-    border-color 0.25s ease,
-    box-shadow 0.32s var(--spring-easing);
-}
-
-.tactile-card:active {
-  transform: scale(0.984);
-  border-color: rgba(139, 92, 246, 0.45);
-}
-
-/* 液态胶囊按钮 (Liquid Buttons & Chips) */
 .btn-liquid {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
-  padding: 9px 16px;
+  gap: 6px;
+  padding: 8.5px 15px;
   border-radius: 14px;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 12.5px;
+  font-weight: 700;
   color: #fff;
-  background: linear-gradient(135deg, rgba(139, 92, 246, 0.85), rgba(6, 182, 212, 0.75));
-  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  border: 1px solid rgba(255, 255, 255, 0.35);
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.45),
-    0 6px 20px -4px rgba(139, 92, 246, 0.5);
-  backdrop-filter: blur(12px);
+    inset 0 1px 1px rgba(255, 255, 255, 0.5),
+    0 6px 18px -4px rgba(99, 102, 241, 0.45);
 }
 
 .btn-liquid-ghost {
@@ -215,70 +250,59 @@ body {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 8px 14px;
+  padding: 8px 13px;
   border-radius: 14px;
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow: inset 0 1px 0.5px rgba(255, 255, 255, 0.22);
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: inset 0 1px 0.5px var(--glass-rim-top);
+  transition: var(--theme-transition);
 }
 
 .btn-liquid-danger {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 8px 13px;
+  gap: 5px;
+  padding: 8px 12px;
   border-radius: 14px;
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
-  color: #fda4af;
-  background: rgba(244, 63, 94, 0.16);
-  border: 1px solid rgba(244, 63, 94, 0.35);
-  box-shadow: inset 0 1px 0.5px rgba(255, 255, 255, 0.2);
+  color: #f43f5e;
+  background: rgba(244, 63, 94, 0.14);
+  border: 1px solid rgba(244, 63, 94, 0.32);
 }
 
-/* 液态输入框与下拉选择器 */
 .liquid-input, .liquid-select, .liquid-textarea {
   width: 100%;
-  background: rgba(5, 8, 17, 0.52);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.45);
+  background: var(--input-bg);
+  border: 1px solid var(--glass-border);
   color: var(--text-primary);
-  padding: 10px 13px;
-  border-radius: 14px;
-  font-size: 13px;
+  padding: 9.5px 12px;
+  border-radius: 13px;
+  font-size: 12.5px;
   outline: none;
-  transition: all 0.25s var(--spring-easing);
+  transition: var(--theme-transition);
 }
 
 .liquid-input:focus, .liquid-select:focus, .liquid-textarea:focus {
   border-color: var(--accent-secondary);
-  background: rgba(10, 16, 32, 0.72);
-  box-shadow:
-    inset 0 1px 2px rgba(0, 0, 0, 0.3),
-    0 0 0 3px rgba(6, 182, 212, 0.2);
+  box-shadow: 0 0 0 3px rgba(6, 182, 212, 0.18);
 }
 
-/* 视图切换过渡动画 */
 .view-morph-enter-active,
 .view-morph-leave-active {
-  transition:
-    opacity 0.26s var(--spring-easing),
-    transform 0.26s var(--spring-easing),
-    filter 0.26s ease;
+  transition: opacity 0.24s var(--spring-easing), transform 0.24s var(--spring-easing);
 }
 
 .view-morph-enter-from {
   opacity: 0;
-  transform: translateY(12px) scale(0.985);
-  filter: blur(6px);
+  transform: translateY(10px) scale(0.985);
 }
 
 .view-morph-leave-to {
   opacity: 0;
-  transform: translateY(-8px) scale(0.99);
-  filter: blur(4px);
+  transform: translateY(-6px) scale(0.99);
 }

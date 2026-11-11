@@ -35,10 +35,12 @@ fn read_stdin_all() -> String {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    let meta = read_module_meta();
+
     if args.len() < 2 {
         println!(
-            "蜃楼工坊 · MirageForge Rust CLI Engine v{} (code {})",
-            MIRAGE_VERSION, MIRAGE_VERSION_CODE
+            "蜃楼工坊 · MirageForge Rust CLI Engine v{} (code {}) [from module.prop]",
+            meta.version, meta.version_code
         );
         return;
     }
@@ -46,7 +48,6 @@ fn main() {
     let cmd = args[1].as_str();
     let json_mode = has_flag(&args, "--json");
 
-    // 1. Zygisk 高速直通通道
     if cmd == "zygisk-fetch" {
         if args.len() < 3 || !is_safe_token(&args[2]) {
             process::exit(1);
@@ -65,11 +66,14 @@ fn main() {
     if cmd == "init" {
         store.init_storage(true);
         if json_mode {
-            println!("{{\"ok\":true,\"version\":\"{}\"}}", MIRAGE_VERSION);
+            println!(
+                "{{\"ok\":true,\"version\":\"{}\",\"versionCode\":{}}}",
+                store.meta.version, store.meta.version_code
+            );
         } else {
             println!(
                 "[MirageForge] Rust CLI v{} initialized ({} templates ready).",
-                MIRAGE_VERSION,
+                store.meta.version,
                 store.templates.len()
             );
         }
@@ -83,14 +87,14 @@ fn main() {
             if json_mode {
                 println!(
                     "{{\"ok\":true,\"version\":\"{}\",\"versionCode\":{},\"activeApps\":{},\"templateCount\":{}}}",
-                    MIRAGE_VERSION,
-                    MIRAGE_VERSION_CODE,
+                    store.meta.version,
+                    store.meta.version_code,
                     store.routes.len(),
                     store.templates.len()
                 );
             } else {
                 println!("==========================================");
-                println!("  蜃楼工坊 · MirageForge v{} (Rust Core)", MIRAGE_VERSION);
+                println!("  蜃楼工坊 · MirageForge v{} (Rust Core)", store.meta.version);
                 println!("==========================================");
                 println!("- 已储备全息模板数: {} 套", store.templates.len());
                 println!("- 当前生效分流应用: {} 款", store.routes.len());
@@ -101,14 +105,15 @@ fn main() {
                         .map(|t| t.name.as_str())
                         .unwrap_or(&r.tpl_id);
                     println!(
-                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{}]",
+                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{} DPI:{}]",
                         r.pkg_name,
                         m_name,
                         r.build as u8,
                         r.gl as u8,
                         r.vfs as u8,
                         r.probe as u8,
-                        r.sdk_spoof as u8
+                        r.sdk_spoof as u8,
+                        r.dpi
                     );
                 }
             }
@@ -200,6 +205,7 @@ fn main() {
                     vfs: get_opt(&args, "--vfs", "1") == "1",
                     probe: get_opt(&args, "--probe", "0") == "1",
                     sdk_spoof: get_opt(&args, "--sdk", "0") == "1",
+                    dpi: get_opt(&args, "--dpi", "0").parse::<i32>().unwrap_or(0),
                 };
                 let restart = has_flag(&args, "--restart");
                 let ok = store.set_route(route, restart);

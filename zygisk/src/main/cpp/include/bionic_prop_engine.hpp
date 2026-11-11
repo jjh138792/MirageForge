@@ -2,40 +2,68 @@
 
 #include <cstring>
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/system_properties.h>
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
 
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
 namespace mirage {
 
+// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构
 struct alignas(4) BionicPropInfoCompat {
     uint32_t serial;              // 偏移 0..3
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
     char name[1];                 // 偏移 96..N
 };
 
-class LockFreePropArena {
+// 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 鎖定为 r--p 只读状态
+class ReadOnlyMmapPropArena {
 public:
+    static constexpr size_t kArenaSize = 65536; // 64KB 足够容纳 400+ 条属性
+
+    void ensure_mapped() {
+        if (arena_base_) return;
+        void *mem = mmap(nullptr, kArenaSize, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem != MAP_FAILED) {
+            arena_base_ = static_cast<uint8_t *>(mem);
+            arena_offset_ = 0;
+            // 将匿名映射页伪装为系统属性区名称，规避 /proc/self/maps 堆指针检测
+            prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, arena_base_, kArenaSize, "SystemProperties");
+        }
+    }
+
     void insert_before_freeze(const std::string &name, const std::string &val) {
-        if (by_name_.find(name) != by_name_.end()) return;
+        ensure_mapped();
+        if (!arena_base_ || by_name_.find(name) != by_name_.end()) return;
 
-        size_t alloc_sz = offsetof(BionicPropInfoCompat, name) + name.size() + 1;
-        void *raw = std::calloc(1, alloc_sz);
-        if (!raw) return;
+        size_t alloc_sz = (offsetof(BionicPropInfoCompat, name) + name.size() + 1 + 7) & ~static_cast<size_t>(7);
+        if (arena_offset_ + alloc_sz > kArenaSize) return;
 
-        auto *pi = static_cast<BionicPropInfoCompat *>(raw);
+        auto *pi = reinterpret_cast<BionicPropInfoCompat *>(arena_base_ + arena_offset_);
+        arena_offset_ += alloc_sz;
+
         __atomic_store_n(&pi->serial, 0x02000000u, __ATOMIC_RELAXED);
         std::strncpy(pi->value, val.c_str(), PROP_VALUE_MAX - 1);
         pi->value[PROP_VALUE_MAX - 1] = '\0';
         std::memcpy(pi->name, name.data(), name.size());
         pi->name[name.size()] = '\0';
 
-        uintptr_t addr = reinterpret_cast<uintptr_t>(pi);
-        if (addr < min_addr_) min_addr_ = addr;
-        if (addr > max_addr_) max_addr_ = addr;
-
         by_name_.emplace(name, pi);
         by_ptr_.emplace(pi, val);
+    }
+
+    // 锁定整块属性内存页为只读 (r--p)，与真实 /dev/__properties__ 内存页权限完全一致
+    void seal_readonly() {
+        if (arena_base_) {
+            mprotect(arena_base_, kArenaSize, PROT_READ);
+        }
     }
 
     inline const prop_info *find_lockfree(const char *name, const std::string **out_val = nullptr) const noexcept {
@@ -49,28 +77,30 @@ public:
         return reinterpret_cast<const prop_info *>(it->second);
     }
 
+    // O(1) 硬件页边界判断：只需判断指针是否落在 [arena_base_, arena_base_ + arena_offset_) 区间内！
     inline bool is_synthetic_lockfree(const prop_info *pi, const char **out_name, const std::string **out_val) const noexcept {
-        if (!pi) return false;
-        uintptr_t addr = reinterpret_cast<uintptr_t>(pi);
-        if (__builtin_expect(addr < min_addr_ || addr > max_addr_, 1)) {
+        if (!pi || !arena_base_) return false;
+        const auto *ptr = reinterpret_cast<const uint8_t *>(pi);
+        if (__builtin_expect(ptr < arena_base_ || ptr >= arena_base_ + arena_offset_, 1)) {
             return false;
         }
         auto *compat = reinterpret_cast<BionicPropInfoCompat *>(const_cast<prop_info *>(pi));
-        auto it = by_ptr_.find(compat);
-        if (it == by_ptr_.end()) return false;
         if (out_name) *out_name = compat->name;
-        if (out_val) *out_val = &it->second;
+        if (out_val) {
+            auto it = by_ptr_.find(compat);
+            if (it != by_ptr_.end()) *out_val = &it->second;
+        }
         return true;
     }
 
 private:
-    uintptr_t min_addr_ = UINTPTR_MAX;
-    uintptr_t max_addr_ = 0;
+    uint8_t *arena_base_ = nullptr;
+    size_t arena_offset_ = 0;
     std::unordered_map<std::string, BionicPropInfoCompat *> by_name_;
     std::unordered_map<BionicPropInfoCompat *, std::string> by_ptr_;
 };
 
-inline LockFreePropArena g_prop_arena;
+inline ReadOnlyMmapPropArena g_prop_arena;
 
 using T_PropCallback = void (*)(void *cookie, const char *name, const char *value, uint32_t serial);
 using T_ForeachCallback = void (*)(const prop_info *pi, void *cookie);
@@ -92,11 +122,48 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
+// 注入 app 域受限属性区与 DPI 属性，并将整个属性池锁定为 r--p 只读内存页
 inline void freeze_bionic_prop_arena() {
     if (!g_cfg.build.enabled) return;
+
+    // 1. 若启用了按应用 DPI 伪装，同步覆盖底层显示密度属性
+    if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
+        std::string dpi_s = std::to_string(g_cfg.build.app_dpi);
+        g_cfg.build.prop_map["ro.sf.lcd_density"] = dpi_s;
+        g_cfg.build.prop_map["qemu.sf.lcd_density"] = dpi_s;
+        g_cfg.build.prop_map["persist.sys.dpi"] = dpi_s;
+        g_cfg.build.prop_map["ro.vendor.display.default_dpi"] = dpi_s;
+    }
+
+    // 2. 补齐 SELinux app 域默认不可读或易暴露解锁/调试状态的受限属性区
+    auto set_default_restricted = [&](const char *k, const char *v) {
+        if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
+            g_cfg.build.prop_map[k] = v;
+        }
+    };
+    set_default_restricted("ro.boot.vbmeta.device_state", "locked");
+    set_default_restricted("ro.boot.vbmeta.avb_version", "1.2");
+    set_default_restricted("ro.boot.vbmeta.hash_alg", "sha256");
+    set_default_restricted("ro.boot.verifiedbootstate", "green");
+    set_default_restricted("ro.boot.veritymode", "enforcing");
+    set_default_restricted("ro.boot.flash.locked", "1");
+    set_default_restricted("ro.boot.warranty_bit", "0");
+    set_default_restricted("ro.warranty_bit", "0");
+    set_default_restricted("ro.build.selinux", "1");
+    set_default_restricted("ro.debuggable", "0");
+    set_default_restricted("ro.secure", "1");
+    set_default_restricted("ro.adb.secure", "1");
+    set_default_restricted("sys.oem_unlock_allowed", "0");
+    set_default_restricted("sys.usb.state", "none");
+    set_default_restricted("sys.usb.config", "none");
+    set_default_restricted("init.svc.adbd", "stopped");
+
     for (const auto &kv : g_cfg.build.prop_map) {
         g_prop_arena.insert_before_freeze(kv.first, kv.second);
     }
+
+    // 锁定为硬件级只读内存页
+    g_prop_arena.seal_readonly();
 }
 
 inline bool is_interesting_unmapped_prop(const char *name) noexcept {
@@ -168,7 +235,7 @@ inline void hook_system_property_read_callback(const prop_info *pi, T_PropCallba
     if (g_cfg.build.enabled) {
         const char *syn_name = nullptr;
         const std::string *syn_val = nullptr;
-        if (g_prop_arena.is_synthetic_lockfree(pi, &syn_name, &syn_val)) {
+        if (g_prop_arena.is_synthetic_lockfree(pi, &syn_name, &syn_val) && syn_name && syn_val) {
             if (__builtin_expect(g_cfg.probe.enabled, 0)) {
                 ScopedHookGuard guard;
                 if (guard) emit_probe("PROP_CB", syn_name, *syn_val);
@@ -190,7 +257,7 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
     if (g_cfg.build.enabled) {
         const char *syn_name = nullptr;
         const std::string *syn_val = nullptr;
-        if (g_prop_arena.is_synthetic_lockfree(pi, &syn_name, &syn_val)) {
+        if (g_prop_arena.is_synthetic_lockfree(pi, &syn_name, &syn_val) && syn_name && syn_val) {
             if (__builtin_expect(g_cfg.probe.enabled, 0)) {
                 ScopedHookGuard guard;
                 if (guard) emit_probe("PROP_READ", syn_name, *syn_val);
@@ -308,7 +375,7 @@ inline const prop_info *hook_system_property_find_nth(unsigned n) {
         auto key_extractor = [](void *c, const char *name, const char *, uint32_t) {
             if (name) *static_cast<std::string *>(c) = name;
         };
-        orig_system_property_read_callback(real_pi, key_extractor, &key);
+        orig_system_property_read_callback(pi, key_extractor, &key);
         if (!key.empty()) {
             if (const prop_info *syn = g_prop_arena.find_lockfree(key.c_str())) {
                 return syn;

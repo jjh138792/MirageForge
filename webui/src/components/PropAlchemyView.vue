@@ -2,7 +2,7 @@
 import { ref } from 'vue';
 import { FileUp, Sparkles, Eraser } from 'lucide-vue-next';
 import { useI18n } from '../i18n';
-import { showToast, triggerHaptic } from '../bridge/webui-x';
+import { showToast, triggerHaptic } from '../bridge/ksu-io';
 import { parsePropTextViaCli, type DeviceTemplate } from '../store/mirageStore';
 
 const emit = defineEmits<{
@@ -68,7 +68,7 @@ async function runAlchemy() {
       v-model="rawPropText"
       rows="8"
       class="liquid-textarea mono-area"
-      placeholder="ro.product.brand=Xiaomi&#10;ro.product.model=2410DPN6CC&#10;ro.board.platform=sun&#10;ro.soc.model=SM8750-AB&#10;ro.boot.hardware.ddr=16GB,SKhynix,LPDDR5X"
+      placeholder="ro.product.brand=Xiaomi&#10;ro.product.model=2410DPN6CC&#10;ro.product.board=sun&#10;ro.soc.model=SM8750-AB&#10;ro.build.display.id=OS2.0.102.0.VOBCNXM&#10;ro.build.version.incremental=OS2.0.102.0.VOBCNXM&#10;ro.build.version.security_patch=2025-02-01&#10;ro.sf.lcd_density=480"
     ></textarea>
 
     <div class="alchemy-actions">
@@ -115,9 +115,9 @@ async function runAlchemy() {
   height: 52px;
   border-radius: 18px;
   margin: 0 auto 10px;
-  background: rgba(139, 92, 246, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  color: #c4b5fd;
+  background: rgba(139, 92, 246, 0.2);
+  border: 1px solid var(--glass-border);
+  color: var(--accent-primary);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -126,7 +126,6 @@ async function runAlchemy() {
 .portal-title {
   font-size: 14px;
   font-weight: 700;
-  color: #fff;
 }
 
 .portal-sub {

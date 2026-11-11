@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { Search, RefreshCw, Zap, ShieldAlert } from 'lucide-vue-next';
+import { Search, RefreshCw, Zap, ShieldAlert, Smartphone } from 'lucide-vue-next';
 import { useI18n } from '../i18n';
-import { triggerHaptic } from '../bridge/webui-x';
+import { triggerHaptic } from '../bridge/ksu-io';
 import {
   mirageStore,
   reloadAppList,
@@ -14,6 +14,7 @@ import {
 const { t } = useI18n();
 const searchQuery = ref('');
 const filterMode = ref<'all' | 'configured'>('all');
+const dpiPresets = [0, 320, 400, 480, 560];
 
 const filteredApps = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
@@ -42,17 +43,30 @@ async function handleTemplateChange(pkg: string, tplId: string) {
     vfs: existing ? existing.vfs : true,
     probe: existing ? existing.probe : false,
     sdkSpoof: existing ? existing.sdkSpoof : false,
+    dpi: existing ? existing.dpi || 0 : 0,
   };
   await updateAppRouteViaCli(pkg, nextRoute, false);
 }
 
-async function toggleModuleSwitch(pkg: string, field: keyof Omit<AppRoute, 'tplId'>) {
+async function toggleModuleSwitch(pkg: string, field: 'build' | 'gl' | 'vfs' | 'probe' | 'sdkSpoof') {
   triggerHaptic('light');
   const cur = mirageStore.appRoutes[pkg];
   if (!cur) return;
   const next: AppRoute = {
     ...cur,
     [field]: !cur[field],
+  };
+  await updateAppRouteViaCli(pkg, next, false);
+}
+
+async function setAppDpi(pkg: string, dpiVal: number) {
+  triggerHaptic('light');
+  const cur = mirageStore.appRoutes[pkg];
+  if (!cur) return;
+  const cleanDpi = isNaN(dpiVal) || dpiVal < 0 ? 0 : Math.min(960, dpiVal);
+  const next: AppRoute = {
+    ...cur,
+    dpi: cleanDpi,
   };
   await updateAppRouteViaCli(pkg, next, false);
 }
@@ -66,7 +80,6 @@ async function toggleSystemApps() {
 
 <template>
   <section class="matrix-section">
-    <!-- 顶部搜索与过滤液态栏 -->
     <div class="filter-panel liquid-glass" v-touch-glass>
       <div class="search-box">
         <Search :size="16" class="search-icon" />
@@ -107,12 +120,11 @@ async function toggleSystemApps() {
       </div>
     </div>
 
-    <!-- 应用矩阵列表 -->
     <div class="app-matrix-list">
       <div
         v-for="app in filteredApps"
         :key="app.packageName"
-        class="app-card liquid-glass tactile-card"
+        class="app-card liquid-glass"
         v-touch-glass
       >
         <div class="app-row-main">
@@ -158,44 +170,74 @@ async function toggleSystemApps() {
           </div>
         </div>
 
-        <!-- 五维微模块按需独立开关 (关闭的模块在底层 0 改动、0 Hook) -->
-        <div v-if="mirageStore.appRoutes[app.packageName]" class="module-pills">
-          <span
-            class="mod-pill tactile-press"
-            :class="{ on: mirageStore.appRoutes[app.packageName].build }"
-            @click="toggleModuleSwitch(app.packageName, 'build')"
-          >
-            🧬 {{ t('apps.swBuild') }}
-          </span>
-          <span
-            class="mod-pill tactile-press"
-            :class="{ on: mirageStore.appRoutes[app.packageName].gl }"
-            @click="toggleModuleSwitch(app.packageName, 'gl')"
-          >
-            🎮 {{ t('apps.swGl') }}
-          </span>
-          <span
-            class="mod-pill tactile-press"
-            :class="{ on: mirageStore.appRoutes[app.packageName].vfs }"
-            @click="toggleModuleSwitch(app.packageName, 'vfs')"
-          >
-            🛡️ {{ t('apps.swVfs') }}
-          </span>
-          <span
-            class="mod-pill probe tactile-press"
-            :class="{ on: mirageStore.appRoutes[app.packageName].probe }"
-            @click="toggleModuleSwitch(app.packageName, 'probe')"
-          >
-            📡 {{ t('apps.swProbe') }}
-          </span>
-          <span
-            class="mod-pill sdk tactile-press"
-            :class="{ on: mirageStore.appRoutes[app.packageName].sdkSpoof }"
-            @click="toggleModuleSwitch(app.packageName, 'sdkSpoof')"
-          >
-            <ShieldAlert :size="12" />
-            <span>{{ t('apps.swSdk') }}</span>
-          </span>
+        <!-- 五维微模块开关 + 按应用独立 DPI 调节器 -->
+        <div v-if="mirageStore.appRoutes[app.packageName]" class="route-config-drawer">
+          <div class="module-pills">
+            <span
+              class="mod-pill tactile-press"
+              :class="{ on: mirageStore.appRoutes[app.packageName].build }"
+              @click="toggleModuleSwitch(app.packageName, 'build')"
+            >
+              🧬 {{ t('apps.swBuild') }}
+            </span>
+            <span
+              class="mod-pill tactile-press"
+              :class="{ on: mirageStore.appRoutes[app.packageName].gl }"
+              @click="toggleModuleSwitch(app.packageName, 'gl')"
+            >
+              🎮 {{ t('apps.swGl') }}
+            </span>
+            <span
+              class="mod-pill tactile-press"
+              :class="{ on: mirageStore.appRoutes[app.packageName].vfs }"
+              @click="toggleModuleSwitch(app.packageName, 'vfs')"
+            >
+              🛡️ {{ t('apps.swVfs') }}
+            </span>
+            <span
+              class="mod-pill probe tactile-press"
+              :class="{ on: mirageStore.appRoutes[app.packageName].probe }"
+              @click="toggleModuleSwitch(app.packageName, 'probe')"
+            >
+              📡 {{ t('apps.swProbe') }}
+            </span>
+            <span
+              class="mod-pill sdk tactile-press"
+              :class="{ on: mirageStore.appRoutes[app.packageName].sdkSpoof }"
+              @click="toggleModuleSwitch(app.packageName, 'sdkSpoof')"
+            >
+              <ShieldAlert :size="12" />
+              <span>{{ t('apps.swSdk') }}</span>
+            </span>
+          </div>
+
+          <!-- 按应用独立 DPI 伪装控制栏 -->
+          <div class="dpi-bar">
+            <div class="dpi-title">
+              <Smartphone :size="13" />
+              <span>{{ t('apps.dpiLabel') }}</span>
+            </div>
+            <div class="dpi-controls">
+              <button
+                v-for="p in dpiPresets"
+                :key="p"
+                type="button"
+                class="dpi-chip tactile-press"
+                :class="{ active: (mirageStore.appRoutes[app.packageName].dpi || 0) === p }"
+                @click="setAppDpi(app.packageName, p)"
+              >
+                {{ p === 0 ? 'Auto' : p }}
+              </button>
+              <input
+                type="number"
+                class="liquid-input dpi-num-input"
+                :value="mirageStore.appRoutes[app.packageName].dpi || 0"
+                min="0"
+                max="960"
+                @change="(e) => setAppDpi(app.packageName, parseInt((e.target as HTMLInputElement).value, 10))"
+              />
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -239,15 +281,15 @@ async function toggleSystemApps() {
   border-radius: 18px;
   font-size: 12px;
   font-weight: 600;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
   color: var(--text-secondary);
 }
 
 .filter-chip.active {
-  background: rgba(139, 92, 246, 0.26);
-  color: #fff;
-  border-color: rgba(139, 92, 246, 0.55);
+  background: rgba(139, 92, 246, 0.24);
+  color: var(--text-primary);
+  border-color: var(--accent-primary);
 }
 
 .app-matrix-list {
@@ -292,7 +334,6 @@ async function toggleSystemApps() {
 .app-label-text {
   font-size: 14px;
   font-weight: 700;
-  color: #fff;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -317,12 +358,18 @@ async function toggleSystemApps() {
   font-size: 12px;
 }
 
+.route-config-drawer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--glass-border);
+}
+
 .module-pills {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding-top: 8px;
-  border-top: 1px dashed rgba(255, 255, 255, 0.1);
 }
 
 .mod-pill {
@@ -333,26 +380,77 @@ async function toggleSystemApps() {
   font-weight: 600;
   padding: 4px 10px;
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--subcard-bg);
   color: var(--text-muted);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--glass-border);
 }
 
 .mod-pill.on {
   background: rgba(6, 182, 212, 0.16);
-  color: #67e8f9;
+  color: var(--accent-secondary);
   border-color: rgba(6, 182, 212, 0.42);
 }
 
 .mod-pill.probe.on {
-  background: rgba(244, 63, 94, 0.18);
-  color: #fda4af;
-  border-color: rgba(244, 63, 94, 0.45);
+  background: rgba(244, 63, 94, 0.16);
+  color: #f43f5e;
+  border-color: rgba(244, 63, 94, 0.42);
 }
 
 .mod-pill.sdk.on {
-  background: rgba(245, 158, 11, 0.18);
-  color: #fcd34d;
-  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.16);
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.42);
+}
+
+.dpi-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  background: var(--subcard-bg);
+  padding: 6px 10px;
+  border-radius: 11px;
+  border: 1px solid var(--glass-border);
+}
+
+.dpi-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.dpi-controls {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.dpi-chip {
+  padding: 3px 8px;
+  border-radius: 7px;
+  font-size: 10.5px;
+  font-weight: 700;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--glass-border);
+}
+
+.dpi-chip.active {
+  background: var(--accent-primary);
+  color: #fff;
+  border-color: var(--accent-primary);
+}
+
+.dpi-num-input {
+  width: 68px;
+  padding: 3px 7px;
+  font-size: 11px;
+  text-align: center;
 }
 </style>

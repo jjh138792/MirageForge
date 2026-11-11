@@ -12,7 +12,7 @@ import {
   Check,
 } from 'lucide-vue-next';
 import { useI18n } from '../i18n';
-import { execRootShell, showToast, triggerHaptic } from '../bridge/webui-x';
+import { execRootShell, showToast, triggerHaptic } from '../bridge/ksu-io';
 import {
   CLI_BIN,
   mirageStore,
@@ -44,10 +44,15 @@ const emptyTemplate = (): DeviceTemplate => ({
   PRODUCT: '',
   BOARD: 'sun',
   HARDWARE: 'qcom',
+  BOOTLOADER: 'unknown',
   SOC_MANUFACTURER: 'Qualcomm',
   SOC_MODEL: 'SM8750-AB',
   SUPPORTED_ABIS: 'arm64-v8a,armeabi-v7a,armeabi',
   BUILD_ID: 'AP3A.240905.015.A2',
+  DISPLAY_ID: 'AP3A.240905.015.A2 release-keys',
+  INCREMENTAL: 'OS2.0.102.0.VOBCNXM',
+  BUILD_HOST: 'pangu-build-component-system',
+  BUILD_USER: 'builder',
   BUILD_TIME: '1736899200000',
   RELEASE: '15',
   SDK_INT: '35',
@@ -67,6 +72,7 @@ const emptyTemplate = (): DeviceTemplate => ({
   SOC_MACHINE: 'SM8750',
   KERNEL_RELEASE: '6.6.30-android15-8-g94b8f12ab4c1',
   KERNEL_VERSION: '#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025',
+  DEFAULT_DPI: 0,
   CUSTOM_PROPS: '',
 });
 
@@ -99,11 +105,18 @@ function openEditModal(tpl: DeviceTemplate) {
   showModal.value = true;
 }
 
-function applyClusterPreset(clusters: string, maxFreq: number, socMachine: string, renderer: string, vendor: string) {
+function applyClusterPreset(
+  clusters: string,
+  maxFreq: number,
+  socMachine: string,
+  renderer: string,
+  vendor: string
+) {
   triggerHaptic('medium');
   form.value.CPU_CLUSTERS = clusters;
   form.value.CPU_MAX_FREQ = maxFreq;
   form.value.SOC_MACHINE = socMachine;
+  form.value.SOC_MODEL = socMachine;
   form.value.GL_RENDERER = renderer;
   form.value.GL_VENDOR = vendor;
 }
@@ -119,7 +132,7 @@ async function handleSave() {
 
 async function handleExportBackup() {
   triggerHaptic('medium');
-  const outPath = '/sdcard/Download/MirageForge_v1.1.0_Backup.json';
+  const outPath = `/sdcard/Download/MirageForge_v${mirageStore.version}_Backup.json`;
   await execRootShell(`"${CLI_BIN}" export "${outPath}"`);
   showToast(`已导出至 ${outPath}`);
 }
@@ -146,30 +159,33 @@ async function handleExportBackup() {
       <article
         v-for="tpl in Object.values(mirageStore.templates)"
         :key="tpl.id"
-        class="tpl-card liquid-glass tactile-card"
+        class="tpl-card liquid-glass"
         v-touch-glass
       >
         <div class="tpl-card-top">
           <div>
             <h3 class="tpl-name">{{ tpl.name }}</h3>
-            <span class="tpl-sub">{{ tpl.BRAND }} · {{ tpl.MODEL }} ({{ tpl.DEVICE }})</span>
+            <span class="tpl-sub">
+              {{ tpl.BRAND }} · {{ tpl.MODEL }} ({{ tpl.BOARD }} / {{ tpl.SOC_MODEL }})
+            </span>
           </div>
           <span class="gpu-pill">{{ tpl.GL_RENDERER }}</span>
         </div>
 
-        <!-- 硬件规格指标 -->
         <div class="spec-chips">
           <div class="spec-item">
             <Cpu :size="14" class="spec-icon" />
-            <span>{{ tpl.SOC_MACHINE || tpl.SOC_MODEL }} (#{{ tpl.SOC_ID || '618' }})</span>
+            <span>{{ tpl.SOC_MACHINE || tpl.SOC_MODEL }} · {{ tpl.SECURITY_PATCH }}</span>
           </div>
           <div class="spec-item">
             <HardDrive :size="14" class="spec-icon" />
-            <span>{{ tpl.RAM_GB }}GB {{ tpl.DDR_TYPE || 'LPDDR5X' }} ({{ tpl.DDR_VENDOR || 'SKhynix' }})</span>
+            <span>
+              {{ tpl.RAM_GB }}GB {{ tpl.DDR_TYPE || 'LPDDR5X' }}
+              <template v-if="tpl.DEFAULT_DPI > 0">· {{ tpl.DEFAULT_DPI }} DPI</template>
+            </span>
           </div>
         </div>
 
-        <!-- 可视化异构单核频率分簇条 -->
         <div class="cluster-visual-box">
           <div class="cluster-visual-title">
             <Gauge :size="13" />
@@ -208,7 +224,7 @@ async function handleExportBackup() {
       </article>
     </div>
 
-    <!-- 液态玻璃模态编辑窗 -->
+    <!-- 液态玻璃模态编辑窗 (含新增的深度 Build 字段与默认 DPI) -->
     <Transition name="view-morph">
       <div v-if="showModal" class="modal-overlay" @click.self="showModal = false">
         <div class="modal-sheet liquid-glass liquid-glass-elevated">
@@ -247,16 +263,40 @@ async function handleExportBackup() {
                 <input v-model="form.PRODUCT" class="liquid-input" placeholder="haotian" />
               </label>
               <label>
-                <span>BOARD (主板平台)</span>
+                <span>Build.BOARD (主板代号)</span>
                 <input v-model="form.BOARD" class="liquid-input" placeholder="sun" />
+              </label>
+              <label>
+                <span>Build.SOC_MODEL (SoC 型号)</span>
+                <input v-model="form.SOC_MODEL" class="liquid-input" placeholder="SM8750-AB" />
               </label>
               <label>
                 <span>SOC_MANUFACTURER</span>
                 <input v-model="form.SOC_MANUFACTURER" class="liquid-input" placeholder="Qualcomm" />
               </label>
               <label>
-                <span>SOC_MODEL</span>
-                <input v-model="form.SOC_MODEL" class="liquid-input" placeholder="SM8750-AB" />
+                <span>BUILD_ID (构建号)</span>
+                <input v-model="form.BUILD_ID" class="liquid-input" placeholder="AP3A.240905.015.A2" />
+              </label>
+              <label>
+                <span>SECURITY_PATCH (安全补丁日期)</span>
+                <input v-model="form.SECURITY_PATCH" class="liquid-input" placeholder="2025-02-01" />
+              </label>
+              <label>
+                <span>DISPLAY_ID (Build.DISPLAY 版本显示号)</span>
+                <input v-model="form.DISPLAY_ID" class="liquid-input" placeholder="OS2.0.102.0.VOBCNXM release-keys" />
+              </label>
+              <label>
+                <span>INCREMENTAL (VERSION.INCREMENTAL)</span>
+                <input v-model="form.INCREMENTAL" class="liquid-input" placeholder="OS2.0.102.0.VOBCNXM" />
+              </label>
+              <label>
+                <span>BUILD_HOST (编译主机名)</span>
+                <input v-model="form.BUILD_HOST" class="liquid-input" placeholder="pangu-build-component-system" />
+              </label>
+              <label>
+                <span>BUILD_USER (编译用户名)</span>
+                <input v-model="form.BUILD_USER" class="liquid-input" placeholder="builder" />
               </label>
               <label>
                 <span>RELEASE (Android 版本)</span>
@@ -337,11 +377,11 @@ async function handleExportBackup() {
                 <input v-model="form.DDR_VENDOR" class="liquid-input" placeholder="SKhynix / Samsung" />
               </label>
               <label>
-                <span>SOC_ID (/sys/devices/soc0)</span>
-                <input v-model="form.SOC_ID" class="liquid-input" placeholder="618" />
+                <span>DEFAULT_DPI (模板默认 DPI, 0=不改)</span>
+                <input v-model.number="form.DEFAULT_DPI" type="number" class="liquid-input" placeholder="0 或 480" />
               </label>
               <label class="span-2">
-                <span>附加跨品牌属性池 (KEY=VALUE 每行一条)</span>
+                <span>附加跨品牌与受限属性池 (KEY=VALUE 每行一条)</span>
                 <textarea v-model="form.CUSTOM_PROPS" rows="4" class="liquid-textarea"></textarea>
               </label>
             </div>
@@ -404,7 +444,6 @@ async function handleExportBackup() {
 .tpl-name {
   font-size: 15.5px;
   font-weight: 800;
-  color: #fff;
 }
 
 .tpl-sub {
@@ -418,7 +457,7 @@ async function handleExportBackup() {
   padding: 3px 9px;
   border-radius: 10px;
   background: rgba(6, 182, 212, 0.16);
-  color: #67e8f9;
+  color: var(--accent-secondary);
   border: 1px solid rgba(6, 182, 212, 0.35);
   white-space: nowrap;
 }
@@ -436,19 +475,18 @@ async function handleExportBackup() {
   font-size: 11.5px;
   padding: 7px 10px;
   border-radius: 12px;
-  background: rgba(0, 0, 0, 0.28);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  color: #e2e8f0;
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
 }
 
 .spec-icon {
-  color: #a78bfa;
+  color: var(--accent-primary);
   flex-shrink: 0;
 }
 
 .cluster-visual-box {
-  background: rgba(0, 0, 0, 0.32);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
   border-radius: 14px;
   padding: 10px 12px;
 }
@@ -459,7 +497,7 @@ async function handleExportBackup() {
   gap: 6px;
   font-size: 11px;
   font-weight: 700;
-  color: #67e8f9;
+  color: var(--accent-secondary);
   margin-bottom: 7px;
 }
 
@@ -478,34 +516,32 @@ async function handleExportBackup() {
 }
 
 .bar-label b {
-  color: #f8fafc;
+  color: var(--text-primary);
 }
 
 .bar-track {
   height: 5px;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(148, 163, 184, 0.2);
   overflow: hidden;
 }
 
 .bar-fill {
   height: 100%;
   border-radius: 4px;
-  background: linear-gradient(90deg, #8b5cf6, #06b6d4);
+  background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
 }
 
 .tpl-card-footer {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  margin-top: 2px;
 }
 
-/* 模态框样式 */
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(3, 5, 12, 0.72);
+  background: rgba(3, 5, 12, 0.65);
   backdrop-filter: blur(10px);
   display: flex;
   align-items: center;
@@ -516,7 +552,7 @@ async function handleExportBackup() {
 
 .modal-sheet {
   width: 100%;
-  max-width: 620px;
+  max-width: 640px;
   max-height: 88vh;
   display: flex;
   flex-direction: column;
@@ -529,13 +565,13 @@ async function handleExportBackup() {
   justify-content: space-between;
   align-items: center;
   padding-bottom: 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  border-bottom: 1px solid var(--glass-border);
 }
 
 .icon-close {
-  background: rgba(255, 255, 255, 0.08);
-  border: none;
-  color: #fff;
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
   width: 32px;
   height: 32px;
   border-radius: 10px;
@@ -553,7 +589,7 @@ async function handleExportBackup() {
 .sec-divider {
   font-size: 12px;
   font-weight: 800;
-  color: #67e8f9;
+  color: var(--accent-secondary);
   margin: 14px 0 8px;
 }
 
@@ -592,7 +628,8 @@ async function handleExportBackup() {
   flex-wrap: wrap;
   gap: 6px;
   font-size: 11px;
-  color: #ddd6fe;
+  color: var(--accent-primary);
+  font-weight: 700;
 }
 
 .preset-pills {
@@ -603,7 +640,7 @@ async function handleExportBackup() {
 
 .preset-pill {
   background: rgba(6, 182, 212, 0.16);
-  color: #67e8f9;
+  color: var(--accent-secondary);
   border: 1px solid rgba(6, 182, 212, 0.35);
   border-radius: 8px;
   padding: 3px 8px;
@@ -616,6 +653,6 @@ async function handleExportBackup() {
   justify-content: flex-end;
   gap: 10px;
   padding-top: 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 1px solid var(--glass-border);
 }
 </style>
