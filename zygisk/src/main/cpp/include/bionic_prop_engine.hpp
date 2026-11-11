@@ -22,7 +22,7 @@ struct alignas(4) BionicPropInfoCompat {
     char name[1];                 // 偏移 96..N
 };
 
-// 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 鎖定为 r--p 只读状态
+// 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 锁定为 r--p 只读状态
 class ReadOnlyMmapPropArena {
 public:
     static constexpr size_t kArenaSize = 65536; // 64KB 足够容纳 400+ 条属性
@@ -34,7 +34,6 @@ public:
         if (mem != MAP_FAILED) {
             arena_base_ = static_cast<uint8_t *>(mem);
             arena_offset_ = 0;
-            // 将匿名映射页伪装为系统属性区名称，规避 /proc/self/maps 堆指针检测
             prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, arena_base_, kArenaSize, "SystemProperties");
         }
     }
@@ -59,7 +58,6 @@ public:
         by_ptr_.emplace(pi, val);
     }
 
-    // 锁定整块属性内存页为只读 (r--p)，与真实 /dev/__properties__ 内存页权限完全一致
     void seal_readonly() {
         if (arena_base_) {
             mprotect(arena_base_, kArenaSize, PROT_READ);
@@ -77,7 +75,6 @@ public:
         return reinterpret_cast<const prop_info *>(it->second);
     }
 
-    // O(1) 硬件页边界判断：只需判断指针是否落在 [arena_base_, arena_base_ + arena_offset_) 区间内！
     inline bool is_synthetic_lockfree(const prop_info *pi, const char **out_name, const std::string **out_val) const noexcept {
         if (!pi || !arena_base_) return false;
         const auto *ptr = reinterpret_cast<const uint8_t *>(pi);
@@ -122,11 +119,9 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
-// 注入 app 域受限属性区与 DPI 属性，并将整个属性池锁定为 r--p 只读内存页
 inline void freeze_bionic_prop_arena() {
     if (!g_cfg.build.enabled) return;
 
-    // 1. 若启用了按应用 DPI 伪装，同步覆盖底层显示密度属性
     if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
         std::string dpi_s = std::to_string(g_cfg.build.app_dpi);
         g_cfg.build.prop_map["ro.sf.lcd_density"] = dpi_s;
@@ -135,7 +130,6 @@ inline void freeze_bionic_prop_arena() {
         g_cfg.build.prop_map["ro.vendor.display.default_dpi"] = dpi_s;
     }
 
-    // 2. 补齐 SELinux app 域默认不可读或易暴露解锁/调试状态的受限属性区
     auto set_default_restricted = [&](const char *k, const char *v) {
         if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
             g_cfg.build.prop_map[k] = v;
@@ -162,7 +156,6 @@ inline void freeze_bionic_prop_arena() {
         g_prop_arena.insert_before_freeze(kv.first, kv.second);
     }
 
-    // 锁定为硬件级只读内存页
     g_prop_arena.seal_readonly();
 }
 
@@ -375,7 +368,7 @@ inline const prop_info *hook_system_property_find_nth(unsigned n) {
         auto key_extractor = [](void *c, const char *name, const char *, uint32_t) {
             if (name) *static_cast<std::string *>(c) = name;
         };
-        orig_system_property_read_callback(pi, key_extractor, &key);
+        orig_system_property_read_callback(real_pi, key_extractor, &key);
         if (!key.empty()) {
             if (const prop_info *syn = g_prop_arena.find_lockfree(key.c_str())) {
                 return syn;
