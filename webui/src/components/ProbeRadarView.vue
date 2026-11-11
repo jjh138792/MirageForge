@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue';
 import { RefreshCw, Trash2, PlusCircle, AlertTriangle, Activity } from 'lucide-vue-next';
 import { useI18n } from '../i18n';
-import { execRootShell, showToast, triggerHaptic } from '../bridge/webui-x';
+import { execRootShell, showToast, triggerHaptic } from '../bridge/ksu-io';
 import {
   CLI_BIN,
   mirageStore,
@@ -13,8 +13,6 @@ import {
 const { t } = useI18n();
 const filterQuery = ref('');
 const unmappedOnly = ref(false);
-
-// 液态玻璃属性捕获弹窗状态
 const captureTarget = ref<{ pkg: string; key: string; val: string } | null>(null);
 
 async function handleRefresh() {
@@ -119,7 +117,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 3. SCM_RIGHTS 硬件嗅探与调用栈回溯雷达 -->
+    <!-- 3. 硬件嗅探与调用栈回溯雷达 -->
     <div class="probe-card liquid-glass" v-touch-glass>
       <div class="card-head">
         <div>
@@ -183,7 +181,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 液态玻璃属性捕获迷你弹窗 -->
+    <!-- 液态玻璃属性捕获弹窗 -->
     <Transition name="view-morph">
       <div v-if="captureTarget" class="modal-overlay" @click.self="captureTarget = null">
         <div class="capture-dialog liquid-glass liquid-glass-elevated">
@@ -213,7 +211,7 @@ onMounted(() => {
 }
 
 .crash-border {
-  border-color: rgba(244, 63, 94, 0.32);
+  border-color: rgba(244, 63, 94, 0.35);
 }
 
 .card-head {
@@ -235,7 +233,7 @@ onMounted(() => {
 }
 
 .text-danger { color: #f43f5e; }
-.text-cyan { color: #06b6d4; }
+.text-cyan { color: var(--accent-secondary); }
 
 .radar-desc {
   font-size: 11.5px;
@@ -262,7 +260,7 @@ onMounted(() => {
 
 .active-unmapped {
   background: rgba(245, 158, 11, 0.22);
-  color: #fcd34d;
+  color: #f59e0b;
   border-color: rgba(245, 158, 11, 0.5);
 }
 
@@ -279,8 +277,8 @@ onMounted(() => {
 }
 
 .event-item {
-  background: rgba(0, 0, 0, 0.38);
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
   border-radius: 12px;
   padding: 9px 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -306,62 +304,63 @@ onMounted(() => {
   border-radius: 6px;
   font-size: 10px;
   font-weight: 800;
-  background: rgba(139, 92, 246, 0.25);
-  color: #ddd6fe;
+  background: rgba(139, 92, 246, 0.22);
+  color: var(--accent-primary);
 }
 
 .badge-tag.unmapped {
-  background: rgba(245, 158, 11, 0.22);
-  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.2);
+  color: #f59e0b;
   border: 1px solid rgba(245, 158, 11, 0.45);
 }
 
 .badge-tag.crash {
-  background: rgba(244, 63, 94, 0.25);
-  color: #fda4af;
+  background: rgba(244, 63, 94, 0.22);
+  color: #f43f5e;
 }
 
 .badge-tag.tele {
-  background: rgba(16, 185, 129, 0.22);
-  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.2);
+  color: #10b981;
 }
 
 .pkg-highlight {
-  color: #67e8f9;
+  color: var(--accent-secondary);
   margin-left: 6px;
 }
 
 .key-text {
-  color: #f8fafc;
+  color: var(--text-primary);
   margin-left: 8px;
+  font-weight: 600;
 }
 
 .val-text {
-  color: #94a3b8;
+  color: var(--text-secondary);
   margin-left: 6px;
 }
 
 .pid-tag {
-  color: #94a3b8;
+  color: var(--text-muted);
   margin-left: 5px;
 }
 
 .tele-summary {
-  color: #6ee7b7;
+  color: #10b981;
   margin-left: 8px;
 }
 
 .time-stamp {
   font-size: 10px;
-  color: #64748b;
+  color: var(--text-muted);
   white-space: nowrap;
 }
 
 .stack-box {
   font-size: 10.5px;
-  color: #a5f3fc;
-  background: rgba(6, 182, 212, 0.08);
-  border-left: 2.5px solid #06b6d4;
+  color: var(--accent-secondary);
+  background: rgba(6, 182, 212, 0.09);
+  border-left: 2.5px solid var(--accent-secondary);
   padding: 5px 9px;
   border-radius: 0 8px 8px 0;
   word-break: break-all;
@@ -369,8 +368,8 @@ onMounted(() => {
 }
 
 .crash-stack {
-  color: #fecdd3;
-  background: rgba(244, 63, 94, 0.12);
+  color: #f43f5e;
+  background: rgba(244, 63, 94, 0.1);
   border-left-color: #f43f5e;
 }
 
@@ -379,7 +378,7 @@ onMounted(() => {
   align-items: center;
   gap: 4px;
   background: rgba(245, 158, 11, 0.18);
-  color: #fcd34d;
+  color: #f59e0b;
   border: 1px solid rgba(245, 158, 11, 0.4);
   padding: 4px 9px;
   border-radius: 8px;
@@ -398,7 +397,7 @@ onMounted(() => {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(3, 5, 12, 0.72);
+  background: rgba(3, 5, 12, 0.65);
   backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
