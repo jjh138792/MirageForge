@@ -96,7 +96,6 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 加载微模块配置后，立即擦除临时接收数组 raw_kvs
         load_modular_config(raw_kvs);
         for (auto &kv : raw_kvs) {
             volatile_scrub_string(kv.first);
@@ -118,14 +117,6 @@ public:
         }
 
         init_linker_symbols();
-        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
-            init_bionic_prop_symbols();
-        }
-        if (g_cfg.build.enabled) {
-            freeze_bionic_prop_arena();
-            reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
-        }
         if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
             init_vfs_symbols();
         }
@@ -134,6 +125,14 @@ public:
         }
         if (g_cfg.gl.enabled) {
             init_graphics_symbols();
+        }
+        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
+            init_bionic_prop_symbols();
+        }
+        if (g_cfg.build.enabled) {
+            freeze_bionic_prop_arena();
+            reflect_java_build_fields(env);
+            apply_app_dpi_virtualization(env);
         }
         if (g_cfg.probe.enabled) {
             install_crash_signal_logger(pkg_name);
@@ -147,8 +146,7 @@ public:
         if (!g_cfg.active) return;
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
-            // 阅后即焚：反射完成后立即抹除堆内存中的 build_map 与 version_map
+            start_app_dpi_enforcer(env);
             g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
@@ -180,7 +178,6 @@ private:
             if (k.rfind("META:", 0) == 0) continue;
 
             if (k.rfind("GLES:", 0) == 0) {
-                if (!g_cfg.gl.enabled) continue;
                 if (k == "GLES:VENDOR") {
                     g_cfg.gl.gl_vendor = v;
                     g_cfg.gl.vulkan_vendor_id = (v.find("ARM") != std::string::npos || v.find("Mali") != std::string::npos) ? 0x13B5 : 0x5143;
@@ -193,7 +190,6 @@ private:
             }
 
             if (k.rfind("VFS:", 0) == 0) {
-                if (!g_cfg.vfs.enabled) continue;
                 if (k == "VFS:CPU_HARDWARE")        g_cfg.vfs.cpu_hardware = v;
                 else if (k == "VFS:CPU_ARCH")       g_cfg.vfs.cpu_arch = v;
                 else if (k == "VFS:CPU_CORES")      g_cfg.vfs.cpu_cores = std::atoi(v.c_str());
@@ -238,9 +234,6 @@ private:
     }
 };
 
-// ============================================================================
-// Root Companion 守护进程：动态读取 module.prop 版本 + 内存缓存 + 异步日志落盘
-// ============================================================================
 static std::mutex g_file_write_mtx;
 
 static void append_line_as_root(const char *path, const std::string &line) {
