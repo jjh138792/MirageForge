@@ -15,6 +15,7 @@ struct CloakedFdEntry {
     std::string fake_target_path;
     size_t content_size;
     int dynamic_core_id;
+    uint64_t memfd_ino; // 记录虚拟 memfd 的真实内核 inode，防止 fd 关闭复用后误伤真实文件
 };
 
 template <typename StatT>
@@ -37,7 +38,6 @@ class FdCloakTracker {
 public:
     static constexpr int kFastBitmapSize = 4096;
 
-    // O(1) 无锁快速预检：如果当前没有任何虚拟 fd，或该 fd 不在位图中，直接返回 false
     inline bool is_tracked_fast(int fd) const noexcept {
         if (__builtin_expect(active_count_.load(std::memory_order_relaxed) == 0, 1)) {
             return false;
@@ -46,14 +46,15 @@ public:
         if (__builtin_expect(fd < kFastBitmapSize, 1)) {
             return fast_bitmap_[fd].load(std::memory_order_relaxed);
         }
-        return true; // 超大 fd 走慢速路径确认
+        return true;
     }
 
-    void register_fd(int fd, const std::string &original_path, size_t content_size, int dyn_core_id = -1) {
+    void register_fd(int fd, const std::string &original_path, size_t content_size,
+                     int dyn_core_id = -1, uint64_t real_memfd_ino = 0) {
         if (fd < 0) return;
         lock();
         bool is_new = (table_.find(fd) == table_.end());
-        table_[fd] = CloakedFdEntry{original_path, content_size, dyn_core_id};
+        table_[fd] = CloakedFdEntry{original_path, content_size, dyn_core_id, real_memfd_ino};
         if (fd < kFastBitmapSize) {
             fast_bitmap_[fd].store(true, std::memory_order_release);
         }
@@ -77,11 +78,25 @@ public:
         unlock();
     }
 
-    bool get_dynamic_core_id(int fd, int *out_core_id) noexcept {
+    bool get_dynamic_core_id(int fd, int *out_core_id, uint64_t cur_real_ino = 0) noexcept {
         if (__builtin_expect(!is_tracked_fast(fd), 1)) return false;
         lock();
         auto it = table_.find(fd);
-        bool ok = (it != table_.end() && it->second.dynamic_core_id >= 0);
+        if (it == table_.end()) {
+            unlock();
+            return false;
+        }
+        // 若传入了当前内核 inode 且与注册时不符，说明该 fd 已被复用，立即自愈剔除
+        if (cur_real_ino != 0 && it->second.memfd_ino != 0 && cur_real_ino != it->second.memfd_ino) {
+            table_.erase(it);
+            if (fd < kFastBitmapSize) {
+                fast_bitmap_[fd].store(false, std::memory_order_release);
+            }
+            active_count_.fetch_sub(1, std::memory_order_release);
+            unlock();
+            return false;
+        }
+        bool ok = (it->second.dynamic_core_id >= 0);
         if (ok && out_core_id) *out_core_id = it->second.dynamic_core_id;
         unlock();
         return ok;
@@ -109,22 +124,33 @@ public:
     }
 
     template <typename StatT>
-    bool get_cloaked_stat(int fd, StatT *buf) {
+    bool get_cloaked_stat(int fd, StatT *buf, uint64_t cur_real_ino = 0) {
         if (__builtin_expect(!is_tracked_fast(fd), 1) || !buf) return false;
         std::string fake_path;
         size_t sz = 0;
         lock();
         auto it = table_.find(fd);
-        bool ok = (it != table_.end());
-        if (ok) {
-            fake_path = it->second.fake_target_path;
-            sz = it->second.content_size;
+        if (it == table_.end()) {
+            unlock();
+            return false;
         }
+        // 核心自愈校验：一旦发现当前 fd 的真实 inode 与 memfd 创建时的 inode 不同，
+        // 说明该 fd 已被关闭并被系统复用给字体/资源文件，立即剔除脏记录并放行！
+        if (cur_real_ino != 0 && it->second.memfd_ino != 0 && cur_real_ino != it->second.memfd_ino) {
+            table_.erase(it);
+            if (fd < kFastBitmapSize) {
+                fast_bitmap_[fd].store(false, std::memory_order_release);
+            }
+            active_count_.fetch_sub(1, std::memory_order_release);
+            unlock();
+            return false;
+        }
+        fake_path = it->second.fake_target_path;
+        sz = it->second.content_size;
         unlock();
-        if (ok) {
-            populate_virtual_stat(buf, fake_path, sz);
-        }
-        return ok;
+
+        populate_virtual_stat(buf, fake_path, sz);
+        return true;
     }
 
 private:
