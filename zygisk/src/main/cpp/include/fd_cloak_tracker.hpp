@@ -1,121 +1,144 @@
 #pragma once
 
-#include <cstdint>
-#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <atomic>
 #include <unistd.h>
+#include <sys/stat.h>
+#include "mirage_config.hpp"
 
 namespace mirage {
 
-// O(1) 无锁位图 memfd 隐身追踪器：追踪虚拟文件描述符并还原 /proc/self/fd/<N> 真实路径
+struct CloakedFdEntry {
+    std::string fake_target_path;
+    size_t content_size;
+    int dynamic_core_id;
+};
+
+template <typename StatT>
+inline void populate_virtual_stat(StatT *buf, const std::string &fake_path, size_t content_size) {
+    if (!buf) return;
+    std::memset(buf, 0, sizeof(StatT));
+    buf->st_dev = 0xFE00;
+    buf->st_ino = static_cast<decltype(buf->st_ino)>(hash_str(fake_path) & 0x7FFFFFFFull);
+    buf->st_mode = S_IFREG | S_IRUSR | S_IRGRP | S_IROTH; // 0100444
+    buf->st_nlink = 1;
+    buf->st_uid = 0;
+    buf->st_gid = 0;
+    buf->st_size = (fake_path.rfind("/proc/", 0) == 0)
+                       ? 0
+                       : static_cast<decltype(buf->st_size)>(content_size);
+    buf->st_blksize = 4096;
+}
+
 class FdCloakTracker {
 public:
-    static constexpr int kMaxTrackedFds = 1024;
-    static constexpr int kBitmapWords = kMaxTrackedFds / 64;
+    static constexpr int kFastBitmapSize = 4096;
 
-    FdCloakTracker() noexcept {
-        for (int i = 0; i < kBitmapWords; ++i) {
-            bitmap_[i].store(0ULL, std::memory_order_relaxed);
+    // O(1) 无锁快速预检：如果当前没有任何虚拟 fd，或该 fd 不在位图中，直接返回 false
+    inline bool is_tracked_fast(int fd) const noexcept {
+        if (__builtin_expect(active_count_.load(std::memory_order_relaxed) == 0, 1)) {
+            return false;
         }
-    }
-
-    inline void track(int fd, const char *real_path) noexcept {
-        if (fd < 0 || fd >= kMaxTrackedFds || !real_path) return;
-
-        while (spinlock_.test_and_set(std::memory_order_acquire)) {}
-        std::strncpy(real_paths_[fd], real_path, sizeof(real_paths_[fd]) - 1);
-        real_paths_[fd][sizeof(real_paths_[fd]) - 1] = '\0';
-        spinlock_.clear(std::memory_order_release);
-
-        int word = fd >> 6;
-        uint64_t bit = 1ULL << (fd & 63);
-        bitmap_[word].fetch_or(bit, std::memory_order_release);
-    }
-
-    inline void register_fd(int fd, const std::string &real_path) noexcept {
-        track(fd, real_path.c_str());
-    }
-
-    inline void untrack(int fd) noexcept {
-        if (fd < 0 || fd >= kMaxTrackedFds) return;
-        int word = fd >> 6;
-        uint64_t bit = 1ULL << (fd & 63);
-        if ((bitmap_[word].load(std::memory_order_relaxed) & bit) == 0) {
-            return;
+        if (fd < 0) return false;
+        if (__builtin_expect(fd < kFastBitmapSize, 1)) {
+            return fast_bitmap_[fd].load(std::memory_order_relaxed);
         }
-        bitmap_[word].fetch_and(~bit, std::memory_order_release);
-
-        while (spinlock_.test_and_set(std::memory_order_acquire)) {}
-        real_paths_[fd][0] = '\0';
-        spinlock_.clear(std::memory_order_release);
+        return true; // 超大 fd 走慢速路径确认
     }
 
-    inline void unregister_fd(int fd) noexcept {
-        untrack(fd);
-    }
-
-    inline bool is_cloaked(int fd) const noexcept {
-        if (fd < 0 || fd >= kMaxTrackedFds) return false;
-        int word = fd >> 6;
-        uint64_t bit = 1ULL << (fd & 63);
-        return (bitmap_[word].load(std::memory_order_acquire) & bit) != 0;
-    }
-
-    inline bool is_tracked(int fd) const noexcept {
-        return is_cloaked(fd);
-    }
-
-    // 指针版重载
-    inline bool resolve_proc_fd_link(const char *pathname, std::string *out_real_path) const {
-        if (!pathname || !out_real_path) return false;
-        int fd = parse_proc_fd_path(pathname);
-        if (!is_cloaked(fd)) return false;
-
-        while (spinlock_.test_and_set(std::memory_order_acquire)) {}
-        const char *saved = real_paths_[fd];
-        bool ok = (saved[0] != '\0');
-        if (ok) {
-            *out_real_path = saved;
+    void register_fd(int fd, const std::string &original_path, size_t content_size, int dyn_core_id = -1) {
+        if (fd < 0) return;
+        lock();
+        bool is_new = (table_.find(fd) == table_.end());
+        table_[fd] = CloakedFdEntry{original_path, content_size, dyn_core_id};
+        if (fd < kFastBitmapSize) {
+            fast_bitmap_[fd].store(true, std::memory_order_release);
         }
-        spinlock_.clear(std::memory_order_release);
+        if (is_new) {
+            active_count_.fetch_add(1, std::memory_order_release);
+        }
+        unlock();
+    }
+
+    void unregister_fd(int fd) noexcept {
+        if (__builtin_expect(!is_tracked_fast(fd), 1)) return;
+        lock();
+        auto it = table_.find(fd);
+        if (it != table_.end()) {
+            table_.erase(it);
+            if (fd < kFastBitmapSize) {
+                fast_bitmap_[fd].store(false, std::memory_order_release);
+            }
+            active_count_.fetch_sub(1, std::memory_order_release);
+        }
+        unlock();
+    }
+
+    bool get_dynamic_core_id(int fd, int *out_core_id) noexcept {
+        if (__builtin_expect(!is_tracked_fast(fd), 1)) return false;
+        lock();
+        auto it = table_.find(fd);
+        bool ok = (it != table_.end() && it->second.dynamic_core_id >= 0);
+        if (ok && out_core_id) *out_core_id = it->second.dynamic_core_id;
+        unlock();
         return ok;
     }
 
-    // 引用版重载 (适配 vfs_sysinfo_engine.hpp 直接传入 std::string&)
-    inline bool resolve_proc_fd_link(const char *pathname, std::string &out_real_path) const {
-        return resolve_proc_fd_link(pathname, &out_real_path);
+    bool resolve_proc_fd_link(const char *pathname, std::string *out_real_path) {
+        if (__builtin_expect(active_count_.load(std::memory_order_relaxed) == 0, 1)) return false;
+        if (!pathname) return false;
+        const char *fd_seg = std::strstr(pathname, "/fd/");
+        if (!fd_seg || std::strncmp(pathname, "/proc/", 6) != 0) return false;
+
+        char *endptr = nullptr;
+        long fd_num = std::strtol(fd_seg + 4, &endptr, 10);
+        if (endptr == fd_seg + 4 || *endptr != '\0' || fd_num < 0) return false;
+
+        int fd = static_cast<int>(fd_num);
+        if (!is_tracked_fast(fd)) return false;
+
+        lock();
+        auto it = table_.find(fd);
+        bool ok = (it != table_.end());
+        if (ok && out_real_path) *out_real_path = it->second.fake_target_path;
+        unlock();
+        return ok;
+    }
+
+    template <typename StatT>
+    bool get_cloaked_stat(int fd, StatT *buf) {
+        if (__builtin_expect(!is_tracked_fast(fd), 1) || !buf) return false;
+        std::string fake_path;
+        size_t sz = 0;
+        lock();
+        auto it = table_.find(fd);
+        bool ok = (it != table_.end());
+        if (ok) {
+            fake_path = it->second.fake_target_path;
+            sz = it->second.content_size;
+        }
+        unlock();
+        if (ok) {
+            populate_virtual_stat(buf, fake_path, sz);
+        }
+        return ok;
     }
 
 private:
-    static inline int parse_proc_fd_path(const char *path) noexcept {
-        const char *p = nullptr;
-        if (std::strncmp(path, "/proc/self/fd/", 14) == 0) {
-            p = path + 14;
-        } else if (std::strncmp(path, "/proc/thread-self/fd/", 21) == 0) {
-            p = path + 21;
-        } else if (std::strncmp(path, "/proc/", 6) == 0) {
-            const char *q = path + 6;
-            while (*q >= '0' && *q <= '9') ++q;
-            if (std::strncmp(q, "/fd/", 4) == 0) {
-                p = q + 4;
-            }
-        }
-        if (!p || *p < '0' || *p > '9') return -1;
-
-        int fd = 0;
-        while (*p >= '0' && *p <= '9') {
-            fd = fd * 10 + (*p - '0');
-            if (fd >= kMaxTrackedFds) return -1;
-            ++p;
-        }
-        return (*p == '\0') ? fd : -1;
+    inline void lock() noexcept {
+        while (spin_.test_and_set(std::memory_order_acquire)) {}
+    }
+    inline void unlock() noexcept {
+        spin_.clear(std::memory_order_release);
     }
 
-    std::atomic<uint64_t> bitmap_[kBitmapWords]{};
-    mutable std::atomic_flag spinlock_ = ATOMIC_FLAG_INIT;
-    char real_paths_[kMaxTrackedFds][128]{};
+    std::atomic_flag spin_ = ATOMIC_FLAG_INIT;
+    std::atomic<uint32_t> active_count_{0};
+    std::atomic<bool> fast_bitmap_[kFastBitmapSize]{};
+    std::unordered_map<int, CloakedFdEntry> table_;
 };
 
 inline FdCloakTracker g_fd_cloak;
