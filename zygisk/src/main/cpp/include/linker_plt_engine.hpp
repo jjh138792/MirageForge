@@ -183,7 +183,7 @@ inline void register_hooks_for_inode(dev_t dev, ino_t ino) {
 
     if (g_cfg.vfs.enabled) {
         reg("uname",   reinterpret_cast<void *>(hook_uname));
-        reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo);
+        reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo));
         reg("sysconf", reinterpret_cast<void *>(hook_sysconf));
     }
 
