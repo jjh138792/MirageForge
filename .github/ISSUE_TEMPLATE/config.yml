@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 先看一眼 README 说明文档
+    url: https://github.com/jjh138792/MirageForge#readme
+    about: 确认你已经开启了对应的微模块开关，并重启了目标应用。

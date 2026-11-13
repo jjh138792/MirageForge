@@ -1,0 +1,33 @@
+name: "✨ 新功能与改进建议 (Feature Request)"
+description: "发现了新的硬件检测点？或者对 WebUI / CLI 有更好的改进想法？"
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: target_component
+    attributes:
+      label: "涉及的模块组件 (Target Component)"
+      options:
+        - "🧬 Zygisk C++ 底层虚拟化引擎 (新增伪装节点 / 属性 / 渲染接口)"
+        - "🦀 Rust CLI 命令行工具 (mirageforge_cli)"
+        - "🔮 WebUI 前端界面与交互"
+        - "📦 构建工作流与脚本"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem_statement
+    attributes:
+      label: "这个功能是为了解决什么问题？ (Why is this needed?)"
+      description: "比如：某款新出的应用/检测工具通过读取 `/sys/xxx` 识别出了真实硬件，或者某个操作用起来太繁琐"
+      placeholder: "请描述具体的应用场景或检测手段..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: "你期望的实现方式 (Proposed Solution)"
+      placeholder: "说说你的想法，如果能顺手甩个 PR 救济一下作者就更好了..."
+    validations:
+      required: true
