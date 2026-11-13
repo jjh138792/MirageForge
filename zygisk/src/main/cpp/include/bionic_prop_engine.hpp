@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstring>
-#include <algorithm>
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -16,22 +15,17 @@
 
 namespace mirage {
 
-// 计算符合 AOSP Bionic 规范的 prop_info->serial：
-// 高 8 位 (bits 24..31) 必须为 strlen(value)，最低位 (bit 0) 必须为 0 (非 dirty)
-inline uint32_t make_bionic_serial(const std::string &val) noexcept {
-    uint32_t len = static_cast<uint32_t>(std::min<size_t>(val.size(), PROP_VALUE_MAX - 1));
-    return (len << 24);
-}
-
+// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构
 struct alignas(4) BionicPropInfoCompat {
-    uint32_t serial;              // 偏移 0..3 (高 8 位为字符串真实长度)
+    uint32_t serial;              // 偏移 0..3
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
     char name[1];                 // 偏移 96..N
 };
 
+// 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 锁定为 r--p 只读状态
 class ReadOnlyMmapPropArena {
 public:
-    static constexpr size_t kArenaSize = 98304; // 96KB 只读属性池
+    static constexpr size_t kArenaSize = 65536; // 64KB 足够容纳 400+ 条属性
 
     void ensure_mapped() {
         if (arena_base_) return;
@@ -54,11 +48,9 @@ public:
         auto *pi = reinterpret_cast<BionicPropInfoCompat *>(arena_base_ + arena_offset_);
         arena_offset_ += alloc_sz;
 
+        __atomic_store_n(&pi->serial, 0x02000000u, __ATOMIC_RELAXED);
         std::strncpy(pi->value, val.c_str(), PROP_VALUE_MAX - 1);
         pi->value[PROP_VALUE_MAX - 1] = '\0';
-        uint32_t real_serial = make_bionic_serial(val);
-        __atomic_store_n(&pi->serial, real_serial, __ATOMIC_RELAXED);
-
         std::memcpy(pi->name, name.data(), name.size());
         pi->name[name.size()] = '\0';
 
@@ -130,13 +122,6 @@ inline void init_bionic_prop_symbols() {
 inline void freeze_bionic_prop_arena() {
     if (!g_cfg.build.enabled) return;
 
-    auto set_fallback = [&](const char *k, const std::string &v) {
-        if (!v.empty() && g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
-            g_cfg.build.prop_map[k] = v;
-        }
-    };
-
-    // 1. 按应用独立 DPI 属性覆盖
     if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
         std::string dpi_s = std::to_string(g_cfg.build.app_dpi);
         g_cfg.build.prop_map["ro.sf.lcd_density"] = dpi_s;
@@ -145,81 +130,27 @@ inline void freeze_bionic_prop_arena() {
         g_cfg.build.prop_map["ro.vendor.display.default_dpi"] = dpi_s;
     }
 
-    // 2. 彻底封堵 DevCheck / AIDA64 探测真机 CPU/SoC 型号的各厂商底层私有属性
-    std::string soc_model = g_cfg.build.build_map.count("SOC_MODEL")
-                                ? g_cfg.build.build_map["SOC_MODEL"]
-                                : (g_cfg.build.prop_map.count("ro.soc.model") ? g_cfg.build.prop_map["ro.soc.model"] : g_cfg.vfs.soc_machine);
-    std::string board_name = g_cfg.build.build_map.count("BOARD")
-                                 ? g_cfg.build.build_map["BOARD"]
-                                 : (g_cfg.build.prop_map.count("ro.product.board") ? g_cfg.build.prop_map["ro.product.board"] : "sun");
-    std::string soc_man = g_cfg.build.build_map.count("SOC_MANUFACTURER")
-                              ? g_cfg.build.build_map["SOC_MANUFACTURER"]
-                              : "Qualcomm";
-
-    if (!soc_model.empty()) {
-        g_cfg.build.prop_map["ro.soc.model"] = soc_model;
-        g_cfg.build.prop_map["ro.vendor.soc.model"] = soc_model;
-        g_cfg.build.prop_map["ro.vendor.soc.model.part_name"] = soc_model;
-        g_cfg.build.prop_map["ro.vendor.soc.model.external_name"] = soc_model;
-        g_cfg.build.prop_map["ro.unicpu.model"] = soc_model;
-        g_cfg.build.prop_map["ro.mediatek.platform"] = soc_model;
-        g_cfg.build.prop_map["ro.chipname"] = soc_model;
-        g_cfg.build.prop_map["ro.hardware.chipname"] = soc_model;
-        g_cfg.build.prop_map["ro.boot.hardware.platform"] = board_name;
-        g_cfg.build.prop_map["ro.vendor.qti.soc_name"] = board_name;
-        g_cfg.build.prop_map["ro.vendor.qti.soc_model"] = soc_model;
-    }
-    set_fallback("ro.soc.manufacturer", soc_man);
-    set_fallback("ro.vendor.soc.manufacturer", soc_man);
-
-    // 3. 封堵真机 GPU / Vulkan 驱动属性泄露 (如 sys.gmali.version, persist.sys.cloud.gpu.vk_devicename)
-    std::string gpu_renderer = !g_cfg.gl.gl_renderer.empty() ? g_cfg.gl.gl_renderer : "Adreno (TM) 830";
-    bool is_adreno = (gpu_renderer.find("Adreno") != std::string::npos);
-    g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_devicename"] = gpu_renderer;
-    g_cfg.build.prop_map["sys.gmali.version"] = gpu_renderer;
-    set_fallback("ro.hardware.egl", is_adreno ? "adreno" : "mali");
-    set_fallback("ro.hardware.vulkan", is_adreno ? "adreno" : "mali");
-    set_fallback("ro.opengles.version", "196610");
-
-    // 4. 物理内存规格 (xGB LPDDR5X) 全套底层 Bootloader & Vendor 属性池强制对齐
-    int ram_gb = g_cfg.vfs.ram_gb > 0 ? g_cfg.vfs.ram_gb : 16;
-    std::string ddr_type = !g_cfg.vfs.ddr_type.empty() ? g_cfg.vfs.ddr_type : "LPDDR5X";
-    std::string ddr_vendor = !g_cfg.vfs.ddr_vendor.empty() ? g_cfg.vfs.ddr_vendor : "SKhynix";
-    std::string ram_str = std::to_string(ram_gb) + "GB";
-    std::string ram_mb_str = std::to_string(ram_gb * 1024);
-    std::string ddr_full = ram_str + "," + ddr_vendor + "," + ddr_type;
-
-    g_cfg.build.prop_map["ro.boot.hardware.ddr"] = ddr_full;
-    g_cfg.build.prop_map["ro.boot.ddr_size"] = ram_str;
-    g_cfg.build.prop_map["ro.boot.ddr_type"] = ddr_type;
-    g_cfg.build.prop_map["ro.boot.ddr_info"] = ddr_full;
-    g_cfg.build.prop_map["ro.boot.ramsize"] = ram_str;
-    g_cfg.build.prop_map["ro.boot.memsize"] = ram_str;
-    g_cfg.build.prop_map["ro.hardware.ddr"] = ddr_full;
-    g_cfg.build.prop_map["ro.vendor.hw.ram"] = ram_str;
-    g_cfg.build.prop_map["ro.product.ram"] = ram_str;
-    g_cfg.build.prop_map["ro.system.build.ram"] = ram_str;
-    g_cfg.build.prop_map["ro.config.ram_size"] = ram_mb_str;
-    g_cfg.build.prop_map["ro.sys.ram_size"] = ram_str;
-    g_cfg.build.prop_map["persist.sys.ram_size"] = ram_str;
-
-    // 5. SELinux 受限安全属性区
-    set_fallback("ro.boot.vbmeta.device_state", "locked");
-    set_fallback("ro.boot.vbmeta.avb_version", "1.2");
-    set_fallback("ro.boot.vbmeta.hash_alg", "sha256");
-    set_fallback("ro.boot.verifiedbootstate", "green");
-    set_fallback("ro.boot.veritymode", "enforcing");
-    set_fallback("ro.boot.flash.locked", "1");
-    set_fallback("ro.boot.warranty_bit", "0");
-    set_fallback("ro.warranty_bit", "0");
-    set_fallback("ro.build.selinux", "1");
-    set_fallback("ro.debuggable", "0");
-    set_fallback("ro.secure", "1");
-    set_fallback("ro.adb.secure", "1");
-    set_fallback("sys.oem_unlock_allowed", "0");
-    set_fallback("sys.usb.state", "none");
-    set_fallback("sys.usb.config", "none");
-    set_fallback("init.svc.adbd", "stopped");
+    auto set_default_restricted = [&](const char *k, const char *v) {
+        if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
+            g_cfg.build.prop_map[k] = v;
+        }
+    };
+    set_default_restricted("ro.boot.vbmeta.device_state", "locked");
+    set_default_restricted("ro.boot.vbmeta.avb_version", "1.2");
+    set_default_restricted("ro.boot.vbmeta.hash_alg", "sha256");
+    set_default_restricted("ro.boot.verifiedbootstate", "green");
+    set_default_restricted("ro.boot.veritymode", "enforcing");
+    set_default_restricted("ro.boot.flash.locked", "1");
+    set_default_restricted("ro.boot.warranty_bit", "0");
+    set_default_restricted("ro.warranty_bit", "0");
+    set_default_restricted("ro.build.selinux", "1");
+    set_default_restricted("ro.debuggable", "0");
+    set_default_restricted("ro.secure", "1");
+    set_default_restricted("ro.adb.secure", "1");
+    set_default_restricted("sys.oem_unlock_allowed", "0");
+    set_default_restricted("sys.usb.state", "none");
+    set_default_restricted("sys.usb.config", "none");
+    set_default_restricted("init.svc.adbd", "stopped");
 
     for (const auto &kv : g_cfg.build.prop_map) {
         g_prop_arena.insert_before_freeze(kv.first, kv.second);
@@ -277,7 +208,7 @@ inline void internal_read_cb_bridge(void *cookie, const char *name, const char *
                     ScopedHookGuard guard;
                     if (guard) emit_probe("PROP_CB", name, it->second);
                 }
-                ctx->user_cb(ctx->user_cookie, name, it->second.c_str(), make_bionic_serial(it->second));
+                ctx->user_cb(ctx->user_cookie, name, it->second.c_str(), serial & ~1u);
                 return;
             }
         }
@@ -302,7 +233,7 @@ inline void hook_system_property_read_callback(const prop_info *pi, T_PropCallba
                 ScopedHookGuard guard;
                 if (guard) emit_probe("PROP_CB", syn_name, *syn_val);
             }
-            callback(cookie, syn_name, syn_val->c_str(), make_bionic_serial(*syn_val));
+            callback(cookie, syn_name, syn_val->c_str(), 0x02000000u);
             return;
         }
     }
