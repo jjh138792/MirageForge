@@ -24,7 +24,7 @@
 
 namespace mirage {
 
-inline int create_ cloaked_memfd(const char *tag, const std::string &content, const char *orig_path) {
+inline int create_cloaked_memfd(const char *tag, const std::string &content, const char *orig_path) {
     int fd = static_cast<int>(syscall(__NR_memfd_create, tag, MFD_CLOEXEC));
     if (fd < 0) return -1;
     if (!content.empty()) {
@@ -155,7 +155,7 @@ inline int compute_live_core_freq_khz(int core_idx) {
     return c.opp_freqs_khz[idx];
 }
 
-inline std::string synthesize_Static_cpu_leaf(int core_idx, const std::string &leaf) {
+inline std::string synthesize_static_cpu_leaf(int core_idx, const std::string &leaf) {
     const CpuClusterSpec &c = get_cluster_for_core(core_idx);
 
     if (leaf == "cpuinfo_max_freq" || leaf == "scaling_max_freq") {
