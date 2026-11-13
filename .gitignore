@@ -1,18 +1,77 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# =============================================================================
+# 1. 模块打包产物与自动注入目录 (CI 会自动构建生成，无需提交进仓库)
+# =============================================================================
+*.zip
+module/zygisk/*.so
+module/bin/
+module/system/
+module/webroot/
 
-# Other files and folders
-.settings/
+# 如果 CI 动态拉取 zygisk.hpp，忽略本地拉取的副本
+zygisk/src/main/cpp/zygisk.hpp
+zygisk/src/main/cpp/include/zygisk.hpp
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# =============================================================================
+# 2. C++ / CMake / Android NDK 构建缓存
+# =============================================================================
+build/
+**/build/
+cmake-build-*/
+.cxx/
+.externalNativeBuild/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+*.o
+*.a
+*.so
+*.d
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# =============================================================================
+# 3. Rust / Cargo (cli/)
+# (注：保留 Cargo.lock 不忽略，以保证 CI 构建依赖版本严格一致)
+# =============================================================================
+cli/target/
+**/target/
+**/*.rs.bk
+
+# =============================================================================
+# 4. Vue 3 + TypeScript + Vite 前端工程 (webui/)
+# =============================================================================
+node_modules/
+**/node_modules/
+webui/dist/
+webui/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# =============================================================================
+# 5. 编辑器、IDE 与操作系统杂项文件
+# =============================================================================
+.idea/
+.vscode/
+*.iml
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 临时文件与运行日志
+*.tmp
+*.tmp.*
+*.bak
+*.log
