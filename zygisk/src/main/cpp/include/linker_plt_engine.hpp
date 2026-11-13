@@ -9,6 +9,7 @@
 #include <elf.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include "zygisk.hpp"
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
@@ -57,7 +58,6 @@ inline void init_linker_symbols() {
     orig_dlsym = reinterpret_cast<decltype(orig_dlsym)>(dlsym(RTLD_DEFAULT, "dlsym"));
 }
 
-// 统一符号映射表：按当前激活的微模块返回对应的 Hook 函数地址
 inline void *resolve_active_hook_symbol(const char *sym) noexcept {
     if (!sym) return nullptr;
 
@@ -113,13 +113,11 @@ inline void *resolve_active_hook_symbol(const char *sym) noexcept {
     return nullptr;
 }
 
-// 拦截 dlsym：当任何 JNI 库（如 DevCheck 的 libvulkan_info.so）动态解析 Vulkan/GLES/Prop 函数时直接返回伪装函数
 inline void *hook_dlsym(void *handle, const char *symbol) {
     void *real_sym = orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
     if (!symbol) return real_sym;
 
     if (void *hooked = resolve_active_hook_symbol(symbol)) {
-        // 如果之前未保存原函数地址，顺手保存
         if (real_sym) {
             if (std::strcmp(symbol, "vkGetInstanceProcAddr") == 0 && !orig_vkGetInstanceProcAddr) {
                 orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_sym);
@@ -134,7 +132,6 @@ inline void *hook_dlsym(void *handle, const char *symbol) {
     return real_sym;
 }
 
-// 阶段 1 (仅在 preAppSpecialize / postAppSpecialize 期间使用)：向 Zygisk 注册 PLT Hooks
 inline void register_hooks_for_inode(dev_t dev, ino_t ino) {
     if (!g_zygisk_api) return;
     auto reg = [&](const char *sym, void *new_fn) {
@@ -186,7 +183,7 @@ inline void register_hooks_for_inode(dev_t dev, ino_t ino) {
 
     if (g_cfg.vfs.enabled) {
         reg("uname",   reinterpret_cast<void *>(hook_uname));
-        reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo));
+        reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo);
         reg("sysconf", reinterpret_cast<void *>(hook_sysconf));
     }
 
@@ -195,7 +192,6 @@ inline void register_hooks_for_inode(dev_t dev, ino_t ino) {
     reg("dlsym",              reinterpret_cast<void *>(hook_dlsym));
 }
 
-// 补齐 libnativeloader.so 与 libnativeloader_lazy.so，确保 Java System.loadLibrary 全程受控
 inline bool is_target_elf_library(const char *path) noexcept {
     if (!path || path[0] != '/') return false;
 
@@ -282,9 +278,6 @@ inline void scan_and_commit_plt_hooks() {
     }
 }
 
-// ============================================================================
-// 阶段 2：运行期自包含轻量级 ELF GOT 补丁器（仅修补 /data/ 应用私有 JNI 库，绝不触碰系统库与 Zygisk API）
-// ============================================================================
 inline void patch_single_got_slot(Elf_Addr *got_slot, void *new_func) {
     if (!got_slot || !new_func) return;
     Elf_Addr target_val = reinterpret_cast<Elf_Addr>(new_func);
@@ -304,7 +297,6 @@ inline int dl_iterate_app_private_cb(struct dl_phdr_info *info, size_t, void *) 
     const char *name = info->dlpi_name;
     if (!name || name[0] != '/') return 0;
 
-    // 运行期仅针对应用自身位于 /data/ 或 /mnt/asec/ 的 JNI 库（如 libvulkan_info.so）打补丁
     if (std::strncmp(name, "/data/", 6) != 0 && std::strncmp(name, "/mnt/asec/", 10) != 0) {
         return 0;
     }
@@ -346,7 +338,6 @@ inline int dl_iterate_app_private_cb(struct dl_phdr_info *info, size_t, void *) 
         }
     }
 
-    // Android Dynamic Linker 的 d_ptr 有时是相对基址偏移，做兼容归一化
     auto norm_ptr = [&](const void *p) -> uintptr_t {
         uintptr_t u = reinterpret_cast<uintptr_t>(p);
         if (u != 0 && u < info->dlpi_addr) u += info->dlpi_addr;
@@ -407,7 +398,6 @@ inline void patch_newly_loaded_app_libraries() {
 
 inline bool is_app_private_dlopen_target(const char *filename) noexcept {
     if (!filename) return false;
-    // 排除系统核心库短文件名，只关注应用私有 JNI 库 (如 libvulkan_info.so / libunity.so) 或 /data/ 路径
     if (std::strncmp(filename, "/system/", 8) == 0 ||
         std::strncmp(filename, "/apex/", 6) == 0 ||
         std::strncmp(filename, "/vendor/", 8) == 0 ||
