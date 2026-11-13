@@ -1,0 +1,96 @@
+name: "🐛 Bug 反馈 / 伪装失效 / 应用闪退 (Bug Report)"
+description: "遇到应用闪退、某项硬件参数没伪装成功，或者 WebUI 抽风了？点这里反馈"
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > 💡 **在提交之前**：既然模块里专门写了 **「📡 幻境探针」**，如果遇到闪退或伪装不生效，请务必在分流矩阵里给目标应用打开 **`[📡 探针与调用栈]`** 跑一下，把日志贴在下面，不然我只能靠意念给你修 Bug 了。
+
+  - type: checkboxes
+    id: pre_checks
+    attributes:
+      label: "前置确认 (Pre-flight Checks)"
+      description: "请确认你已经做过以下基础排查："
+      options:
+        - label: "我已经更新到了最新版本的 MirageForge，并在修改配置后点击 ⚡ 重启了目标应用"
+          required: true
+        - label: "我已经在历史 Issue 中搜索过，没有发现完全相同的问题"
+          required: true
+
+  - type: dropdown
+    id: bug_category
+    attributes:
+      label: "问题类型 (Issue Category)"
+      options:
+        - "伪装未生效（目标应用依然能认出真实机型/CPU/GPU/内存/DPI）"
+        - "目标应用闪退 / 卡死 / ANR"
+        - "WebUI 界面显示或交互异常"
+        - "命令行工具 (mirageforge_cli) 报错"
+        - "刷入或启动异常"
+    validations:
+      required: true
+
+  - type: input
+    id: target_app
+    attributes:
+      label: "目标应用名称与包名 (Target App & Package Name)"
+      description: "如果是针对特定应用或检测软件的问题，请填写其名称、包名与版本号"
+      placeholder: "例如：DevCheck (flar2.devcheck) v5.29 / 王者荣耀 (com.tencent.tmgp.sgame)"
+    validations:
+      required: true
+
+  - type: input
+    id: device_rom
+    attributes:
+      label: "真机设备与系统版本 (Device & Android Version)"
+      placeholder: "例如：Pixel 7a (Android 15 / API 35) 或 小米 14 (HyperOS 2.0 Android 15)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: root_solution
+    attributes:
+      label: "Root 管理器 (Root Solution)"
+      options:
+        - "KernelSU / KernelSU Next"
+        - "APatch"
+        - "Magisk (Official / Alpha / Kitsune)"
+        - "其他 (请在下方补充)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: zygisk_impl
+    attributes:
+      label: "Zygisk 实现方式 (Zygisk Implementation)"
+      options:
+        - "Zygisk Next"
+        - "ReZygisk"
+        - "Magisk 内置 Zygisk"
+        - "NeoZygisk / 其他"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "问题详细描述与复现步骤 (Description & Steps to Reproduce)"
+      description: "请清楚说明你选了哪个模板、开了哪几个微模块开关、期望看到什么结果、实际看到了什么结果"
+      placeholder: |
+        1. 在分流矩阵为 xxx 绑定了「红魔 10 Pro+」模板
+        2. 开启了 [Bionic/ART 属性]、[Vulkan/GLES]、[VFS] 开关
+        3. 打开应用点击 xxx 页面后发生闪退 / 依然显示真机 CPU 型号
+    validations:
+      required: true
+
+  - type: textarea
+    id: probe_crash_logs
+    attributes:
+      label: "探针与崩溃日志 (Probe & Crash Logs)"
+      description: "请粘贴 `/data/adb/mirage_forge/probe_events.log` 或 `crash_events.log` 的相关内容（或在 WebUI「幻境探针」页面复制）"
+      render: log
+      placeholder: |
+        [CRASH][com.example.app][SIGABRT] ...
+        [PROBE][com.example.app][VFS_OPEN] /proc/cpuinfo => Cloaked @@ ...
