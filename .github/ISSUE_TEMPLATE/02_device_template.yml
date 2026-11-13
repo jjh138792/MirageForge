@@ -1,0 +1,48 @@
+name: "📱 新机型模板提交 / 适配请求 (Device Template)"
+description: "分享你提取的满血旗舰真机 build.prop，或请求内置某款新手机/平板的硬件模板"
+title: "[Template]: 请求添加/更新 "
+labels: ["template", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎投喂真机提取的 `build.prop` 或硬件拓扑数据！提供的数据越完整，内置进下一版预设模板库的速度就越快。
+
+  - type: input
+    id: device_name
+    attributes:
+      label: "机型商业名称与型号 (Device Marketing Name & Model)"
+      placeholder: "例如：一加 13 (PJZ110) / iQOO 13 (V2408A)"
+    validations:
+      required: true
+
+  - type: input
+    id: soc_gpu_spec
+    attributes:
+      label: "处理器、GPU 与内存规格 (SoC, GPU & RAM Specs)"
+      placeholder: "例如：骁龙 8 至尊版 (SM8750-AB) / Adreno (TM) 830 / 24GB LPDDR5X"
+    validations:
+      required: true
+
+  - type: input
+    id: cpu_clusters
+    attributes:
+      label: "CPU 异构分簇频率 (可选，格式：起始核-结束核:最小kHz:最大kHz)"
+      description: "如果你知道该机型的大小核频率分布可以填上，不知道留空即可"
+      placeholder: "例如：0-5:614400:3532800;6-7:806400:4320000"
+
+  - type: textarea
+    id: build_prop_content
+    attributes:
+      label: "真机 build.prop 内容或导出的模板 JSON (build.prop / Template JSON)"
+      description: "请粘贴从真机 system / vendor / product 提取的 build.prop 关键字段，或在 WebUI 中导出的模板 JSON（注意自行抹掉序列号等个人隐私）"
+      render: ini
+      placeholder: |
+        ro.product.brand=OnePlus
+        ro.product.model=PJZ110
+        ro.product.device=OP5D0BL1
+        ro.board.platform=sun
+        ro.soc.model=SM8750-AB
+        ro.build.fingerprint=...
+    validations:
+      required: true
