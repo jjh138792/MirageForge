@@ -18,11 +18,11 @@
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
 #include "fd_cloak_tracker.hpp"
+#include "jvm_art_engine.hpp"
 #include "bionic_prop_engine.hpp"
 #include "vfs_sysinfo_engine.hpp"
 #include "graphics_vulkan_gles.hpp"
 #include "linker_plt_engine.hpp"
-#include "jvm_art_engine.hpp"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
@@ -40,17 +40,20 @@ public:
     void preAppSpecialize(AppSpecializeArgs *args) override {
         if (!args || !args->nice_name) {
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            g_zygisk_api = nullptr;
             return;
         }
 
         if (args->uid < 10000 && args->uid != 2000) {
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            g_zygisk_api = nullptr;
             return;
         }
 
         const char *raw_pkg = env->GetStringUTFChars(args->nice_name, nullptr);
         if (!raw_pkg) {
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            g_zygisk_api = nullptr;
             return;
         }
         std::string pkg_name(raw_pkg);
@@ -64,6 +67,7 @@ public:
         int fd = api->connectCompanion();
         if (fd < 0) {
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            g_zygisk_api = nullptr;
             return;
         }
 
@@ -75,6 +79,7 @@ public:
         if (!read_full(fd, &hit, sizeof(hit)) || !hit) {
             close(fd);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            g_zygisk_api = nullptr;
             return;
         }
 
@@ -96,7 +101,6 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 加载微模块配置后，立即擦除临时接收数组 raw_kvs
         load_modular_config(raw_kvs);
         for (auto &kv : raw_kvs) {
             volatile_scrub_string(kv.first);
@@ -107,6 +111,7 @@ public:
         if (!g_cfg.build.enabled && !g_cfg.gl.enabled && !g_cfg.vfs.enabled && !g_cfg.probe.enabled) {
             close(fd);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            g_zygisk_api = nullptr;
             return;
         }
 
@@ -126,7 +131,7 @@ public:
             reflect_java_build_fields(env);
             apply_app_dpi_virtualization(env);
         }
-        if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
+        if (g_cfg.vfs.enabled || g_cfg.build.enabled || g_cfg.probe.enabled) {
             init_vfs_symbols();
         }
         if (g_cfg.vfs.enabled) {
@@ -144,18 +149,25 @@ public:
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
-        if (!g_cfg.active) return;
+        if (!g_cfg.active) {
+            g_zygisk_api = nullptr;
+            return;
+        }
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
             apply_app_dpi_virtualization(env);
-            // 阅后即焚：反射完成后立即抹除堆内存中的 build_map 与 version_map
             g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
+        patch_newly_loaded_app_libraries();
+
+        // 生命周期结束，立即置空 Zygisk API 指针，严禁运行期非法调用 pltHookCommit()
+        g_zygisk_api = nullptr;
     }
 
     void preServerSpecialize(ServerSpecializeArgs *) override {
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        g_zygisk_api = nullptr;
     }
 
 private:

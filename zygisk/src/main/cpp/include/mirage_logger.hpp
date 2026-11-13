@@ -23,7 +23,6 @@ namespace mirage {
 constexpr const char *PROBE_LOG_PATH = "/data/adb/mirage_forge/probe_events.log";
 constexpr const char *CRASH_LOG_PATH = "/data/adb/mirage_forge/crash_events.log";
 
-// 指向经 api->exemptFd() 豁免的 Companion Unix Socket 描述符 (由 Root 守护线程代写磁盘)
 inline int g_probe_log_fd = -1;
 inline std::atomic_flag g_probe_spinlock = ATOMIC_FLAG_INIT;
 inline std::unordered_set<uint64_t> g_probe_dedup;
@@ -88,7 +87,6 @@ inline std::string capture_caller_chain(size_t skip_frames = 2, size_t max_frame
     return res.empty() ? "app_runtime" : res;
 }
 
-// 通过 Companion Socket 实时发送给 Root 守护线程写盘，同时使用 WARN 级别写 logd 突破国产 ROM 过滤
 inline void write_direct_log_line(int prio, const std::string &line) {
     __android_log_print(prio, LOG_TAG, "%s", line.c_str());
     int sock = g_probe_log_fd;
@@ -102,7 +100,6 @@ inline void write_direct_log_line(int prio, const std::string &line) {
     }
 }
 
-// 极速探针记录：未开启探针时 1 周期内联返回，开启后实时回溯调用栈并发送给 Root 守护线程
 inline void emit_probe(const char *domain, const std::string &key, const std::string &val) {
     if (__builtin_expect(!g_cfg.probe.enabled, 1)) return;
 
@@ -120,29 +117,33 @@ inline void emit_probe(const char *domain, const std::string &key, const std::st
     write_direct_log_line(ANDROID_LOG_WARN, ss.str());
 }
 
-inline struct sigaction g_old_sigsegv{};
+// 仅拦截真正的致命中止信号 (SIGABRT / SIGBUS / SIGILL)，绝不触碰 ART 用于 Java 空指针检查的 SIGSEGV！
+// 且内部 100% 使用栈内存，零 malloc 分配，保证异步信号安全。
 inline struct sigaction g_old_sigabrt{};
 inline struct sigaction g_old_sigbus{};
 inline struct sigaction g_old_sigill{};
 inline char g_crash_pkg_name[128] = {0};
 
 inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext) {
-    const char *sig_name = (sig == SIGSEGV) ? "SIGSEGV" :
-                           (sig == SIGABRT) ? "SIGABRT" :
+    const char *sig_name = (sig == SIGABRT) ? "SIGABRT" :
                            (sig == SIGBUS)  ? "SIGBUS"  : "SIGILL";
-    std::string bt = capture_caller_chain(1, 8);
-    char crash_buf[1024];
-    std::snprintf(crash_buf, sizeof(crash_buf),
-                  "[CRASH][%s][%s] code=%d fault_addr=%p | Stack: %s",
-                  g_crash_pkg_name, sig_name,
-                  info ? info->si_code : 0,
-                  info ? info->si_addr : nullptr,
-                  bt.c_str());
 
-    write_direct_log_line(ANDROID_LOG_ERROR, crash_buf);
+    char crash_buf[512];
+    int len = std::snprintf(
+        crash_buf, sizeof(crash_buf),
+        "[CRASH][%s][%s] code=%d fault_addr=%p | Stack: native_abort\n",
+        g_crash_pkg_name, sig_name,
+        info ? info->si_code : 0,
+        info ? info->si_addr : nullptr
+    );
 
-    struct sigaction *prev = (sig == SIGSEGV) ? &g_old_sigsegv :
-                             (sig == SIGABRT) ? &g_old_sigabrt :
+    if (len > 0 && g_probe_log_fd >= 0) {
+        size_t write_len = static_cast<size_t>(len < static_cast<int>(sizeof(crash_buf)) ? len : sizeof(crash_buf) - 1);
+        ssize_t unused = send(g_probe_log_fd, crash_buf, write_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+        (void)unused;
+    }
+
+    struct sigaction *prev = (sig == SIGABRT) ? &g_old_sigabrt :
                              (sig == SIGBUS)  ? &g_old_sigbus  : &g_old_sigill;
     if (prev && (prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction) {
         prev->sa_sigaction(sig, info, ucontext);
@@ -163,7 +164,6 @@ inline void install_crash_signal_logger(const std::string &pkg) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 
-    sigaction(SIGSEGV, &sa, &g_old_sigsegv);
     sigaction(SIGABRT, &sa, &g_old_sigabrt);
     sigaction(SIGBUS,  &sa, &g_old_sigbus);
     sigaction(SIGILL,  &sa, &g_old_sigill);

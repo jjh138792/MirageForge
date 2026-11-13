@@ -7,6 +7,7 @@
 #include <sys/system_properties.h>
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
+#include "jvm_art_engine.hpp"
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
@@ -25,7 +26,7 @@ struct alignas(4) BionicPropInfoCompat {
 // 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 锁定为 r--p 只读状态
 class ReadOnlyMmapPropArena {
 public:
-    static constexpr size_t kArenaSize = 65536; // 64KB 足够容纳 400+ 条属性
+    static constexpr size_t kArenaSize = 65536; // 64KB 容量
 
     void ensure_mapped() {
         if (arena_base_) return;
@@ -130,27 +131,41 @@ inline void freeze_bionic_prop_arena() {
         g_cfg.build.prop_map["ro.vendor.display.default_dpi"] = dpi_s;
     }
 
-    auto set_default_restricted = [&](const char *k, const char *v) {
-        if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
+    auto set_default_prop = [&](const char *k, const std::string &v) {
+        if (!v.empty() && g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
             g_cfg.build.prop_map[k] = v;
         }
     };
-    set_default_restricted("ro.boot.vbmeta.device_state", "locked");
-    set_default_restricted("ro.boot.vbmeta.avb_version", "1.2");
-    set_default_restricted("ro.boot.vbmeta.hash_alg", "sha256");
-    set_default_restricted("ro.boot.verifiedbootstate", "green");
-    set_default_restricted("ro.boot.veritymode", "enforcing");
-    set_default_restricted("ro.boot.flash.locked", "1");
-    set_default_restricted("ro.boot.warranty_bit", "0");
-    set_default_restricted("ro.warranty_bit", "0");
-    set_default_restricted("ro.build.selinux", "1");
-    set_default_restricted("ro.debuggable", "0");
-    set_default_restricted("ro.secure", "1");
-    set_default_restricted("ro.adb.secure", "1");
-    set_default_restricted("sys.oem_unlock_allowed", "0");
-    set_default_restricted("sys.usb.state", "none");
-    set_default_restricted("sys.usb.config", "none");
-    set_default_restricted("init.svc.adbd", "stopped");
+
+    // 同步真机常见的高通 / 联发科 / 通用底层芯片型号属性（防止 DevCheck 从次级芯片属性识别出真机 SoC）
+    auto soc_it = g_cfg.build.prop_map.find("ro.soc.model");
+    if (soc_it != g_cfg.build.prop_map.end() && !soc_it->second.empty()) {
+        const std::string &soc = soc_it->second;
+        set_default_prop("ro.chipname", soc);
+        set_default_prop("ro.hardware.chipname", soc);
+        set_default_prop("ro.boot.chipname", soc);
+        set_default_prop("ro.vendor.qti.soc_model", soc);
+        set_default_prop("ro.vendor.qti.soc_name", soc);
+        set_default_prop("ro.mediatek.platform", soc);
+    }
+
+    // 补齐真机 SELinux app 域受限安全状态属性
+    set_default_prop("ro.boot.vbmeta.device_state", "locked");
+    set_default_prop("ro.boot.vbmeta.avb_version", "1.2");
+    set_default_prop("ro.boot.vbmeta.hash_alg", "sha256");
+    set_default_prop("ro.boot.verifiedbootstate", "green");
+    set_default_prop("ro.boot.veritymode", "enforcing");
+    set_default_prop("ro.boot.flash.locked", "1");
+    set_default_prop("ro.boot.warranty_bit", "0");
+    set_default_prop("ro.warranty_bit", "0");
+    set_default_prop("ro.build.selinux", "1");
+    set_default_prop("ro.debuggable", "0");
+    set_default_prop("ro.secure", "1");
+    set_default_prop("ro.adb.secure", "1");
+    set_default_prop("sys.oem_unlock_allowed", "0");
+    set_default_prop("sys.usb.state", "none");
+    set_default_prop("sys.usb.config", "none");
+    set_default_prop("init.svc.adbd", "stopped");
 
     for (const auto &kv : g_cfg.build.prop_map) {
         g_prop_arena.insert_before_freeze(kv.first, kv.second);
@@ -170,6 +185,11 @@ inline bool is_interesting_unmapped_prop(const char *name) noexcept {
 }
 
 inline const prop_info *hook_system_property_find(const char *name) {
+    if (__builtin_expect(g_cfg.build.app_dpi > 0 && !g_app_dpi_locked_on_app.load(std::memory_order_relaxed), 0)) {
+        ScopedHookGuard dpi_guard;
+        if (dpi_guard) try_lock_application_dpi_if_needed();
+    }
+
     if (name) {
         if (g_cfg.build.enabled) {
             const std::string *syn_val = nullptr;
@@ -286,6 +306,11 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 }
 
 inline int hook_system_property_get(const char *name, char *value) {
+    if (__builtin_expect(g_cfg.build.app_dpi > 0 && !g_app_dpi_locked_on_app.load(std::memory_order_relaxed), 0)) {
+        ScopedHookGuard dpi_guard;
+        if (dpi_guard) try_lock_application_dpi_if_needed();
+    }
+
     if (name && value) {
         if (g_cfg.build.enabled) {
             auto it = g_cfg.build.prop_map.find(name);
