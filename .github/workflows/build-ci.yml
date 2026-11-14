@@ -138,7 +138,7 @@ jobs:
         run: |
           ZIP_NAME="${{ steps.meta.outputs.zip_name }}"
           chmod +x module/META-INF/com/google/android/update-binary
-          chmod +x module/customize.sh module/action.sh module/uninstall.sh
+          chmod +x module/customize.sh module/action.sh module/uninstall.sh module/post-fs-data.sh module/service.sh
           chmod +x module/bin/mirageforge_cli module/bin/*/mirageforge_cli
           cd module
           zip -r9 "../$ZIP_NAME" . -x "*.DS_Store"
