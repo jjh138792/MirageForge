@@ -96,7 +96,6 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 加载微模块配置后，立即擦除临时接收数组 raw_kvs
         load_modular_config(raw_kvs);
         for (auto &kv : raw_kvs) {
             volatile_scrub_string(kv.first);
@@ -124,10 +123,7 @@ public:
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
-            // 注意：preAppSpecialize 阶段仅执行纯同步 JNI 字段修改，绝不在此阶段调用 pthread_create
-            if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
-                apply_dpi_to_all_active_resources(env, g_cfg.build.app_dpi);
-            }
+            apply_app_dpi_virtualization(env);
         }
         if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
             init_vfs_symbols();
@@ -147,24 +143,13 @@ public:
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
-        if (!g_cfg.active) {
-            g_zygisk_api = nullptr;
-            this->api = nullptr;
-            return;
-        }
+        if (!g_cfg.active) return;
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
-            // 在完成进程特权切换的 postAppSpecialize 阶段安全启动短生命周期 DPI 锁定线程
             apply_app_dpi_virtualization(env);
-            // 阅后即焚：反射完成后立即抹除堆内存中的 build_map 与 version_map
             g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
-
-        // 关键安全防护：postAppSpecialize 返回后 Zygisk Api 指针立即失效，必须置空！
-        // 置空后，运行期所有 dlopen / android_dlopen_ext 将自动走安全的 dl_iterate_phdr 引擎
-        g_zygisk_api = nullptr;
-        this->api = nullptr;
     }
 
     void preServerSpecialize(ServerSpecializeArgs *) override {
@@ -253,7 +238,6 @@ private:
             }
         }
 
-        // C++ 侧衍生属性自动补全：确保即使配置文件由 WebUI Zero-Fork 模式生成，所有厂商 SoC 属性也 100% 闭合
         if (g_cfg.build.enabled) {
             auto ensure_prop = [&](const char *key, const std::string &val) {
                 if (!val.empty() && g_cfg.build.prop_map.find(key) == g_cfg.build.prop_map.end()) {
@@ -291,9 +275,6 @@ private:
     }
 };
 
-// ============================================================================
-// Root Companion 守护进程：动态读取 module.prop 版本 + 内存缓存 + 异步日志落盘
-// ============================================================================
 static std::mutex g_file_write_mtx;
 
 static void append_line_as_root(const char *path, const std::string &line) {
