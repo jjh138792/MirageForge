@@ -26,8 +26,8 @@ constexpr uint32_t VK_UUID_SIZE = 16U;
 constexpr uint32_t VK_MAX_DRIVER_NAME_SIZE = 256U;
 constexpr uint32_t VK_MAX_DRIVER_INFO_SIZE = 256U;
 
-// Vulkan 扩展结构体的 sType 常量
-constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES = 49U;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES = 49U;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES = 50U;
 constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES     = 1000196000U;
 
 struct VkBaseOutStructureCompat {
@@ -42,18 +42,7 @@ struct VkConformanceVersionCompat {
     uint8_t patch;
 };
 
-// VK_KHR_driver_properties (sType = 1000196000)
 struct VkPhysicalDeviceDriverPropertiesCompat {
-    uint32_t sType;
-    void *pNext;
-    uint32_t driverID;
-    char driverName[VK_MAX_DRIVER_NAME_SIZE];
-    char driverInfo[VK_MAX_DRIVER_INFO_SIZE];
-    VkConformanceVersionCompat conformanceVersion;
-};
-
-// VkPhysicalDeviceVulkan12Properties (sType = 49) 头部与 DriverProperties 完全对齐
-struct VkPhysicalDeviceVulkan12PropertiesHeaderCompat {
     uint32_t sType;
     void *pNext;
     uint32_t driverID;
@@ -80,65 +69,98 @@ struct VkPhysicalDeviceProperties2Compat {
 
 using PFN_vkVoidFunction = void (*)(void);
 using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction (*)(void *instance, const char *pName);
+using PFN_vkGetDeviceProcAddr = PFN_vkVoidFunction (*)(void *device, const char *pName);
 using PFN_vkGetPhysicalDeviceProperties = void (*)(void *physicalDevice, VkPhysicalDevicePropertiesCompat *pProperties);
 using PFN_vkGetPhysicalDeviceProperties2 = void (*)(void *physicalDevice, VkPhysicalDeviceProperties2Compat *pProperties);
+using PFN_vkEnumeratePhysicalDevices = int32_t (*)(void *instance, uint32_t *pPhysicalDeviceCount, void **pPhysicalDevices);
+
+// Android 硬件抽象层 (HAL) 标准 ABI 结构 (hardware/hardware.h & hardware/hwvulkan.h)
+struct hw_module_t;
+struct hw_device_t;
+
+struct hw_module_methods_t {
+    int (*open)(const struct hw_module_t *module, const char *id, struct hw_device_t **device);
+};
+
+struct hw_module_t {
+    uint32_t tag;
+    uint16_t module_api_version;
+    uint16_t hal_api_version;
+    const char *id;
+    const char *name;
+    const char *author;
+    struct hw_module_methods_t *methods;
+    void *dso;
+};
+
+struct hw_device_t {
+    uint32_t tag;
+    uint32_t version;
+    struct hw_module_t *module;
+    uint64_t reserved[12];
+    int (*close)(struct hw_device_t *device);
+};
+
+struct hwvulkan_device_t {
+    struct hw_device_t common;
+    PFN_vkVoidFunction EnumerateInstanceExtensionProperties;
+    PFN_vkVoidFunction CreateInstance;
+    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+};
 
 using media_status_t = int32_t;
 using PFN_AMediaDrm_getPropertyString = media_status_t (*)(void *drm, const char *propertyName, const char **propertyValue);
 
 inline const GLubyte *(*orig_glGetString)(GLenum name) = nullptr;
+inline const GLubyte *(*orig_glGetStringi)(GLenum name, GLuint index) = nullptr;
 inline __eglMustCastToProperFunctionPointerType (*orig_eglGetProcAddress)(const char *procname) = nullptr;
 
 inline PFN_vkGetInstanceProcAddr orig_vkGetInstanceProcAddr = nullptr;
+inline PFN_vkGetDeviceProcAddr orig_vkGetDeviceProcAddr = nullptr;
 inline PFN_vkGetPhysicalDeviceProperties orig_vkGetPhysicalDeviceProperties = nullptr;
 inline PFN_vkGetPhysicalDeviceProperties2 orig_vkGetPhysicalDeviceProperties2 = nullptr;
+inline PFN_vkGetInstanceProcAddr orig_hal_vkGetInstanceProcAddr = nullptr;
+inline int (*orig_hal_vulkan_open)(const struct hw_module_t *module, const char *id, struct hw_device_t **device) = nullptr;
+inline hw_module_methods_t g_hooked_hal_methods{};
+
 inline PFN_AMediaDrm_getPropertyString orig_AMediaDrm_getPropertyString = nullptr;
 
-// 按需懒加载解析 libvulkan.so 符号：解决 preAppSpecialize 阶段 libvulkan.so 尚未加载或处于 RTLD_LOCAL 命名空间的问题
 inline void ensure_vulkan_symbols_loaded() {
     if (orig_vkGetInstanceProcAddr && orig_vkGetPhysicalDeviceProperties && orig_vkGetPhysicalDeviceProperties2) {
         return;
     }
 
     ScopedHookGuard guard;
+    // 主动将系统 libvulkan.so 载入全局符号空间，确保 preAppSpecialize 阶段 Zygisk 能直接 Hook 到 libvulkan.so 自身
+    void *vk_handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!vk_handle) {
+        vk_handle = RTLD_DEFAULT;
+    }
+
     if (!orig_vkGetInstanceProcAddr) {
         orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-            dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr"));
+            dlsym(vk_handle, "vkGetInstanceProcAddr"));
+    }
+    if (!orig_vkGetDeviceProcAddr) {
+        orig_vkGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            dlsym(vk_handle, "vkGetDeviceProcAddr"));
     }
     if (!orig_vkGetPhysicalDeviceProperties) {
         orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-            dlsym(RTLD_DEFAULT, "vkGetPhysicalDeviceProperties"));
+            dlsym(vk_handle, "vkGetPhysicalDeviceProperties"));
     }
     if (!orig_vkGetPhysicalDeviceProperties2) {
         orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
-            dlsym(RTLD_DEFAULT, "vkGetPhysicalDeviceProperties2"));
-    }
-
-    if (!orig_vkGetInstanceProcAddr || !orig_vkGetPhysicalDeviceProperties || !orig_vkGetPhysicalDeviceProperties2) {
-        void *vk_handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_NOLOAD);
-        if (!vk_handle) {
-            vk_handle = dlopen("libvulkan.so", RTLD_LAZY);
-        }
-        if (vk_handle) {
-            if (!orig_vkGetInstanceProcAddr) {
-                orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-                    dlsym(vk_handle, "vkGetInstanceProcAddr"));
-            }
-            if (!orig_vkGetPhysicalDeviceProperties) {
-                orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-                    dlsym(vk_handle, "vkGetPhysicalDeviceProperties"));
-            }
-            if (!orig_vkGetPhysicalDeviceProperties2) {
-                orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
-                    dlsym(vk_handle, "vkGetPhysicalDeviceProperties2"));
-            }
-        }
+            dlsym(vk_handle, "vkGetPhysicalDeviceProperties2"));
     }
 }
 
 inline void init_graphics_symbols() {
     if (!orig_glGetString) {
         orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(dlsym(RTLD_DEFAULT, "glGetString"));
+    }
+    if (!orig_glGetStringi) {
+        orig_glGetStringi = reinterpret_cast<decltype(orig_glGetStringi)>(dlsym(RTLD_DEFAULT, "glGetStringi"));
     }
     if (!orig_eglGetProcAddress) {
         orig_eglGetProcAddress = reinterpret_cast<decltype(orig_eglGetProcAddress)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
@@ -209,26 +231,29 @@ inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
     if (g_cfg.gl.vulkan_device_id != 0) {
         props->deviceID = g_cfg.gl.vulkan_device_id;
     } else if (!is_arm_mali) {
-        // 根据 Adreno 型号生成合理的真实 PCI deviceID
         if (g_cfg.gl.gl_renderer.find("830") != std::string::npos) {
             props->deviceID = 0x44050000U;
         } else if (g_cfg.gl.gl_renderer.find("750") != std::string::npos) {
             props->deviceID = 0x43050A01U;
         } else if (g_cfg.gl.gl_renderer.find("740") != std::string::npos) {
             props->deviceID = 0x43050000U;
+        } else {
+            props->deviceID = 0x44050000U;
         }
+    } else {
+        props->deviceID = 0x92020010U;
     }
 
-    // 設为独立/集成物理 GPU 类型 (VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU = 1)
-    if (props->deviceType == 0 || props->deviceType == 4) {
-        props->deviceType = 1U;
+    // 伪装驱动版本号与 API 版本 (Vulkan 1.3.280)
+    if (props->apiVersion < ((1U << 22) | (3U << 12))) {
+        props->apiVersion = (1U << 22) | (3U << 12) | 280U;
     }
+    props->deviceType = 1U; // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
 
     ScopedHookGuard guard;
     if (guard) emit_probe("VULKAN", "VkPhysicalDeviceProperties.deviceName", props->deviceName);
 }
 
-// 遍历并伪装 VkPhysicalDeviceProperties2 的 pNext 扩展链（防止通过 DriverProperties 读出真实驱动名）
 inline void spoof_vulkan_pnext_chain(void *pNext) {
     if (!pNext || !g_cfg.gl.enabled) return;
 
@@ -242,7 +267,7 @@ inline void spoof_vulkan_pnext_chain(void *pNext) {
     const char *fake_drv_info = is_arm_mali
                                     ? "v1.r49p0-01eac0"
                                     : "Prometheus V@0800.0 (GIT@I94b8f12ab4)";
-    uint32_t fake_drv_id = is_arm_mali ? 9U : 8U; // 8 = VK_DRIVER_ID_QUALCOMM_PROPRIETARY, 9 = VK_DRIVER_ID_ARM_PROPRIETARY
+    uint32_t fake_drv_id = is_arm_mali ? 9U : 8U;
 
     auto *cur = static_cast<VkBaseOutStructureCompat *>(pNext);
     int depth = 0;
@@ -292,7 +317,9 @@ inline PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void *instance, const char 
         }
     }
 
-    PFN_vkVoidFunction real_fn = orig_vkGetInstanceProcAddr ? orig_vkGetInstanceProcAddr(instance, pName) : nullptr;
+    PFN_vkVoidFunction real_fn = orig_vkGetInstanceProcAddr
+                                     ? orig_vkGetInstanceProcAddr(instance, pName)
+                                     : (orig_hal_vkGetInstanceProcAddr ? orig_hal_vkGetInstanceProcAddr(instance, pName) : nullptr);
     if (!pName || !g_cfg.gl.enabled) return real_fn;
 
     if (std::strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
@@ -309,6 +336,71 @@ inline PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void *instance, const char 
         return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties2);
     }
     return real_fn;
+}
+
+inline PFN_vkVoidFunction hook_vkGetDeviceProcAddr(void *device, const char *pName) {
+    ensure_vulkan_symbols_loaded();
+    PFN_vkVoidFunction real_fn = orig_vkGetDeviceProcAddr ? orig_vkGetDeviceProcAddr(device, pName) : nullptr;
+    if (!pName || !g_cfg.gl.enabled) return real_fn;
+
+    if (std::strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties);
+    }
+    if (std::strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
+        std::strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties2);
+    }
+    return real_fn;
+}
+
+// ============================================================================
+// Vulkan HAL 驱动层根部劫持 (拦截 libvulkan.so 对 /vendor/lib64/hw/vulkan.*.so 的 HMI 调用)
+// 作用：直接篡改 libvulkan.so 内部 InstanceDispatchTable 的驱动函数指针！
+// ============================================================================
+inline PFN_vkVoidFunction hook_hal_vkGetInstanceProcAddr(void *instance, const char *pName) {
+    PFN_vkVoidFunction real_fn = orig_hal_vkGetInstanceProcAddr ? orig_hal_vkGetInstanceProcAddr(instance, pName) : nullptr;
+    if (!pName || !g_cfg.gl.enabled) return real_fn;
+
+    if (std::strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
+        if (real_fn) {
+            orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_fn);
+        }
+        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties);
+    }
+    if (std::strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
+        std::strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
+        if (real_fn) {
+            orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_fn);
+        }
+        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties2);
+    }
+    return real_fn;
+}
+
+inline int hook_hal_vulkan_open(const struct hw_module_t *module, const char *id, struct hw_device_t **device) {
+    int ret = orig_hal_vulkan_open ? orig_hal_vulkan_open(module, id, device) : -1;
+    if (ret == 0 && device && *device && g_cfg.gl.enabled) {
+        auto *vk_dev = reinterpret_cast<hwvulkan_device_t *>(*device);
+        if (vk_dev->GetInstanceProcAddr && vk_dev->GetInstanceProcAddr != hook_hal_vkGetInstanceProcAddr) {
+            orig_hal_vkGetInstanceProcAddr = vk_dev->GetInstanceProcAddr;
+            vk_dev->GetInstanceProcAddr = hook_hal_vkGetInstanceProcAddr;
+        }
+    }
+    return ret;
+}
+
+inline void *intercept_vulkan_hal_hmi_if_needed(void *sym_addr) {
+    if (!sym_addr || !g_cfg.gl.enabled) return sym_addr;
+    auto *mod = static_cast<hw_module_t *>(sym_addr);
+    if (mod->id && std::strcmp(mod->id, "vulkan") == 0 && mod->methods && mod->methods->open) {
+        if (mod->methods->open != hook_hal_vulkan_open) {
+            orig_hal_vulkan_open = mod->methods->open;
+            g_hooked_hal_methods = *(mod->methods);
+            g_hooked_hal_methods.open = hook_hal_vulkan_open;
+            mod->methods = &g_hooked_hal_methods;
+        }
+    }
+    return sym_addr;
 }
 
 inline __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char *procname) {
