@@ -110,7 +110,6 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
         }
     }
 
-    // 若 dl_iterate_phdr 传入的是不带 '/' 的纯 SONAME 且不在系统黑名单中，允许挂载
     if (path[0] != '/') {
         return true;
     }
@@ -120,8 +119,6 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
 // 统一符号路由表：同时供 hook_dlsym 与 dl_iterate_phdr GOT 热修补器调用
 inline void *resolve_mirage_hook_symbol(const char *symbol) noexcept {
     if (!symbol) return nullptr;
-
-    if (std::strcmp(symbol, "dlopen") == 0) return reinterpret_cast<void *>(orig_dlopen ? nullptr : nullptr); // 单独处理
 
     if (g_cfg.build.enabled || g_cfg.probe.enabled) {
         if (std::strcmp(symbol, "__system_property_find") == 0) return reinterpret_cast<void *>(hook_system_property_find);
@@ -195,7 +192,6 @@ inline bool should_rescan_on_dlopen(const char *filename) noexcept {
         std::strncmp(filename, "/vendor/", 8) == 0) {
         return false;
     }
-    // 过滤纯系统库名（如 libhwui 动态 dlopen("libandroid.so")），仅对应用层/Vulkan JNI 库触发增量扫描
     if (std::strcmp(filename, "libandroid.so") == 0 ||
         std::strcmp(filename, "libc.so") == 0 ||
         std::strcmp(filename, "libdl.so") == 0 ||
@@ -229,10 +225,6 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
     return handle;
 }
 
-// ============================================================================
-// 基于 dl_iterate_phdr 的运行期安全 ELF GOT/PLT 热修补引擎
-// 优势：1. 不依赖运行期已失效的 g_zygisk_api；2. 按 dlpi_addr 唯一基址识别 base.apk 内的每个独立 .so
-// ============================================================================
 inline void patch_single_got_entry(uintptr_t base, uintptr_t offset, const char *sym_name,
                                    uintptr_t relro_start, uintptr_t relro_end, size_t page_sz) {
     void *replacement = nullptr;
@@ -255,7 +247,6 @@ inline void patch_single_got_entry(uintptr_t base, uintptr_t offset, const char 
 
     *slot = replacement;
 
-    // 若整页完全处于 PT_GNU_RELRO 区间内，恢复只读保护；若跨 .data 边界则保持读写以防崩溃
     if (relro_start < relro_end && page_start >= relro_start && (page_start + page_sz) <= relro_end) {
         mprotect(reinterpret_cast<void *>(page_start), page_sz, PROT_READ);
     }
@@ -355,7 +346,6 @@ inline void patch_loaded_elves_via_phdr() {
     g_maps_mtx.unlock();
 }
 
-// 仅在 preAppSpecialize / postAppSpecialize 期间使用 Zygisk 原生 API 注册，随后同步执行一次 phdr 扫描
 inline void scan_and_commit_plt_hooks() {
     if (!g_zygisk_api) {
         patch_loaded_elves_via_phdr();
@@ -474,7 +464,6 @@ inline void scan_and_commit_plt_hooks() {
     }
     g_maps_mtx.unlock();
 
-    // 同步执行一次 phdr 扫描以记录当前基址
     patch_loaded_elves_via_phdr();
 }
 
