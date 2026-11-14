@@ -8,7 +8,7 @@ MOD_CODE=$(grep_prop versionCode "$MODPATH/module.prop")
 
 ui_print "========================================================"
 ui_print "   蜃楼工坊 · MirageForge $MOD_VER (Build $MOD_CODE)     "
-ui_print "   Volatile Arena | Zero-Fork WebUI | Per-App DPI       "
+ui_print "   Volatile Arena | Bootloop Guard | Per-App DPI        "
 ui_print "========================================================"
 ui_print "- 设备架构: $ARCH ($ABI) | Android API: $API"
 
@@ -16,9 +16,11 @@ if [ "$API" -lt 26 ]; then
   abort "! 错误：MirageForge 仅支持 Android 8.0 (API 26) 及以上版本"
 fi
 
-ui_print "- 正在解压模块核心组件与光学液态玻璃 WebUI 资源..."
+ui_print "- 正在解压模块核心组件、防砖看门狗与 WebUI 资源..."
 unzip -o "$ZIPFILE" \
   "module.prop" \
+  "post-fs-data.sh" \
+  "service.sh" \
   "action.sh" \
   "uninstall.sh" \
   "bin/*" \
@@ -49,11 +51,19 @@ ln -sf "/data/adb/modules/mirage_forge/bin/mirageforge_cli" "$MODPATH/system/bin
 
 ui_print "- 正在通过 Rust mirageforge_cli ($MOD_VER) 同步全息模板库..."
 "$MODPATH/bin/mirageforge_cli" init
-"$MODPATH/bin/mirageforge_cli" sync >/dev/null 2>&1
+"$MODPATH/bin/mirageforge_cli" sync >/dev/null 2>/dev/null
+
+# 重置防砖看门狗启动计数器
+mkdir -p "/data/adb/mirage_forge"
+echo "0" > "/data/adb/mirage_forge/boot_count"
+chmod 0600 "/data/adb/mirage_forge/boot_count"
+ui_print "- 已启用防砖头看门狗保护 (Bootloop Watchdog)"
 
 set_perm_recursive "$MODPATH/zygisk" 0 0 0755 0644
 set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm_recursive "$MODPATH/webroot" 0 0 0755 0644
+set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
+set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 
