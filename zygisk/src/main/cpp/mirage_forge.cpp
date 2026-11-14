@@ -121,13 +121,12 @@ public:
             init_bionic_prop_symbols();
         }
         if (g_cfg.gl.enabled) {
-            // 先加载 libvulkan.so 并初始化图形符号，以便紧接着的 freeze_bionic_prop_arena 与 PLT 扫描直接覆盖它
             init_graphics_symbols();
         }
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
+            apply_app_dpi_virtualization(env, false);
         }
         if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
             init_vfs_symbols();
@@ -144,22 +143,13 @@ public:
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
-        if (!g_cfg.active) {
-            g_zygisk_api = nullptr;
-            this->api = nullptr;
-            return;
-        }
+        if (!g_cfg.active) return;
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
+            apply_app_dpi_virtualization(env, true);
             g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
-
-        // postAppSpecialize 返回后 Zygisk 的 Api 上下文立即失效，必须置空！
-        // 置空后，运行期 System.loadLibrary 加载的应用 JNI 库将自动走安全的 DT_JMPREL 挂载引擎
-        g_zygisk_api = nullptr;
-        this->api = nullptr;
     }
 
     void preServerSpecialize(ServerSpecializeArgs *) override {
@@ -182,7 +172,6 @@ private:
             else if (k == "META:APP_DPI")         g_cfg.build.app_dpi = std::atoi(v.c_str());
         }
 
-        // 若用户单独设置了按应用 DPI，自动激活 Build 模块以使其生效
         if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
             g_cfg.build.enabled = true;
         }
