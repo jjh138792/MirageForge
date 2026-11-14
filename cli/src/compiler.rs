@@ -1,7 +1,7 @@
 use crate::models::{AppRoute, DeviceTemplate};
 
 pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
-    let mut lines: Vec<String> = Vec::with_capacity(128);
+    let mut lines: Vec<String> = Vec::with_capacity(160);
 
     let push_kv = |out: &mut Vec<String>, k: &str, v: &str| {
         if !k.is_empty() && !v.is_empty() {
@@ -87,6 +87,11 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         } else {
             "builder"
         };
+        let soc_model = if !tpl.soc_model.is_empty() {
+            &tpl.soc_model
+        } else {
+            &tpl.soc_machine
+        };
 
         // Java android.os.Build 反射字段 (含 BOARD, SOC_MODEL, DISPLAY, HOST, USER)
         push_kv(&mut lines, "BUILD:MODEL", &tpl.model);
@@ -98,7 +103,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "BUILD:BOARD", &tpl.board);
         push_kv(&mut lines, "BUILD:BOOTLOADER", &tpl.bootloader);
         push_kv(&mut lines, "BUILD:SOC_MANUFACTURER", &tpl.soc_manufacturer);
-        push_kv(&mut lines, "BUILD:SOC_MODEL", &tpl.soc_model);
+        push_kv(&mut lines, "BUILD:SOC_MODEL", soc_model);
         push_kv(&mut lines, "BUILD:ID", &tpl.build_id);
         push_kv(&mut lines, "BUILD:DISPLAY", display_id);
         push_kv(&mut lines, "BUILD:HOST", build_host);
@@ -138,23 +143,45 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "ro.product.build.fingerprint", &tpl.fingerprint);
         push_kv(&mut lines, "ro.product.build.version.incremental", incremental);
         push_kv(&mut lines, "ro.build.product", &tpl.device);
+        push_kv(&mut lines, "ro.target.product", &tpl.device);
         push_kv(&mut lines, "ro.product.board", &tpl.board);
         push_kv(&mut lines, "ro.board.platform", &tpl.board);
         push_kv(&mut lines, "ro.hardware", &tpl.hardware);
         push_kv(&mut lines, "ro.boot.hardware", &tpl.hardware);
         push_kv(&mut lines, "ro.bootloader", &tpl.bootloader);
         push_kv(&mut lines, "ro.boot.bootloader", &tpl.bootloader);
+
+        // 全方位 SoC 与处理器型号属性合围 (解决 DevCheck / AIDA64 通过厂商属性读取真实 CPU 的问题)
         push_kv(&mut lines, "ro.soc.manufacturer", &tpl.soc_manufacturer);
-        push_kv(&mut lines, "ro.soc.model", &tpl.soc_model);
+        push_kv(&mut lines, "ro.vendor.soc.manufacturer", &tpl.soc_manufacturer);
+        push_kv(&mut lines, "ro.soc.model", soc_model);
+        push_kv(&mut lines, "ro.vendor.soc.model", soc_model);
+        push_kv(&mut lines, "ro.vendor.soc.model.part_name", soc_model);
+        push_kv(&mut lines, "ro.vendor.soc.model.external_name", &tpl.cpu_hardware);
+        push_kv(&mut lines, "ro.chipname", soc_model);
+        push_kv(&mut lines, "ro.hardware.chipname", soc_model);
+        push_kv(&mut lines, "ro.boot.chipname", soc_model);
+        push_kv(&mut lines, "ro.unicpu.model", &tpl.cpu_hardware);
+        push_kv(&mut lines, "ro.mediatek.platform", soc_model);
+        push_kv(&mut lines, "ro.arch", "arm64");
+
+        // 指令集与版本衍生属性
         push_kv(&mut lines, "ro.product.cpu.abi", "arm64-v8a");
         push_kv(&mut lines, "ro.product.cpu.abilist", abis);
         push_kv(&mut lines, "ro.product.cpu.abilist64", "arm64-v8a");
         push_kv(&mut lines, "ro.product.cpu.abilist32", "armeabi-v7a,armeabi");
+        push_kv(&mut lines, "ro.dalvik.vm.isa.arm", "arm");
+        push_kv(&mut lines, "ro.dalvik.vm.isa.arm64", "arm64");
         push_kv(&mut lines, "ro.build.date.utc", &build_utc.to_string());
         push_kv(&mut lines, "ro.build.host", build_host);
         push_kv(&mut lines, "ro.build.user", build_user);
         push_kv(&mut lines, "ro.build.version.security_patch", &tpl.security_patch);
         push_kv(&mut lines, "ro.vendor.build.security_patch", &tpl.security_patch);
+        push_kv(&mut lines, "ro.build.version.codename", "REL");
+        push_kv(&mut lines, "ro.build.version.all_codenames", "REL");
+        push_kv(&mut lines, "ro.build.version.preview_sdk", "0");
+        push_kv(&mut lines, "ro.product.first_api_level", &tpl.sdk_int);
+        push_kv(&mut lines, "ro.vndk.version", &tpl.sdk_int);
         push_kv(&mut lines, "ro.build.tags", "release-keys");
         push_kv(&mut lines, "ro.build.type", "user");
 
@@ -198,6 +225,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             push_kv(&mut lines, "qemu.sf.lcd_density", &dpi_s);
             push_kv(&mut lines, "persist.sys.dpi", &dpi_s);
             push_kv(&mut lines, "ro.vendor.display.default_dpi", &dpi_s);
+            push_kv(&mut lines, "ro.config.density_dpi", &dpi_s);
         }
 
         if route.sdk_spoof {
