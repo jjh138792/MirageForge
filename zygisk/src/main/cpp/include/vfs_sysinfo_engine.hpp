@@ -53,11 +53,11 @@ inline int (*orig_fstat64)(int fd, struct stat64 *statbuf) = nullptr;
 inline ssize_t (*orig_readlink)(const char *pathname, char *buf, size_t bufsiz) = nullptr;
 inline ssize_t (*orig_readlinkat)(int dirfd, const char *pathname, char *buf, size_t bufsiz) = nullptr;
 inline FILE *(*orig_popen)(const char *command, const char *type) = nullptr;
+inline int (*orig_execve)(const char *pathname, char *const argv[], char *const envp[]) = nullptr;
 inline int (*orig_uname)(struct utsname *buf) = nullptr;
 inline int (*orig_sysinfo)(struct sysinfo *info) = nullptr;
 inline long (*orig_sysconf)(int name) = nullptr;
 
-// 记录每个虚拟 memfd 创建时的真实内核 inode，防止 fd 被底层关闭后复用给字体/资源文件导致崩溃
 inline std::atomic<ino_t> g_vfs_fd_real_ino[FdCloakTracker::kMaxFastFd]{};
 
 inline void init_vfs_symbols() {
@@ -92,6 +92,7 @@ inline void init_vfs_symbols() {
     orig_readlink = reinterpret_cast<decltype(orig_readlink)>(dlsym(RTLD_DEFAULT, "readlink"));
     orig_readlinkat = reinterpret_cast<decltype(orig_readlinkat)>(dlsym(RTLD_DEFAULT, "readlinkat"));
     orig_popen = reinterpret_cast<decltype(orig_popen)>(dlsym(RTLD_DEFAULT, "popen"));
+    orig_execve = reinterpret_cast<decltype(orig_execve)>(dlsym(RTLD_DEFAULT, "execve"));
     orig_uname = reinterpret_cast<decltype(orig_uname)>(dlsym(RTLD_DEFAULT, "uname"));
     orig_sysinfo = reinterpret_cast<decltype(orig_sysinfo)>(dlsym(RTLD_DEFAULT, "sysinfo"));
     orig_sysconf = reinterpret_cast<decltype(orig_sysconf)>(dlsym(RTLD_DEFAULT, "sysconf"));
@@ -113,7 +114,6 @@ inline void unregister_vfs_fd_safe(int fd) noexcept {
     g_fd_cloak.unregister_fd(fd);
 }
 
-// 校验当前 fd 是否仍然是我们的虚拟 memfd；若已被底层悄悄关闭并复用给字体或其它文件，自动清理并返回 false
 inline bool verify_vfs_fd_alive(int fd) noexcept {
     if (!g_fd_cloak.is_tracked_fast(fd)) return false;
     if (fd >= 0 && fd < static_cast<int>(FdCloakTracker::kMaxFastFd)) {
@@ -140,6 +140,53 @@ inline bool is_cpufreq_relative_candidate(const char *rel) noexcept {
     if (!rel || rel[0] == '/' || rel[0] == '.') return false;
     char c = rel[0];
     return (c == 's' || c == 'c' || c == 'o' || c == 'r' || c == 'a' || c == 't' || c == 'm' || c == 'p' || c == 'f' || c == 'v');
+}
+
+// 判定是否为虚拟硬件目录：防止宿主机缺少 /sys/devices/soc0 等目录导致 DevCheck 在 stat() 预检阶段放弃读取
+inline bool is_virtual_vfs_directory(const std::string &norm) noexcept {
+    if (!g_cfg.vfs.enabled || norm.empty()) return false;
+    if (norm == "/sys/devices/soc0" ||
+        norm == "/sys/class/kgsl" ||
+        norm == "/sys/class/kgsl/kgsl-3d0" ||
+        norm == "/sys/devices/system/chip-info" ||
+        norm == "/sys/devices/system/cpu" ||
+        norm == "/sys/devices/system/cpu/cpufreq" ||
+        norm == "/proc/device-tree" ||
+        norm == "/sys/firmware/devicetree/base") {
+        return true;
+    }
+    if (norm.rfind("/sys/devices/system/cpu/cpu", 0) == 0) {
+        const char *sub = norm.c_str() + 27;
+        if (*sub >= '0' && *sub <= '9') {
+            while (*sub >= '0' && *sub <= '9') ++sub;
+            if (*sub == '\0' || std::strcmp(sub, "/cpufreq") == 0 ||
+                std::strcmp(sub, "/topology") == 0 || std::strcmp(sub, "/cpufreq/stats") == 0) {
+                return true;
+            }
+        }
+    }
+    if (norm.rfind("/sys/devices/system/cpu/cpufreq/policy", 0) == 0) {
+        const char *sub = norm.c_str() + 38;
+        if (*sub >= '0' && *sub <= '9') {
+            while (*sub >= '0' && *sub <= '9') ++sub;
+            if (*sub == '\0' || std::strcmp(sub, "/stats") == 0) return true;
+        }
+    }
+    return false;
+}
+
+template <typename StatT>
+inline void populate_virtual_dir_stat(StatT *buf, const std::string &dir_path) {
+    if (!buf) return;
+    std::memset(buf, 0, sizeof(StatT));
+    buf->st_dev = 0xFE00;
+    buf->st_ino = static_cast<decltype(buf->st_ino)>(hash_str(dir_path) & 0x7FFFFFFFull);
+    buf->st_mode = S_IFDIR | S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH; // 0040755
+    buf->st_nlink = 2;
+    buf->st_uid = 0;
+    buf->st_gid = 0;
+    buf->st_size = 4096;
+    buf->st_blksize = 4096;
 }
 
 inline uint64_t calc_realistic_memtotal_kb(int ram_gb) noexcept {
@@ -302,7 +349,6 @@ inline bool synthesize_cpufreq_leaf(int core_id, const char *leaf, std::string *
     return false;
 }
 
-// 注意：仅过滤本模块创建的 /memfd:mirage_vfs，严禁过滤 Android ART 自身的 /memfd:jit-cache！
 inline bool is_sensitive_proc_line(const char *line) noexcept {
     return std::strstr(line, "mirage_forge") != nullptr ||
            std::strstr(line, "mirage_vfs") != nullptr ||
@@ -406,7 +452,7 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
         return false;
     }
 
-    // 2. /proc/* 节点按需合成 (含 /proc/device-tree/*)
+    // 2. /proc/* 节点按需合成
     if (norm.rfind("/proc/", 0) == 0) {
         if (norm == "/proc/meminfo") {
             int ram_gb = g_cfg.vfs.ram_gb > 0 ? g_cfg.vfs.ram_gb : 16;
@@ -448,7 +494,9 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
                    << "CPU part\t: 0x" << std::hex << part_id << std::dec << "\n"
                    << "CPU revision\t: 1\n\n";
             }
-            ss << "Hardware\t: " << g_cfg.vfs.cpu_hardware << "\n";
+            ss << "Hardware\t: " << g_cfg.vfs.cpu_hardware << "\n"
+               << "Revision\t: 0000\n"
+               << "Serial\t\t: 0000000000000000\n";
             *out_content = ss.str();
             return true;
         }
@@ -484,13 +532,20 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
         *out_content = g_cfg.vfs.soc_id + "\n";
         return true;
     }
-    if (norm == "/sys/devices/soc0/family") { *out_content = g_cfg.vfs.soc_family + "\n"; return true; }
-    if (norm == "/sys/devices/soc0/machine") { *out_content = g_cfg.vfs.soc_machine + "\n"; return true; }
+    if (norm == "/sys/devices/soc0/family") {
+        *out_content = (g_cfg.vfs.soc_machine.find("MT") == 0 ? "MediaTek" : g_cfg.vfs.soc_family) + "\n";
+        return true;
+    }
+    if (norm == "/sys/devices/soc0/machine" || norm == "/sys/devices/soc0/chip_name") {
+        *out_content = g_cfg.vfs.soc_machine + "\n";
+        return true;
+    }
     if (norm == "/sys/devices/soc0/vendor") {
         *out_content = (g_cfg.vfs.soc_machine.find("MT") == 0 ? "MediaTek" : "Qualcomm") + std::string("\n");
         return true;
     }
     if (norm == "/sys/devices/soc0/revision") { *out_content = "2.0\n"; return true; }
+    if (norm == "/sys/devices/soc0/serial_number") { *out_content = "0x0019b7a2\n"; return true; }
     if (norm == "/sys/firmware/devicetree/base/model") {
         *out_content = g_cfg.vfs.cpu_hardware + "\n";
         return true;
@@ -695,7 +750,6 @@ inline FILE *hook_fopen64(const char *pathname, const char *mode) {
     return hook_fopen(pathname, mode);
 }
 
-// 拦截 fclose：在 libc 内部关闭底层 fd 前，提前注销 g_fd_cloak 中的追踪记录
 inline int hook_fclose(FILE *fp) {
     if (fp) {
         int fd = fileno(fp);
@@ -709,7 +763,6 @@ inline int hook_close(int fd) {
     return orig_close ? orig_close(fd) : close(fd);
 }
 
-// 拦截 Android 10+ libjavacore/libc 使用的 fdsan 关闭接口，防止 Java 关闭文件后残留幽灵 fd
 inline int hook_android_fdsan_close_with_tag(int fd, uint64_t tag) {
     unregister_vfs_fd_safe(fd);
     if (orig_android_fdsan_close_with_tag) {
@@ -746,9 +799,11 @@ inline off64_t hook_lseek64(int fd, off64_t offset, int whence) {
 inline int hook_access(const char *pathname, int mode) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname), 0)) {
         ScopedHookGuard guard;
-        std::string content;
-        if (guard && synthesize_vfs_node_on_demand(normalize_vfs_path(pathname), &content)) {
-            return 0;
+        if (guard) {
+            std::string norm = normalize_vfs_path(pathname);
+            if (is_virtual_vfs_directory(norm)) return 0;
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) return 0;
         }
     }
     return orig_access ? orig_access(pathname, mode) : -1;
@@ -757,9 +812,11 @@ inline int hook_access(const char *pathname, int mode) {
 inline int hook_faccessat(int dirfd, const char *pathname, int mode, int flags) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname) || is_cpufreq_relative_candidate(pathname), 0)) {
         ScopedHookGuard guard;
-        std::string content;
-        if (guard && synthesize_vfs_node_on_demand(resolve_dirfd_path_fast(dirfd, pathname), &content)) {
-            return 0;
+        if (guard) {
+            std::string norm = resolve_dirfd_path_fast(dirfd, pathname);
+            if (is_virtual_vfs_directory(norm)) return 0;
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) return 0;
         }
     }
     return orig_faccessat ? orig_faccessat(dirfd, pathname, mode, flags) : -1;
@@ -768,11 +825,17 @@ inline int hook_faccessat(int dirfd, const char *pathname, int mode, int flags) 
 inline int hook_stat(const char *pathname, struct stat *statbuf) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname), 0)) {
         ScopedHookGuard guard;
-        std::string norm = normalize_vfs_path(pathname);
-        std::string content;
-        if (guard && statbuf && synthesize_vfs_node_on_demand(norm, &content)) {
-            populate_virtual_stat(statbuf, norm, content.size());
-            return 0;
+        if (guard && statbuf) {
+            std::string norm = normalize_vfs_path(pathname);
+            if (is_virtual_vfs_directory(norm)) {
+                populate_virtual_dir_stat(statbuf, norm);
+                return 0;
+            }
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) {
+                populate_virtual_stat(statbuf, norm, content.size());
+                return 0;
+            }
         }
     }
     return orig_stat ? orig_stat(pathname, statbuf) : -1;
@@ -781,11 +844,17 @@ inline int hook_stat(const char *pathname, struct stat *statbuf) {
 inline int hook_stat64(const char *pathname, struct stat64 *statbuf) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname), 0)) {
         ScopedHookGuard guard;
-        std::string norm = normalize_vfs_path(pathname);
-        std::string content;
-        if (guard && statbuf && synthesize_vfs_node_on_demand(norm, &content)) {
-            populate_virtual_stat(statbuf, norm, content.size());
-            return 0;
+        if (guard && statbuf) {
+            std::string norm = normalize_vfs_path(pathname);
+            if (is_virtual_vfs_directory(norm)) {
+                populate_virtual_dir_stat(statbuf, norm);
+                return 0;
+            }
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) {
+                populate_virtual_stat(statbuf, norm, content.size());
+                return 0;
+            }
         }
     }
     return orig_stat64 ? orig_stat64(pathname, statbuf) : -1;
@@ -802,11 +871,17 @@ inline int hook_lstat64(const char *pathname, struct stat64 *statbuf) {
 inline int hook_fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname) || is_cpufreq_relative_candidate(pathname), 0)) {
         ScopedHookGuard guard;
-        std::string norm = resolve_dirfd_path_fast(dirfd, pathname);
-        std::string content;
-        if (guard && statbuf && synthesize_vfs_node_on_demand(norm, &content)) {
-            populate_virtual_stat(statbuf, norm, content.size());
-            return 0;
+        if (guard && statbuf) {
+            std::string norm = resolve_dirfd_path_fast(dirfd, pathname);
+            if (is_virtual_vfs_directory(norm)) {
+                populate_virtual_dir_stat(statbuf, norm);
+                return 0;
+            }
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) {
+                populate_virtual_stat(statbuf, norm, content.size());
+                return 0;
+            }
         }
     }
     return orig_fstatat ? orig_fstatat(dirfd, pathname, statbuf, flags) : -1;
@@ -815,11 +890,17 @@ inline int hook_fstatat(int dirfd, const char *pathname, struct stat *statbuf, i
 inline int hook_fstatat64(int dirfd, const char *pathname, struct stat64 *statbuf, int flags) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname) || is_cpufreq_relative_candidate(pathname), 0)) {
         ScopedHookGuard guard;
-        std::string norm = resolve_dirfd_path_fast(dirfd, pathname);
-        std::string content;
-        if (guard && statbuf && synthesize_vfs_node_on_demand(norm, &content)) {
-            populate_virtual_stat(statbuf, norm, content.size());
-            return 0;
+        if (guard && statbuf) {
+            std::string norm = resolve_dirfd_path_fast(dirfd, pathname);
+            if (is_virtual_vfs_directory(norm)) {
+                populate_virtual_dir_stat(statbuf, norm);
+                return 0;
+            }
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) {
+                populate_virtual_stat(statbuf, norm, content.size());
+                return 0;
+            }
         }
     }
     return orig_fstatat64 ? orig_fstatat64(dirfd, pathname, statbuf, flags) : -1;
@@ -915,6 +996,37 @@ inline int hook_uname(struct utsname *buf) {
         if (guard) emit_probe("UNAME", "release/machine", std::string(buf->release) + " / " + buf->machine);
     }
     return ret;
+}
+
+// 拦截子进程 execve：当应用通过 ProcessBuilder / Runtime.exec 调用 getprop 或 cat 读取硬件文件时，直接在子进程返回伪装值
+inline int hook_execve(const char *pathname, char *const argv[], char *const envp[]) {
+    if (pathname && argv && argv[0]) {
+        const char * slash = std::strrchr(pathname, '/');
+        const char *prog = slash ? (slash + 1) : pathname;
+
+        // 1. 拦截 getprop <key>
+        if (g_cfg.build.enabled && std::strcmp(prog, "getprop") == 0) {
+            if (argv[1] && argv[1][0] != '-') {
+                auto it = g_cfg.build.prop_map.find(argv[1]);
+                if (it != g_cfg.build.prop_map.end()) {
+                    std::string out = it->second + "\n";
+                    write_full(STDOUT_FILENO, out.data(), out.size());
+                    _exit(0);
+                }
+            }
+        }
+
+        // 2. 拦截 cat <virtual_path>
+        if (g_cfg.vfs.enabled && std::strcmp(prog, "cat") == 0 && argv[1] && !argv[2]) {
+            std::string norm = normalize_vfs_path(argv[1]);
+            std::string content;
+            if (!norm.empty() && synthesize_vfs_node_on_demand(norm, &content)) {
+                write_full(STDOUT_FILENO, content.data(), content.size());
+                _exit(0);
+            }
+        }
+    }
+    return orig_execve ? orig_execve(pathname, argv, envp) : execve(pathname, argv, envp);
 }
 
 inline FILE *hook_popen(const char *command, const char *type) {
