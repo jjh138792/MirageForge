@@ -15,9 +15,6 @@
 
 namespace mirage {
 
-// 供第三部分 jvm_art_engine.hpp 挂载的主线程 DPI 按需刷新钩子（0 后台线程）
-inline void (*g_prop_dpi_lazy_sync_fn)() = nullptr;
-
 struct alignas(4) BionicPropInfoCompat {
     uint32_t serial;              // 偏移 0..3
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
@@ -114,12 +111,10 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
-// 检查宿主机真实环境是否存在指定属性
 inline bool real_host_prop_exists(const char *name) noexcept {
     return orig_system_property_find && name && (orig_system_property_find(name) != nullptr);
 }
 
-// 自适应云机属性伪装：默认不开启！仅当探测到宿主机确实存在云机底层属性时才激活覆盖
 inline void inject_adaptive_cloud_props_if_present() {
     bool is_cloud_host = real_host_prop_exists("ro.sys.cloud.magisk") ||
                          real_host_prop_exists("persist.sys.cloud.root.global") ||
@@ -136,14 +131,12 @@ inline void inject_adaptive_cloud_props_if_present() {
         }
     };
 
-    // 1. 仅对宿主机已存在的云机 Root 暴露属性做隐藏归零
-    if (real_host_prop_exists("ro.sys.cloud.magisk"))          set_cloud_kv("ro.sys.cloud.magisk", "0");
+    if (real_host_prop_exists("ro.sys.cloud.magisk"))           set_cloud_kv("ro.sys.cloud.magisk", "0");
     if (real_host_prop_exists("persist.sys.cloud.root.global")) set_cloud_kv("persist.sys.cloud.root.global", "0");
-    if (real_host_prop_exists("ro.sys.cloud.root.global"))     set_cloud_kv("ro.sys.cloud.root.global", "0");
-    if (real_host_prop_exists("persist.sys.device.allowroot")) set_cloud_kv("persist.sys.device.allowroot", "0");
-    if (real_host_prop_exists("persist.sys.device_allowance")) set_cloud_kv("persist.sys.device_allowance", "0");
+    if (real_host_prop_exists("ro.sys.cloud.root.global"))      set_cloud_kv("ro.sys.cloud.root.global", "0");
+    if (real_host_prop_exists("persist.sys.device.allowroot"))  set_cloud_kv("persist.sys.device.allowroot", "0");
+    if (real_host_prop_exists("persist.sys.device_allowance"))  set_cloud_kv("persist.sys.device_allowance", "0");
 
-    // 2. 云机底层 Vulkan / GLES 驱动重定向属性 (解决云机 libvulkan.so 内部通过 property_get 读取 GPU 的问题)
     if (g_cfg.gl.enabled) {
         std::string renderer = !g_cfg.gl.gl_renderer.empty() ? g_cfg.gl.gl_renderer : "Adreno (TM) 830";
         std::string vendor   = !g_cfg.gl.gl_vendor.empty() ? g_cfg.gl.gl_vendor : "Qualcomm";
@@ -154,7 +147,7 @@ inline void inject_adaptive_cloud_props_if_present() {
                        renderer.find("Immortalis") != std::string::npos);
 
         set_cloud_kv("persist.sys.cloud.gpu.vk_devicename", renderer);
-        set_cloud_kv("persist.sys.cloud.gpu.vk_vendorid", is_arm ? "5045" : "20803");     // 0x13B5 / 0x5143
+        set_cloud_kv("persist.sys.cloud.gpu.vk_vendorid", is_arm ? "5045" : "20803");
         set_cloud_kv("persist.sys.cloud.gpu.vk_deviceid", is_arm ? "2449604624" : "1141178368");
         set_cloud_kv("persist.sys.cloud.gpu.vk_driverversion", "33554432");
         set_cloud_kv("persist.sys.cloud.gpu.gl_renderer", renderer);
@@ -199,7 +192,6 @@ inline void freeze_bionic_prop_arena() {
     set_default_restricted("sys.usb.config", "none");
     set_default_restricted("init.svc.adbd", "stopped");
 
-    // 探测宿主机环境：仅当宿主机存在云机属性时才按需注入云机伪装项
     inject_adaptive_cloud_props_if_present();
 
     for (const auto &kv : g_cfg.build.prop_map) {
@@ -223,9 +215,6 @@ inline bool is_interesting_unmapped_prop(const char *name) noexcept {
 }
 
 inline const prop_info *hook_system_property_find(const char *name) {
-    if (__builtin_expect(g_prop_dpi_lazy_sync_fn != nullptr && !g_tls_in_hook, 0)) {
-        g_prop_dpi_lazy_sync_fn();
-    }
     if (name) {
         if (g_cfg.build.enabled) {
             const std::string *syn_val = nullptr;
@@ -342,9 +331,6 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 }
 
 inline int hook_system_property_get(const char *name, char *value) {
-    if (__builtin_expect(g_prop_dpi_lazy_sync_fn != nullptr && !g_tls_in_hook, 0)) {
-        g_prop_dpi_lazy_sync_fn();
-    }
     if (name && value) {
         if (g_cfg.build.enabled) {
             auto it = g_cfg.build.prop_map.find(name);
