@@ -16,23 +16,43 @@ on:
       - 'README.md'
       - 'docs/**'
 
+permissions:
+  contents: write
+
 jobs:
-  build-ci:
+  build-canary:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Read Version from module/module.prop
+      - name: Generate Canary Version & Patch module.prop
         id: meta
         run: |
-          VERSION=$(grep '^version=' module/module.prop | cut -d'=' -f2 | tr -d '\r ')
-          VERSION_CODE=$(grep '^versionCode=' module/module.prop | cut -d'=' -f2 | tr -d '\r ')
-          SEMVER="${VERSION#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
-          echo "semver=$SEMVER" >> $GITHUB_OUTPUT
-          echo ">>> Detected Version: $VERSION (code: $VERSION_CODE)"
+          BASE_VER=$(grep '^version=' module/module.prop | cut -d'=' -f2 | tr -d '\r ')
+          BASE_SEMVER="${BASE_VER#v}"
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+
+          # 版本格式：原版本-Canary-提交短哈希，versionCode 永远锁死为 999
+          CANARY_VER="${BASE_VER}-Canary-${SHORT_SHA}"
+          CANARY_SEMVER="${BASE_SEMVER}-Canary.${SHORT_SHA}"
+          CANARY_CODE="999"
+          ZIP_NAME="MirageForge-Zygisk-${CANARY_VER}.zip"
+
+          # 直接覆写构建工作区的 module.prop（不会提交回仓库，仅生效于构建产物）
+          sed -i "s/^version=.*/version=${CANARY_VER}/" module/module.prop
+          sed -i "s/^versionCode=.*/versionCode=${CANARY_CODE}/" module/module.prop
+
+          echo "canary_version=$CANARY_VER" >> $GITHUB_OUTPUT
+          echo "canary_semver=$CANARY_SEMVER" >> $GITHUB_OUTPUT
+          echo "canary_code=$CANARY_CODE" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+
+          echo ">>> Patched module/module.prop for Canary:"
+          cat module/module.prop
 
       - name: Setup Node.js 20 for WebUI
         uses: actions/setup-node@v4
@@ -42,7 +62,7 @@ jobs:
       - name: Build Optical Liquid Glass WebUI
         working-directory: ./webui
         run: |
-          npm pkg set version="${{ steps.meta.outputs.semver }}"
+          npm pkg set version="${{ steps.meta.outputs.canary_semver }}"
           npm install
           npm run build
           ls -la ../module/webroot
@@ -82,7 +102,7 @@ jobs:
 
           CARGO_TOML_PATH="$(find . -path ./webui -prune -o -name "Cargo.toml" -print | head -n 1)"
           CLI_DIR="$(dirname "$CARGO_TOML_PATH")"
-          sed -i "s/^version = .*/version = \"${{ steps.meta.outputs.semver }}\"/" "$CARGO_TOML_PATH"
+          sed -i "s/^version = .*/version = \"${{ steps.meta.outputs.canary_semver }}\"/" "$CARGO_TOML_PATH"
 
           ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
           TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake"
@@ -114,17 +134,45 @@ jobs:
 
           cp -f "$ROOT_DIR/module/bin/arm64-v8a/mirageforge_cli" "$ROOT_DIR/module/bin/mirageforge_cli"
 
-      - name: Package CI Flashable Zip
+      - name: Package Canary Flashable Zip
         run: |
-          VERSION="${{ steps.meta.outputs.version }}"
+          ZIP_NAME="${{ steps.meta.outputs.zip_name }}"
           chmod +x module/META-INF/com/google/android/update-binary
           chmod +x module/customize.sh module/action.sh module/uninstall.sh
           chmod +x module/bin/mirageforge_cli module/bin/*/mirageforge_cli
           cd module
-          zip -r9 "../MirageForge-Zygisk-${VERSION}-CI.zip" . -x "*.DS_Store"
+          zip -r9 "../$ZIP_NAME" . -x "*.DS_Store"
 
-      - name: Upload CI Artifact
+      - name: Upload Canary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MirageForge-Zygisk-${{ steps.meta.outputs.version }}-CI
-          path: MirageForge-Zygisk-${{ steps.meta.outputs.version }}-CI.zip
+          name: MirageForge-Zygisk-${{ steps.meta.outputs.canary_version }}
+          path: ${{ steps.meta.outputs.zip_name }}
+
+      - name: Generate Canary Release Notes
+        if: github.event_name == 'push'
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s%n%n%b")
+          cat > canary_notes.md <<EOF
+          ### 🧪 MirageForge Canary Pre-Release (\`${{ steps.meta.outputs.canary_version }}\`)
+
+          * **构建版本 (Version)**: \`${{ steps.meta.outputs.canary_version }}\`
+          * **版本号 (versionCode)**: \`999\` *(锁定 999，屏蔽正式版更新推送)*
+          * **触发提交 (Commit)**: \`${{ github.sha }}\`
+
+          #### 📝 本次提交变更
+          \`\`\`text
+          ${COMMIT_MSG}
+          \`\`\`
+          EOF
+
+      - name: Publish GitHub Pre-Release (Canary)
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.canary_version }}
+          name: "MirageForge ${{ steps.meta.outputs.canary_version }}"
+          body_path: canary_notes.md
+          files: ${{ steps.meta.outputs.zip_name }}
+          draft: false
+          prerelease: true
