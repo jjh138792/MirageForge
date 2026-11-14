@@ -36,6 +36,7 @@ inline void populate_virtual_stat(StatT *buf, const std::string &fake_path, size
 class FdCloakTracker {
 public:
     static constexpr int kFastBitmapSize = 4096;
+    static constexpr int kMaxFastFd = kFastBitmapSize;
 
     // O(1) 无锁快速预检：如果当前没有任何虚拟 fd，或该 fd 不在位图中，直接返回 false
     inline bool is_tracked_fast(int fd) const noexcept {
