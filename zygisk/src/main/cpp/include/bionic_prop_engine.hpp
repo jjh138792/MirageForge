@@ -15,17 +15,15 @@
 
 namespace mirage {
 
-// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构
 struct alignas(4) BionicPropInfoCompat {
     uint32_t serial;              // 偏移 0..3
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
     char name[1];                 // 偏移 96..N
 };
 
-// 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 锁定为 r--p 只读状态
-class ReadOnlyMmapPropArena {
+class MmapPropArena {
 public:
-    static constexpr size_t kArenaSize = 65536; // 64KB 足够容纳 400+ 条属性
+    static constexpr size_t kArenaSize = 65536;
 
     void ensure_mapped() {
         if (arena_base_) return;
@@ -56,12 +54,6 @@ public:
 
         by_name_.emplace(name, pi);
         by_ptr_.emplace(pi, val);
-    }
-
-    void seal_readonly() {
-        if (arena_base_) {
-            mprotect(arena_base_, kArenaSize, PROT_READ);
-        }
     }
 
     inline const prop_info *find_lockfree(const char *name, const std::string **out_val = nullptr) const noexcept {
@@ -97,7 +89,7 @@ private:
     std::unordered_map<BionicPropInfoCompat *, std::string> by_ptr_;
 };
 
-inline ReadOnlyMmapPropArena g_prop_arena;
+inline MmapPropArena g_prop_arena;
 
 using T_PropCallback = void (*)(void *cookie, const char *name, const char *value, uint32_t serial);
 using T_ForeachCallback = void (*)(const prop_info *pi, void *cookie);
@@ -155,18 +147,22 @@ inline void freeze_bionic_prop_arena() {
     for (const auto &kv : g_cfg.build.prop_map) {
         g_prop_arena.insert_before_freeze(kv.first, kv.second);
     }
-
-    g_prop_arena.seal_readonly();
 }
 
+// 过滤 ART 启动期高频噪音属性 (dalvik.vm.* / persist.device_config.*)，避免启动时大量无意义调用栈回溯
 inline bool is_interesting_unmapped_prop(const char *name) noexcept {
     if (!name) return false;
+    if (std::strncmp(name, "persist.device_config.", 22) == 0 ||
+        std::strncmp(name, "dalvik.vm.", 10) == 0 ||
+        std::strncmp(name, "ro.boottime.", 12) == 0 ||
+        std::strncmp(name, "debug.", 6) == 0) {
+        return false;
+    }
     return std::strncmp(name, "ro.", 3) == 0 ||
            std::strncmp(name, "persist.", 8) == 0 ||
            std::strncmp(name, "sys.", 4) == 0 ||
            std::strncmp(name, "gsm.", 4) == 0 ||
-           std::strncmp(name, "ril.", 4) == 0 ||
-           std::strncmp(name, "dalvik.vm.", 10) == 0;
+           std::strncmp(name, "ril.", 4) == 0;
 }
 
 inline const prop_info *hook_system_property_find(const char *name) {
