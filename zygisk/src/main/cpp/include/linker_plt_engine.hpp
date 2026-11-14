@@ -3,14 +3,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
+#include <tuple>
 #include <set>
-#include <unordered_set>
 #include <mutex>
 #include <dlfcn.h>
-#include <link.h>
-#include <elf.h>
-#include <unistd.h>
-#include <sys/mman.h>
 #include <sys/sysmacros.h>
 #include "zygisk.hpp"
 #include "mirage_config.hpp"
@@ -22,8 +18,8 @@ namespace mirage {
 
 inline zygisk::Api *g_zygisk_api = nullptr;
 inline std::mutex g_maps_mtx;
-inline std::set<std::pair<dev_t, ino_t>> g_hooked_elves;
-inline std::unordered_set<uintptr_t> g_patched_phdr_bases;
+// 按 (dev, inode, offset) 追踪可执行段，解决同一个 base.apk / split_config.apk 内多个 .so 共享 (dev, inode) 被跳过的问题
+inline std::set<std::tuple<dev_t, ino_t, uintptr_t>> g_hooked_segments;
 inline void *g_discard_old_slot = nullptr;
 
 inline void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
@@ -31,7 +27,6 @@ inline void *(*orig_android_dlopen_ext)(const char *filename, int flags, const v
 inline void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
 
 inline void scan_and_commit_plt_hooks();
-inline void patch_loaded_elves_via_phdr();
 
 inline void init_linker_symbols() {
     if (orig_dlopen) return;
@@ -47,7 +42,7 @@ inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) no
 }
 
 inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
-    if (!path || len == 0) return false;
+    if (!path || len == 0 || path[0] != '/') return false;
 
     bool is_binary = ends_with_ext(path, len, ".so") ||
                      ends_with_ext(path, len, ".apk") ||
@@ -56,39 +51,32 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
 
     const char *slash = std::strrchr(path, '/');
     const char *fname = slash ? (slash + 1) : path;
-    if (const char *bang = std::strrchr(fname, '!')) {
-        fname = bang + 1;
-        if (const char *s2 = std::strrchr(fname, '/')) fname = s2 + 1;
-    }
 
-    // 永远不 Hook Bionic 自身、ART 核心、WebView 与本模块自身
+    // 永远不触碰 Bionic 自身、ART 虚拟机、Google PairIP 保护壳与本模块自身
     if (std::strcmp(fname, "libc.so") == 0 ||
         std::strcmp(fname, "libdl.so") == 0 ||
         std::strcmp(fname, "libm.so") == 0 ||
         std::strcmp(fname, "libart.so") == 0 ||
+        std::strcmp(fname, "libartbase.so") == 0 ||
         std::strncmp(fname, "linker", 6) == 0 ||
         std::strncmp(fname, "libwebviewchromium", 18) == 0 ||
+        std::strstr(path, "libpairipcore.so") != nullptr ||
         std::strstr(path, "mirage_forge") != nullptr) {
         return false;
     }
 
-    // 应用自身目录 (/data/app, /data/user, /data/data, /mnt/asec, base.apk!... 等) 下的所有库 100% 挂载
+    // 应用私有目录 (/data/app, /data/user, /data/data, /mnt/asec, .apk) 100% 挂载
     if (std::strncmp(path, "/data/", 6) == 0 ||
         std::strncmp(path, "/mnt/", 5) == 0 ||
-        std::strstr(path, ".apk") != nullptr) {
+        ends_with_ext(path, len, ".apk")) {
         return true;
     }
 
-    // 系统与 APEX 目录下，精准拦截核心桥接库（含负责 System.loadLibrary 的 libnativeloader.so！）
+    // 系统与 APEX 目录下，仅精准拦截负责 Java I/O、SystemProperties、OpenGL/Vulkan、DRM 的核心桥接库
     static const char *const kSystemBridgeLibs[] = {
-        "libnativeloader.so",
-        "libnativeloader_lazy.so",
-        "libdl_android.so",
         "libandroid_runtime.so",
         "libjavacore.so",
         "libopenjdk.so",
-        "libopenjdkjvm.so",
-        "libnio.so",
         "libc++.so",
         "libcutils.so",
         "libutils.so",
@@ -109,96 +97,77 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
             return true;
         }
     }
-
-    if (path[0] != '/') {
-        return true;
-    }
     return false;
-}
-
-// 统一符号路由表：同时供 hook_dlsym 与 dl_iterate_phdr GOT 热修补器调用
-inline void *resolve_mirage_hook_symbol(const char *symbol) noexcept {
-    if (!symbol) return nullptr;
-
-    if (g_cfg.build.enabled || g_cfg.probe.enabled) {
-        if (std::strcmp(symbol, "__system_property_find") == 0) return reinterpret_cast<void *>(hook_system_property_find);
-        if (std::strcmp(symbol, "__system_property_read_callback") == 0) return reinterpret_cast<void *>(hook_system_property_read_callback);
-        if (std::strcmp(symbol, "__system_property_read") == 0) return reinterpret_cast<void *>(hook_system_property_read);
-        if (std::strcmp(symbol, "__system_property_get") == 0) return reinterpret_cast<void *>(hook_system_property_get);
-        if (std::strcmp(symbol, "__system_property_foreach") == 0) return reinterpret_cast<void *>(hook_system_property_foreach);
-        if (std::strcmp(symbol, "__system_property_find_nth") == 0) return reinterpret_cast<void *>(hook_system_property_find_nth);
-    }
-    if (g_cfg.build.enabled) {
-        if (std::strcmp(symbol, "popen") == 0) return reinterpret_cast<void *>(hook_popen);
-    }
-    if (g_cfg.vfs.enabled) {
-        if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
-        if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
-        if (std::strcmp(symbol, "__open_2") == 0) return reinterpret_cast<void *>(hook_open_2);
-        if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
-        if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
-        if (std::strcmp(symbol, "__openat_2") == 0) return reinterpret_cast<void *>(hook_openat_2);
-        if (std::strcmp(symbol, "__openat64_2") == 0) return reinterpret_cast<void *>(hook_openat64_2);
-        if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
-        if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
-        if (std::strcmp(symbol, "fclose") == 0) return reinterpret_cast<void *>(hook_fclose);
-        if (std::strcmp(symbol, "close") == 0) return reinterpret_cast<void *>(hook_close);
-        if (std::strcmp(symbol, "android_fdsan_close_with_tag") == 0) return reinterpret_cast<void *>(hook_android_fdsan_close_with_tag);
-        if (std::strcmp(symbol, "lseek") == 0) return reinterpret_cast<void *>(hook_lseek);
-        if (std::strcmp(symbol, "lseek64") == 0) return reinterpret_cast<void *>(hook_lseek64);
-        if (std::strcmp(symbol, "access") == 0) return reinterpret_cast<void *>(hook_access);
-        if (std::strcmp(symbol, "faccessat") == 0) return reinterpret_cast<void *>(hook_faccessat);
-        if (std::strcmp(symbol, "stat") == 0) return reinterpret_cast<void *>(hook_stat);
-        if (std::strcmp(symbol, "stat64") == 0) return reinterpret_cast<void *>(hook_stat64);
-        if (std::strcmp(symbol, "lstat") == 0) return reinterpret_cast<void *>(hook_lstat);
-        if (std::strcmp(symbol, "lstat64") == 0) return reinterpret_cast<void *>(hook_lstat64);
-        if (std::strcmp(symbol, "fstatat") == 0) return reinterpret_cast<void *>(hook_fstatat);
-        if (std::strcmp(symbol, "fstatat64") == 0) return reinterpret_cast<void *>(hook_fstatat64);
-        if (std::strcmp(symbol, "fstat") == 0) return reinterpret_cast<void *>(hook_fstat);
-        if (std::strcmp(symbol, "fstat64") == 0) return reinterpret_cast<void *>(hook_fstat64);
-        if (std::strcmp(symbol, "readlink") == 0) return reinterpret_cast<void *>(hook_readlink);
-        if (std::strcmp(symbol, "readlinkat") == 0) return reinterpret_cast<void *>(hook_readlinkat);
-        if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
-        if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
-        if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
-    }
-    if (g_cfg.gl.enabled) {
-        if (std::strcmp(symbol, "glGetString") == 0) return reinterpret_cast<void *>(hook_glGetString);
-        if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hook_eglGetProcAddress);
-        if (std::strcmp(symbol, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<void *>(hook_vkGetInstanceProcAddr);
-        if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties") == 0) return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties);
-        if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties2") == 0 ||
-            std::strcmp(symbol, "vkGetPhysicalDeviceProperties2KHR") == 0) {
-            return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2);
-        }
-        if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
-    }
-    return nullptr;
 }
 
 inline void *hook_dlsym(void *handle, const char *symbol) {
     if (symbol && !g_tls_in_hook) {
-        if (void *hooked = resolve_mirage_hook_symbol(symbol)) {
-            return hooked;
+        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
+            if (std::strcmp(symbol, "__system_property_find") == 0) return reinterpret_cast<void *>(hook_system_property_find);
+            if (std::strcmp(symbol, "__system_property_read_callback") == 0) return reinterpret_cast<void *>(hook_system_property_read_callback);
+            if (std::strcmp(symbol, "__system_property_read") == 0) return reinterpret_cast<void *>(hook_system_property_read);
+            if (std::strcmp(symbol, "__system_property_get") == 0) return reinterpret_cast<void *>(hook_system_property_get);
+            if (std::strcmp(symbol, "__system_property_foreach") == 0) return reinterpret_cast<void *>(hook_system_property_foreach);
+        }
+        if (g_cfg.build.enabled) {
+            if (std::strcmp(symbol, "popen") == 0) return reinterpret_cast<void *>(hook_popen);
+        }
+        if (g_cfg.vfs.enabled) {
+            if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
+            if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
+            if (std::strcmp(symbol, "__open_2") == 0) return reinterpret_cast<void *>(hook_open_2);
+            if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
+            if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
+            if (std::strcmp(symbol, "__openat_2") == 0) return reinterpret_cast<void *>(hook_openat_2);
+            if (std::strcmp(symbol, "__openat64_2") == 0) return reinterpret_cast<void *>(hook_openat64_2);
+            if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
+            if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
+            if (std::strcmp(symbol, "fclose") == 0) return reinterpret_cast<void *>(hook_fclose);
+            if (std::strcmp(symbol, "close") == 0) return reinterpret_cast<void *>(hook_close);
+            if (std::strcmp(symbol, "android_fdsan_close_with_tag") == 0) return reinterpret_cast<void *>(hook_android_fdsan_close_with_tag);
+            if (std::strcmp(symbol, "lseek") == 0) return reinterpret_cast<void *>(hook_lseek);
+            if (std::strcmp(symbol, "lseek64") == 0) return reinterpret_cast<void *>(hook_lseek64);
+            if (std::strcmp(symbol, "access") == 0) return reinterpret_cast<void *>(hook_access);
+            if (std::strcmp(symbol, "faccessat") == 0) return reinterpret_cast<void *>(hook_faccessat);
+            if (std::strcmp(symbol, "stat") == 0) return reinterpret_cast<void *>(hook_stat);
+            if (std::strcmp(symbol, "stat64") == 0) return reinterpret_cast<void *>(hook_stat64);
+            if (std::strcmp(symbol, "lstat") == 0) return reinterpret_cast<void *>(hook_lstat);
+            if (std::strcmp(symbol, "lstat64") == 0) return reinterpret_cast<void *>(hook_lstat64);
+            if (std::strcmp(symbol, "fstatat") == 0) return reinterpret_cast<void *>(hook_fstatat);
+            if (std::strcmp(symbol, "fstatat64") == 0) return reinterpret_cast<void *>(hook_fstatat64);
+            if (std::strcmp(symbol, "fstat") == 0) return reinterpret_cast<void *>(hook_fstat);
+            if (std::strcmp(symbol, "fstat64") == 0) return reinterpret_cast<void *>(hook_fstat64);
+            if (std::strcmp(symbol, "readlink") == 0) return reinterpret_cast<void *>(hook_readlink);
+            if (std::strcmp(symbol, "readlinkat") == 0) return reinterpret_cast<void *>(hook_readlinkat);
+            if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
+            if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
+            if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
+        }
+        if (g_cfg.gl.enabled) {
+            if (std::strcmp(symbol, "glGetString") == 0) return reinterpret_cast<void *>(hook_glGetString);
+            if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hook_eglGetProcAddress);
+            if (std::strcmp(symbol, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<void *>(hook_vkGetInstanceProcAddr);
+            if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties") == 0) return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties);
+            if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties2") == 0 ||
+                std::strcmp(symbol, "vkGetPhysicalDeviceProperties2KHR") == 0) {
+                return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2);
+            }
+            if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
         }
     }
     return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
 }
 
+// 仅当加载的是应用私有库 (/data/*, /mnt/*, .apk!*) 且非 PairIP 壳时才触发增量扫描，彻底消除系统库加载开销
 inline bool should_rescan_on_dlopen(const char *filename) noexcept {
     if (!filename) return false;
-    if (std::strncmp(filename, "/system/", 8) == 0 ||
-        std::strncmp(filename, "/apex/", 6) == 0 ||
-        std::strncmp(filename, "/vendor/", 8) == 0) {
-        return false;
+    if (std::strstr(filename, "libpairipcore.so") != nullptr) return false;
+    if (std::strncmp(filename, "/data/", 6) == 0 ||
+        std::strncmp(filename, "/mnt/", 5) == 0 ||
+        std::strstr(filename, ".apk!") != nullptr) {
+        return true;
     }
-    if (std::strcmp(filename, "libandroid.so") == 0 ||
-        std::strcmp(filename, "libc.so") == 0 ||
-        std::strcmp(filename, "libdl.so") == 0 ||
-        std::strcmp(filename, "liblog.so") == 0) {
-        return false;
-    }
-    return true;
+    return false;
 }
 
 inline void *hook_dlopen(const char *filename, int flags) {
@@ -206,8 +175,7 @@ inline void *hook_dlopen(const char *filename, int flags) {
     if (handle && should_rescan_on_dlopen(filename)) {
         ScopedHookGuard guard;
         if (guard) {
-            emit_probe("DLOPEN", filename, "Incremental GOT Hook");
-            patch_loaded_elves_via_phdr();
+            scan_and_commit_plt_hooks();
         }
     }
     return handle;
@@ -218,139 +186,14 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
     if (handle && should_rescan_on_dlopen(filename)) {
         ScopedHookGuard guard;
         if (guard) {
-            emit_probe("DLOPEN_EXT", filename, "Incremental GOT Hook");
-            patch_loaded_elves_via_phdr();
+            scan_and_commit_plt_hooks();
         }
     }
     return handle;
 }
 
-inline void patch_single_got_entry(uintptr_t base, uintptr_t offset, const char *sym_name,
-                                   uintptr_t relro_start, uintptr_t relro_end, size_t page_sz) {
-    void *replacement = nullptr;
-    if (std::strcmp(sym_name, "dlopen") == 0) replacement = reinterpret_cast<void *>(hook_dlopen);
-    else if (std::strcmp(sym_name, "android_dlopen_ext") == 0) replacement = reinterpret_cast<void *>(hook_android_dlopen_ext);
-    else if (std::strcmp(sym_name, "dlsym") == 0) replacement = reinterpret_cast<void *>(hook_dlsym);
-    else replacement = resolve_mirage_hook_symbol(sym_name);
-
-    if (!replacement) return;
-
-    auto *slot = reinterpret_cast<void **>(base + offset);
-    if (*slot == replacement) return;
-
-    uintptr_t addr = reinterpret_cast<uintptr_t>(slot);
-    uintptr_t page_start = addr & ~(page_sz - 1);
-
-    if (mprotect(reinterpret_cast<void *>(page_start), page_sz, PROT_READ | PROT_WRITE) != 0) {
-        return;
-    }
-
-    *slot = replacement;
-
-    if (relro_start < relro_end && page_start >= relro_start && (page_start + page_sz) <= relro_end) {
-        mprotect(reinterpret_cast<void *>(page_start), page_sz, PROT_READ);
-    }
-}
-
-inline void patch_loaded_elves_via_phdr() {
-    if (!g_maps_mtx.try_lock()) return;
-
-    dl_iterate_phdr([](struct dl_phdr_info *info, size_t, void *) -> int {
-        if (!info || !info->dlpi_name || info->dlpi_addr == 0 || !info->dlpi_phdr) return 0;
-
-        size_t name_len = std::strlen(info->dlpi_name);
-        if (!should_hook_elf_path(info->dlpi_name, name_len)) return 0;
-
-        if (!g_patched_phdr_bases.insert(static_cast<uintptr_t>(info->dlpi_addr)).second) {
-            return 0;
-        }
-
-        uintptr_t base = static_cast<uintptr_t>(info->dlpi_addr);
-        const ElfW(Dyn) *dyn = nullptr;
-        uintptr_t relro_start = 0, relro_end = 0;
-
-        for (int i = 0; i < info->dlpi_phnum; ++i) {
-            const ElfW(Phdr) &ph = info->dlpi_phdr[i];
-            if (ph.p_type == PT_DYNAMIC) {
-                dyn = reinterpret_cast<const ElfW(Dyn) *>(base + ph.p_vaddr);
-            } else if (ph.p_type == PT_GNU_RELRO) {
-                relro_start = base + ph.p_vaddr;
-                relro_end = relro_start + ph.p_memsz;
-            }
-        }
-        if (!dyn) return 0;
-
-        const ElfW(Sym) *symtab = nullptr;
-        const char *strtab = nullptr;
-        uintptr_t jmprel = 0, pltrelsz = 0, pltrel_type = 0;
-        uintptr_t rela = 0, relasz = 0;
-        uintptr_t rel = 0, relsz = 0;
-
-        for (const ElfW(Dyn) *d = dyn; d->d_tag != DT_NULL; ++d) {
-            switch (d->d_tag) {
-                case DT_SYMTAB:   symtab = reinterpret_cast<const ElfW(Sym) *>(d->d_un.d_ptr > base ? d->d_un.d_ptr : base + d->d_un.d_ptr); break;
-                case DT_STRTAB:   strtab = reinterpret_cast<const char *>(d->d_un.d_ptr > base ? d->d_un.d_ptr : base + d->d_un.d_ptr); break;
-                case DT_JMPREL:   jmprel = (d->d_un.d_ptr > base ? d->d_un.d_ptr : base + d->d_un.d_ptr); break;
-                case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
-                case DT_PLTREL:   pltrel_type = d->d_un.d_val; break;
-                case DT_RELA:     rela = (d->d_un.d_ptr > base ? d->d_un.d_ptr : base + d->d_un.d_ptr); break;
-                case DT_RELASZ:   relasz = d->d_un.d_val; break;
-                case DT_REL:      rel = (d->d_un.d_ptr > base ? d->d_un.d_ptr : base + d->d_un.d_ptr); break;
-                case DT_RELSZ:    relsz = d->d_un.d_val; break;
-                default: break;
-            }
-        }
-
-        if (!symtab || !strtab) return 0;
-        size_t page_sz = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-        if (page_sz == 0) page_sz = 4096;
-
-#if defined(__LP64__)
-        auto process_rela = [&](uintptr_t table_addr, size_t total_bytes) {
-            if (!table_addr || total_bytes == 0) return;
-            size_t count = total_bytes / sizeof(Elf64_Rela);
-            const auto *entries = reinterpret_cast<const Elf64_Rela *>(table_addr);
-            for (size_t i = 0; i < count; ++i) {
-                uint32_t sym_idx = ELF64_R_SYM(entries[i].r_info);
-                if (sym_idx == 0) continue;
-                const char *sym_name = strtab + symtab[sym_idx].st_name;
-                if (sym_name && sym_name[0] != '\0') {
-                    patch_single_got_entry(base, entries[i].r_offset, sym_name, relro_start, relro_end, page_sz);
-                }
-            }
-        };
-        if (jmprel && pltrelsz) process_rela(jmprel, pltrelsz);
-        if (rela && relasz)     process_rela(rela, relasz);
-        (void)pltrel_type; (void)rel; (void)relsz;
-#else
-        auto process_rel = [&](uintptr_t table_addr, size_t total_bytes) {
-            if (!table_addr || total_bytes == 0) return;
-            size_t count = total_bytes / sizeof(Elf32_Rel);
-            const auto *entries = reinterpret_cast<const Elf32_Rel *>(table_addr);
-            for (size_t i = 0; i < count; ++i) {
-                uint32_t sym_idx = ELF32_R_SYM(entries[i].r_info);
-                if (sym_idx == 0) continue;
-                const char *sym_name = strtab + symtab[sym_idx].st_name;
-                if (sym_name && sym_name[0] != '\0') {
-                    patch_single_got_entry(base, entries[i].r_offset, sym_name, relro_start, relro_end, page_sz);
-                }
-            }
-        };
-        if (jmprel && pltrelsz && pltrel_type == DT_REL) process_rel(jmprel, pltrelsz);
-        if (rel && relsz) process_rel(rel, relsz);
-        (void)rela; (void)relasz;
-#endif
-        return 0;
-    }, nullptr);
-
-    g_maps_mtx.unlock();
-}
-
 inline void scan_and_commit_plt_hooks() {
-    if (!g_zygisk_api) {
-        patch_loaded_elves_via_phdr();
-        return;
-    }
+    if (!g_zygisk_api) return;
     if (!g_maps_mtx.try_lock()) return;
 
     FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
@@ -360,7 +203,7 @@ inline void scan_and_commit_plt_hooks() {
     }
 
     char line[1024];
-    bool dirty = false;
+    std::set<std::pair<dev_t, ino_t>> batch_to_register;
 
     while (std::fgets(line, sizeof(line), fp)) {
         uintptr_t start = 0, end = 0, offset = 0;
@@ -373,7 +216,8 @@ inline void scan_and_commit_plt_hooks() {
                         &start, &end, perms, &offset, &dev_maj, &dev_min, &inode_ul, &path_pos) < 7) {
             continue;
         }
-        if (inode_ul == 0) continue;
+        // 仅检查具有可执行权限 ('x') 的代码段，立省 75% 解析开销，且每个独立 .so 拥有唯一的 (dev, inode, offset)
+        if (inode_ul == 0 || std::strchr(perms, 'x') == nullptr) continue;
 
         char *path = line + path_pos;
         while (*path == ' ' || *path == '\t') ++path;
@@ -388,11 +232,16 @@ inline void scan_and_commit_plt_hooks() {
 
         dev_t dev = makedev(dev_maj, dev_min);
         ino_t inode = static_cast<ino_t>(inode_ul);
-        auto id_pair = std::make_pair(dev, inode);
-        if (!g_hooked_elves.insert(id_pair).second) {
-            continue;
+        auto seg_key = std::make_tuple(dev, inode, offset);
+        if (g_hooked_segments.insert(seg_key).second) {
+            batch_to_register.emplace(dev, inode);
         }
-        dirty = true;
+    }
+    if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
+
+    for (const auto &target : batch_to_register) {
+        dev_t dev = target.first;
+        ino_t inode = target.second;
 
         auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
             void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &g_discard_old_slot;
@@ -457,14 +306,11 @@ inline void scan_and_commit_plt_hooks() {
             reg("AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString));
         }
     }
-    if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
 
-    if (dirty) {
+    if (!batch_to_register.empty()) {
         g_zygisk_api->pltHookCommit();
     }
     g_maps_mtx.unlock();
-
-    patch_loaded_elves_via_phdr();
 }
 
 } // namespace mirage
