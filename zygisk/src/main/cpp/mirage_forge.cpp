@@ -124,7 +124,10 @@ public:
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
+            // 注意：preAppSpecialize 阶段仅执行纯同步 JNI 字段修改，绝不在此阶段调用 pthread_create
+            if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
+                apply_dpi_to_all_active_resources(env, g_cfg.build.app_dpi);
+            }
         }
         if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
             init_vfs_symbols();
@@ -144,14 +147,24 @@ public:
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
-        if (!g_cfg.active) return;
+        if (!g_cfg.active) {
+            g_zygisk_api = nullptr;
+            this->api = nullptr;
+            return;
+        }
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
+            // 在完成进程特权切换的 postAppSpecialize 阶段安全启动短生命周期 DPI 锁定线程
             apply_app_dpi_virtualization(env);
             // 阅后即焚：反射完成后立即抹除堆内存中的 build_map 与 version_map
             g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
+
+        // 关键安全防护：postAppSpecialize 返回后 Zygisk Api 指针立即失效，必须置空！
+        // 置空后，运行期所有 dlopen / android_dlopen_ext 将自动走安全的 dl_iterate_phdr 引擎
+        g_zygisk_api = nullptr;
+        this->api = nullptr;
     }
 
     void preServerSpecialize(ServerSpecializeArgs *) override {
@@ -183,7 +196,11 @@ private:
                 if (!g_cfg.gl.enabled) continue;
                 if (k == "GLES:VENDOR") {
                     g_cfg.gl.gl_vendor = v;
-                    g_cfg.gl.vulkan_vendor_id = (v.find("ARM") != std::string::npos || v.find("Mali") != std::string::npos) ? 0x13B5 : 0x5143;
+                    g_cfg.gl.vulkan_vendor_id = (v.find("ARM") != std::string::npos ||
+                                                 v.find("Mali") != std::string::npos ||
+                                                 v.find("Immortalis") != std::string::npos)
+                                                    ? 0x13B5U
+                                                    : 0x5143U;
                 } else if (k == "GLES:RENDERER") {
                     g_cfg.gl.gl_renderer = v;
                 } else if (k == "GLES:VERSION") {
@@ -234,6 +251,42 @@ private:
                 }
                 g_cfg.build.prop_map[k] = v;
             }
+        }
+
+        // C++ 侧衍生属性自动补全：确保即使配置文件由 WebUI Zero-Fork 模式生成，所有厂商 SoC 属性也 100% 闭合
+        if (g_cfg.build.enabled) {
+            auto ensure_prop = [&](const char *key, const std::string &val) {
+                if (!val.empty() && g_cfg.build.prop_map.find(key) == g_cfg.build.prop_map.end()) {
+                    g_cfg.build.prop_map[key] = val;
+                }
+            };
+
+            std::string soc_model = g_cfg.build.build_map.count("SOC_MODEL")
+                                        ? g_cfg.build.build_map["SOC_MODEL"]
+                                        : g_cfg.vfs.soc_machine;
+            std::string soc_man = g_cfg.build.build_map.count("SOC_MANUFACTURER")
+                                      ? g_cfg.build.build_map["SOC_MANUFACTURER"]
+                                      : "Qualcomm";
+            std::string cpu_hw = !g_cfg.vfs.cpu_hardware.empty() ? g_cfg.vfs.cpu_hardware : soc_model;
+            std::string dev = g_cfg.build.build_map.count("DEVICE") ? g_cfg.build.build_map["DEVICE"] : "";
+
+            ensure_prop("ro.soc.model", soc_model);
+            ensure_prop("ro.vendor.soc.model", soc_model);
+            ensure_prop("ro.vendor.soc.model.part_name", soc_model);
+            ensure_prop("ro.vendor.soc.model.external_name", cpu_hw);
+            ensure_prop("ro.soc.manufacturer", soc_man);
+            ensure_prop("ro.vendor.soc.manufacturer", soc_man);
+            ensure_prop("ro.chipname", soc_model);
+            ensure_prop("ro.hardware.chipname", soc_model);
+            ensure_prop("ro.boot.chipname", soc_model);
+            ensure_prop("ro.unicpu.model", cpu_hw);
+            ensure_prop("ro.mediatek.platform", soc_model);
+            ensure_prop("ro.target.product", dev);
+            ensure_prop("ro.build.version.codename", "REL");
+            ensure_prop("ro.build.version.all_codenames", "REL");
+            ensure_prop("ro.build.version.preview_sdk", "0");
+            ensure_prop("ro.dalvik.vm.isa.arm", "arm");
+            ensure_prop("ro.dalvik.vm.isa.arm64", "arm64");
         }
     }
 };
