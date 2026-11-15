@@ -258,8 +258,9 @@ private:
 
             g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_devicename"] = g_cfg.gl.gl_renderer;
             g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_vendorid"] = is_arm ? "5045" : "20803";
-            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_deviceid"] = is_arm ? "2454716432" : "1124403713";
-            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_driverversion"] = is_arm ? "205520896" : "2150760448";
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_deviceid"] = is_arm ? "1920991248" : "1124403713";
+            // 必须是小于 2147483647 (INT32_MAX) 的正整数，防止 libvulkan.so 内部 atoi 溢出为负数！
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_driverversion"] = is_arm ? "205520896" : "540147712";
 
             g_cfg.build.prop_map["persist.sys.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
             g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
