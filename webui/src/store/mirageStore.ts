@@ -146,9 +146,6 @@ export function triggerLiquidToast(msg: string) {
   }, 2800);
 }
 
-/**
- * 1. 日夜与跟随系统主题控制器 (带平滑过渡)
- */
 export function applyThemeMode(mode?: ThemeMode) {
   if (mode) {
     mirageStore.themeMode = mode;
@@ -193,9 +190,6 @@ if (typeof window !== 'undefined' && window.matchMedia) {
     });
 }
 
-/**
- * 2. 动态读取 module.prop 版本号 (彻底告别硬编码)
- */
 export async function loadVersionFromModuleProp() {
   const raw = await readFileZeroFork(MODULE_PROP_FILE);
   if (!raw) return;
@@ -209,9 +203,6 @@ export async function loadVersionFromModuleProp() {
   }
 }
 
-/**
- * 3. 在线检查更新 (拉取 GitHub update.json 并对比 versionCode)
- */
 export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
   mirageStore.updateInfo.checking = true;
   triggerHaptic('light');
@@ -241,8 +232,17 @@ export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
   }
 }
 
+function isSdkOrReleaseKey(k: string): boolean {
+  return (
+    k.includes('build.version.sdk') ||
+    k.includes('build.version.release') ||
+    k.includes('first_api_level') ||
+    k === 'ro.board.api_level'
+  );
+}
+
 /**
- * 4. TypeScript 内存级微模块 .conf 编译器 (用于 Native I/O 模式下 0 Shell Fork 编译配置)
+ * TypeScript 内存级微模块 .conf 编译器（严格遵循未开启项 0 改动原则）
  */
 function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
   const lines: string[] = [];
@@ -252,12 +252,8 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     }
   };
 
-  const effectiveDpi =
-    route.dpi >= 120 && route.dpi <= 960
-      ? route.dpi
-      : tpl.DEFAULT_DPI >= 120 && tpl.DEFAULT_DPI <= 960
-      ? tpl.DEFAULT_DPI
-      : 0;
+  // 严格 0 改动：仅当应用路由明确设置了 120..=960 的 DPI 时才启用，Auto (0) 不改动任何 DPI
+  const effectiveDpi = route.dpi >= 120 && route.dpi <= 960 ? route.dpi : 0;
 
   push('META:ENABLE_BUILD', route.build ? '1' : '0');
   push('META:ENABLE_GL', route.gl ? '1' : '0');
@@ -293,9 +289,9 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
 
   if (route.build) {
     const abis = tpl.SUPPORTED_ABIS || 'arm64-v8a,armeabi-v7a,armeabi';
-    const buildUtc = Math.floor((parseInt(tpl.BUILD_TIME || '1736899200000', 10) || 1736899200000) / 1000);
-    const ramStr = `${ramGb}GB`;
-    const ddrFull = `${ramStr},${ddrVendor},${ddrType}`;
+    const buildUtc = Math.floor(
+      (parseInt(tpl.BUILD_TIME || '1736899200000', 10) || 1736899200000) / 1000
+    );
     const displayId = tpl.DISPLAY_ID || `${tpl.BUILD_ID} release-keys`;
     const incremental = tpl.INCREMENTAL || tpl.BUILD_ID;
     const host = tpl.BUILD_HOST || 'pangu-build-component-system';
@@ -356,6 +352,8 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.boot.bootloader', tpl.BOOTLOADER || 'unknown');
     push('ro.soc.manufacturer', tpl.SOC_MANUFACTURER);
     push('ro.soc.model', tpl.SOC_MODEL);
+    push('ro.boot.hardware.sku', tpl.DEVICE);
+    push('ro.boot.product.hardware.sku', tpl.DEVICE);
     push('ro.product.cpu.abi', 'arm64-v8a');
     push('ro.product.cpu.abilist', abis);
     push('ro.product.cpu.abilist64', 'arm64-v8a');
@@ -368,33 +366,32 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.build.tags', 'release-keys');
     push('ro.build.type', 'user');
 
-    // app 域受限属性区与 DDR 对称属性
-    push('ro.boot.vbmeta.device_state', 'locked');
-    push('ro.boot.vbmeta.avb_version', '1.2');
-    push('ro.boot.verifiedbootstate', 'green');
-    push('ro.boot.flash.locked', '1');
-    push('ro.boot.veritymode', 'enforcing');
-    push('ro.boot.warranty_bit', '0');
-    push('ro.warranty_bit', '0');
-    push('ro.build.selinux', '1');
-    push('ro.debuggable', '0');
-    push('ro.secure', '1');
-    push('ro.adb.secure', '1');
-    push('sys.oem_unlock_allowed', '0');
-    push('sys.usb.state', 'none');
-    push('init.svc.adbd', 'stopped');
-    push('ro.boot.hardware.ddr', ddrFull);
-    push('ro.boot.ddr_size', ramStr);
-    push('ro.boot.ddr_type', ddrType);
-    push('ro.boot.ddr_info', ddrFull);
-    push('ro.boot.ramsize', ramStr);
-    push('ro.boot.memsize', ramStr);
-    push('ro.hardware.ddr', ddrFull);
-    push('ro.vendor.hw.ram', ramStr);
-    push('ro.product.ram', ramStr);
-    push('ro.config.ram_size', ramGb * 1024);
-    push('ro.sys.ram_size', ramStr);
-    push('persist.sys.ram_size', ramStr);
+    if (route.vfs) {
+      const ramStr = `${ramGb}GB`;
+      const ddrFull = `${ramStr},${ddrVendor},${ddrType}`;
+      push('ro.boot.hardware.ddr', ddrFull);
+      push('ro.boot.ddr_size', ramStr);
+      push('ro.boot.ddr_type', ddrType);
+      push('ro.boot.ddr_info', ddrFull);
+      push('ro.boot.ramsize', ramStr);
+      push('ro.boot.memsize', ramStr);
+      push('ro.hardware.ddr', ddrFull);
+      push('ro.vendor.hw.ram', ramStr);
+      push('ro.product.ram', ramStr);
+      push('ro.config.ram_size', ramGb * 1024);
+      push('ro.sys.ram_size', ramStr);
+      push('persist.sys.ram_size', ramStr);
+    }
+
+    if (route.gl && tpl.GL_RENDERER) {
+      push('persist.sys.cloud.gpu.vk_devicename', tpl.GL_RENDERER);
+      push('persist.sys.gpu.gl_renderer', tpl.GL_RENDERER);
+      push('persist.sys.cloud.gpu.gl_renderer', tpl.GL_RENDERER);
+      if (tpl.GL_VENDOR) {
+        push('persist.sys.gpu.gl_vendor', tpl.GL_VENDOR);
+        push('persist.sys.cloud.gpu.gl_vendor', tpl.GL_VENDOR);
+      }
+    }
 
     if (effectiveDpi > 0) {
       push('ro.sf.lcd_density', effectiveDpi);
@@ -404,15 +401,23 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     }
 
     if (route.sdkSpoof) {
-      push('ro.build.version.release', tpl.RELEASE);
-      push('ro.build.version.sdk', tpl.SDK_INT);
+      for (const part of ['', 'system.', 'vendor.', 'odm.', 'product.', 'system_ext.']) {
+        push(`ro.${part}build.version.release`, tpl.RELEASE);
+        push(`ro.${part}build.version.sdk`, tpl.SDK_INT);
+      }
       push('ro.product.build.version.sdk', tpl.SDK_INT);
-      push('ro.system.build.version.sdk', tpl.SDK_INT);
     }
 
     for (const raw of (tpl.CUSTOM_PROPS || '').split(/\r?\n/)) {
       const tr = raw.trim();
-      if (tr && !tr.startsWith('#') && tr.includes('=')) lines.push(tr);
+      if (!tr || tr.startsWith('#')) continue;
+      const eq = tr.indexOf('=');
+      if (eq > 0) {
+        const k = tr.slice(0, eq).trim();
+        const v = tr.slice(eq + 1).trim();
+        if (!route.sdkSpoof && isSdkOrReleaseKey(k)) continue;
+        push(k, v);
+      }
     }
   }
 
@@ -471,7 +476,6 @@ export function parseClusterBars(clustersStr: string) {
 export async function syncStateFromRustCli() {
   await loadVersionFromModuleProp();
 
-  // 优先尝试零 Shell Fork 直接读取 config.json
   if (hasZeroForkIo()) {
     const rawJson = await readFileZeroFork(CONFIG_JSON_FILE);
     if (rawJson.trim()) {
@@ -488,7 +492,6 @@ export async function syncStateFromRustCli() {
     }
   }
 
-  // 回退调用 Rust CLI
   const res = await execRootShell(`"${CLI_BIN}" state --json`);
   if (res.errno === 0 && res.stdout.trim()) {
     try {
