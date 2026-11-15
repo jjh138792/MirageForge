@@ -20,9 +20,9 @@
 #include "fd_cloak_tracker.hpp"
 #include "bionic_prop_engine.hpp"
 #include "vfs_sysinfo_engine.hpp"
+#include "jvm_art_engine.hpp"
 #include "graphics_vulkan_gles.hpp"
 #include "linker_plt_engine.hpp"
-#include "jvm_art_engine.hpp"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
@@ -35,6 +35,9 @@ public:
         this->api = api;
         this->env = env;
         g_zygisk_api = api;
+        if (env) {
+            env->GetJavaVM(&g_jvm);
+        }
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
@@ -96,7 +99,6 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 加载微模块配置后，立即擦除临时接收数组 raw_kvs
         load_modular_config(raw_kvs);
         for (auto &kv : raw_kvs) {
             volatile_scrub_string(kv.first);
@@ -117,19 +119,24 @@ public:
             close(fd);
         }
 
+        g_main_tid = gettid();
         init_linker_symbols();
+
         if (g_cfg.build.enabled || g_cfg.probe.enabled) {
             init_bionic_prop_symbols();
         }
         if (g_cfg.build.enabled) {
+            init_popen_symbol();
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
+            if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
+                g_dpi_sync_remaining.store(3, std::memory_order_release);
+                apply_app_dpi_virtualization(env);
+            }
         }
-        if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
-            init_vfs_symbols();
-        }
+        // 严格 0 改动隔离：仅当 VFS 真正启用时才解析文件 I/O 符号与 CPU 频率表
         if (g_cfg.vfs.enabled) {
+            init_vfs_symbols();
             init_vfs_clusters_lightweight();
         }
         if (g_cfg.gl.enabled) {
@@ -147,8 +154,9 @@ public:
         if (!g_cfg.active) return;
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
-            // 阅后即焚：反射完成后立即抹除堆内存中的 build_map 与 version_map
+            if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
+                apply_app_dpi_virtualization(env);
+            }
             g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
@@ -161,6 +169,13 @@ public:
 private:
     Api *api = nullptr;
     JNIEnv *env = nullptr;
+
+    static bool is_sdk_or_release_prop(const std::string &k) noexcept {
+        return k.find("build.version.sdk") != std::string::npos ||
+               k.find("build.version.release") != std::string::npos ||
+               k.find("first_api_level") != std::string::npos ||
+               k == "ro.board.api_level";
+    }
 
     void load_modular_config(const std::vector<std::pair<std::string, std::string>> &raw_kvs) {
         for (const auto &kv : raw_kvs) {
@@ -206,7 +221,6 @@ private:
                 else if (k == "VFS:SOC_MACHINE")    g_cfg.vfs.soc_machine = v;
                 else if (k == "VFS:KERNEL_RELEASE") g_cfg.vfs.kernel_release = v;
                 else if (k == "VFS:KERNEL_VERSION") g_cfg.vfs.kernel_version = v;
-                else if (k == "VFS:DPI" && g_cfg.build.app_dpi == 0) g_cfg.build.app_dpi = std::atoi(v.c_str());
                 continue;
             }
 
@@ -227,19 +241,29 @@ private:
                 }
                 g_cfg.build.version_map[v_field] = v;
             } else {
-                if (!g_cfg.build.force_spoof_sdk &&
-                    (k == "ro.build.version.sdk" || k == "ro.product.build.version.sdk" ||
-                     k == "ro.system.build.version.sdk" || k == "ro.build.version.release")) {
+                // 严格 0 改动：未开启 force_spoof_sdk 时，拦截所有分区的 SDK 与 Android 版本属性
+                if (!g_cfg.build.force_spoof_sdk && is_sdk_or_release_prop(k)) {
                     continue;
                 }
                 g_cfg.build.prop_map[k] = v;
+            }
+        }
+
+        // 若同时启用了 GL 与 Build 模块，自动填充云端 GPU 属性通道，防止定制 ROM 从属性表读取真实 Vulkan/GLES 设备名
+        if (g_cfg.gl.enabled && g_cfg.build.enabled && !g_cfg.gl.gl_renderer.empty()) {
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_devicename"] = g_cfg.gl.gl_renderer;
+            g_cfg.build.prop_map["persist.sys.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
+            if (!g_cfg.gl.gl_vendor.empty()) {
+                g_cfg.build.prop_map["persist.sys.gpu.gl_vendor"] = g_cfg.gl.gl_vendor;
+                g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_vendor"] = g_cfg.gl.gl_vendor;
             }
         }
     }
 };
 
 // ============================================================================
-// Root Companion 守护进程：动态读取 module.prop 版本 + 内存缓存 + 异步日志落盘
+// Root Companion 守护进程
 // ============================================================================
 static std::mutex g_file_write_mtx;
 
