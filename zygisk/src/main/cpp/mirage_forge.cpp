@@ -126,6 +126,9 @@ public:
             init_bionic_prop_symbols();
         }
         if (g_cfg.build.enabled) {
+            if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
+                unlock_hidden_api_for_dpi(env);
+            }
             init_popen_symbol();
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
@@ -243,7 +246,18 @@ private:
             }
         }
 
+        // 若同时启用了 GL 与 Build 模块，同步伪装 Vulkan/EGL 硬件驱动属性与云端 GPU 属性
         if (g_cfg.gl.enabled && g_cfg.build.enabled && !g_cfg.gl.gl_renderer.empty()) {
+            bool is_arm = (g_cfg.gl.vulkan_vendor_id == 0x13B5) ||
+                          (g_cfg.gl.gl_renderer.find("Mali") != std::string::npos) ||
+                          (g_cfg.gl.gl_renderer.find("Immortalis") != std::string::npos);
+            const char *hw_drv = is_arm ? "mali" : "adreno";
+            g_cfg.build.prop_map["ro.hardware.vulkan"] = hw_drv;
+            g_cfg.build.prop_map["ro.hardware.egl"] = hw_drv;
+            g_cfg.build.prop_map["ro.gfx.driver.0"] = is_arm
+                ? "com.arm.gpudrivers.mali"
+                : "com.qualcomm.qti.gpudrivers.adreno";
+
             g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_devicename"] = g_cfg.gl.gl_renderer;
             g_cfg.build.prop_map["persist.sys.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
             g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
