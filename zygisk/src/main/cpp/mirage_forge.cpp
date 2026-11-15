@@ -152,11 +152,9 @@ public:
         if (!g_cfg.active) return;
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
-            if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
-                start_dpi_guardian_after_specialize(env);
-            }
             g_cfg.build.wipe_volatile_reflection_maps();
         }
+        start_runtime_guardian_after_specialize(env);
         scan_and_commit_plt_hooks();
     }
 
@@ -246,7 +244,7 @@ private:
             }
         }
 
-        // 若同时启用了 GL 与 Build 模块，同步伪装 Vulkan/EGL 硬件驱动属性与云端 GPU 属性
+        // 完整补齐 Vulkan 与 OpenGL ES 全套云端驱动属性 (vk_devicename / vk_vendorid / vk_deviceid / vk_driverversion)
         if (g_cfg.gl.enabled && g_cfg.build.enabled && !g_cfg.gl.gl_renderer.empty()) {
             bool is_arm = (g_cfg.gl.vulkan_vendor_id == 0x13B5) ||
                           (g_cfg.gl.gl_renderer.find("Mali") != std::string::npos) ||
@@ -259,11 +257,19 @@ private:
                 : "com.qualcomm.qti.gpudrivers.adreno";
 
             g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_devicename"] = g_cfg.gl.gl_renderer;
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_vendorid"] = is_arm ? "5045" : "20803";
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_deviceid"] = is_arm ? "2454716432" : "1124403713";
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_driverversion"] = is_arm ? "205520896" : "2150760448";
+
             g_cfg.build.prop_map["persist.sys.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
             g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
             if (!g_cfg.gl.gl_vendor.empty()) {
                 g_cfg.build.prop_map["persist.sys.gpu.gl_vendor"] = g_cfg.gl.gl_vendor;
                 g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_vendor"] = g_cfg.gl.gl_vendor;
+            }
+            if (!g_cfg.gl.gl_version.empty()) {
+                g_cfg.build.prop_map["persist.sys.gpu.gl_version"] = g_cfg.gl.gl_version;
+                g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_version"] = g_cfg.gl.gl_version;
             }
         }
     }
