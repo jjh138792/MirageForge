@@ -15,9 +15,9 @@ inline std::atomic<int> g_dpi_sync_remaining{0};
 inline std::atomic<bool> g_hidden_api_unlocked{false};
 inline pid_t g_main_tid = 0;
 
+inline void scan_and_commit_plt_hooks();
 inline void maybe_sync_dpi_post_bind() noexcept {}
 
-// 仅在启用按应用 DPI 虚拟化时豁免当前进程的 Hidden API 限制，确保 ResourcesManager / DisplayInfo 隐藏字段可读写
 inline void unlock_hidden_api_for_dpi(JNIEnv *env) {
     if (!env || g_hidden_api_unlocked.load(std::memory_order_acquire)) return;
 
@@ -235,7 +235,6 @@ inline void patch_dm_and_cfg_fields(JNIEnv *env, jobject dm, jobject cfg, int dp
     }
 }
 
-// 覆写单个 DisplayInfo 实例的逻辑密度与物理 xdpi/ydpi
 inline void patch_display_info_obj(JNIEnv *env, jobject dinfo, int dpi) {
     if (!env || !dinfo) return;
     jclass di_cls = env->GetObjectClass(dinfo);
@@ -256,7 +255,6 @@ inline void patch_display_info_obj(JNIEnv *env, jobject dinfo, int dpi) {
     env->DeleteLocalRef(di_cls);
 }
 
-// 覆写 DisplayAdjustments 内部的 Configuration
 inline void patch_display_adjustments_obj(JNIEnv *env, jobject da_obj, int dpi) {
     if (!env || !da_obj) return;
     jclass da_cls = env->GetObjectClass(da_obj);
@@ -277,7 +275,6 @@ inline void patch_display_adjustments_obj(JNIEnv *env, jobject da_obj, int dpi) 
     env->DeleteLocalRef(da_cls);
 }
 
-// 覆写 android.view.Display 实例的 mDisplayInfo 与 mDisplayAdjustments
 inline void patch_display_obj(JNIEnv *env, jobject disp_obj, int dpi) {
     if (!env || !disp_obj) return;
     jclass disp_cls = env->GetObjectClass(disp_obj);
@@ -311,6 +308,7 @@ inline void patch_display_obj(JNIEnv *env, jobject disp_obj, int dpi) {
     env->DeleteLocalRef(disp_cls);
 }
 
+// 同步更新 Resources / ResourcesImpl，并调用 updateConfiguration 刷新底层 C++ AssetManager2 的 densityDpi
 inline void patch_resources_or_impl_obj(JNIEnv *env, jobject obj, int dpi) {
     if (!env || !obj) return;
     jclass cls = env->GetObjectClass(obj);
@@ -368,6 +366,20 @@ inline void patch_resources_or_impl_obj(JNIEnv *env, jobject obj, int dpi) {
 
     patch_dm_and_cfg_fields(env, dm, cfg, dpi);
 
+    // 关键一步：当传入的是 Resources 实例时，调用 updateConfiguration(cfg, dm) 同步更新 C++ AssetManager2！
+    if (impl_fid && cfg && dm) {
+        jmethodID upd_mid = env->GetMethodID(
+            cls, "updateConfiguration",
+            "(Landroid/content/res/Configuration;Landroid/util/DisplayMetrics;)V");
+        if (!env->ExceptionCheck() && upd_mid) {
+            ScopedHookGuard guard;
+            env->CallVoidMethod(obj, upd_mid, cfg, dm);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        } else {
+            env->ExceptionClear();
+        }
+    }
+
     if (dm) env->DeleteLocalRef(dm);
     if (cfg) env->DeleteLocalRef(cfg);
     env->DeleteLocalRef(cls);
@@ -385,21 +397,7 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         return false;
     }
 
-    // 1. 覆写 DisplayMetrics 静态基准值 DENSITY_DEVICE 与 DENSITY_DEVICE_STABLE
-    jclass dm_static_cls = env->FindClass("android/util/DisplayMetrics");
-    if (!env->ExceptionCheck() && dm_static_cls) {
-        jfieldID dev_fid = env->GetStaticFieldID(dm_static_cls, "DENSITY_DEVICE", "I");
-        if (!env->ExceptionCheck() && dev_fid) env->SetStaticIntField(dm_static_cls, dev_fid, dpi);
-        else env->ExceptionClear();
-
-        jfieldID stb_fid = env->GetStaticFieldID(dm_static_cls, "DENSITY_DEVICE_STABLE", "I");
-        if (!env->ExceptionCheck() && stb_fid) env->SetStaticIntField(dm_static_cls, stb_fid, dpi);
-        else env->ExceptionClear();
-    } else {
-        env->ExceptionClear();
-    }
-
-    // 2. 主动调用 DisplayManagerGlobal.getInstance().getDisplayInfo(0) 预热并覆写缓存
+    // 1. 覆写 DisplayManagerGlobal 内部的真实缓存对象（而非 getDisplayInfo 返回的克隆副本！）
     jclass dmg_cls = env->FindClass("android/hardware/display/DisplayManagerGlobal");
     if (!env->ExceptionCheck() && dmg_cls) {
         jmethodID get_inst = env->GetStaticMethodID(
@@ -407,11 +405,23 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         if (!env->ExceptionCheck() && get_inst) {
             jobject dmg_obj = env->CallStaticObjectMethod(dmg_cls, get_inst);
             if (!env->ExceptionCheck() && dmg_obj) {
+                // 1a. 先触发一次 getDisplayInfo(0) 确保内部缓存已填充
                 jmethodID get_di = env->GetMethodID(dmg_cls, "getDisplayInfo", "(I)Landroid/view/DisplayInfo;");
                 if (!env->ExceptionCheck() && get_di) {
-                    jobject di0 = env->CallObjectMethod(dmg_obj, get_di, 0);
-                    if (!env->ExceptionCheck() && di0) {
-                        patch_display_info_obj(env, di0, dpi);
+                    jobject tmp = env->CallObjectMethod(dmg_obj, get_di, 0);
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    if (tmp) env->DeleteLocalRef(tmp);
+                } else {
+                    env->ExceptionClear();
+                }
+
+                // 1b. 直接调用私有方法 getDisplayInfoLocked(0) 拿内部缓存的原始 DisplayInfo 引用并改写！
+                jmethodID get_locked = env->GetMethodID(
+                    dmg_cls, "getDisplayInfoLocked", "(I)Landroid/view/DisplayInfo;");
+                if (!env->ExceptionCheck() && get_locked) {
+                    jobject raw_di = env->CallObjectMethod(dmg_obj, get_locked, 0);
+                    if (!env->ExceptionCheck() && raw_di) {
+                        patch_display_info_obj(env, raw_di, dpi);
                     } else {
                         env->ExceptionClear();
                     }
@@ -419,9 +429,47 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                     env->ExceptionClear();
                 }
 
-                jfieldID cache_fid = env->GetFieldID(dmg_cls, "mDisplayInfoCache", "Landroid/util/SparseArray;");
-                if (!env->ExceptionCheck() && cache_fid) {
-                    jobject sa_obj = env->GetObjectField(dmg_obj, cache_fid);
+                // 1c. 同时穿透 Android 11~16 的 mDisplayCache (PropertyInvalidatedCache<Integer, DisplayInfo>)
+                jfieldID pcache_fid = env->GetFieldID(
+                    dmg_cls, "mDisplayCache", "Landroid/app/PropertyInvalidatedCache;");
+                if (!env->ExceptionCheck() && pcache_fid) {
+                    jobject pcache = env->GetObjectField(dmg_obj, pcache_fid);
+                    if (!env->ExceptionCheck() && pcache) {
+                        jclass pcache_cls = env->GetObjectClass(pcache);
+                        jclass int_cls = env->FindClass("java/lang/Integer");
+                        if (!env->ExceptionCheck() && pcache_cls && int_cls) {
+                            jmethodID val_of = env->GetStaticMethodID(int_cls, "valueOf", "(I)Ljava/lang/Integer;");
+                            jmethodID query_mid = env->GetMethodID(
+                                pcache_cls, "query", "(Ljava/lang/Object;)Ljava/lang/Object;");
+                            if (!env->ExceptionCheck() && val_of && query_mid) {
+                                jobject zero_int = env->CallStaticObjectMethod(int_cls, val_of, 0);
+                                if (!env->ExceptionCheck() && zero_int) {
+                                    jobject cached_di = env->CallObjectMethod(pcache, query_mid, zero_int);
+                                    if (!env->ExceptionCheck() && cached_di) {
+                                        patch_display_info_obj(env, cached_di, dpi);
+                                    } else {
+                                        env->ExceptionClear();
+                                    }
+                                } else {
+                                    env->ExceptionClear();
+                                }
+                            } else {
+                                env->ExceptionClear();
+                            }
+                        } else {
+                            env->ExceptionClear();
+                        }
+                    } else {
+                        env->ExceptionClear();
+                    }
+                } else {
+                    env->ExceptionClear();
+                }
+
+                // 1d. 兼容旧版 mDisplayInfoCache (SparseArray<DisplayInfo>)
+                jfieldID scache_fid = env->GetFieldID(dmg_cls, "mDisplayInfoCache", "Landroid/util/SparseArray;");
+                if (!env->ExceptionCheck() && scache_fid) {
+                    jobject sa_obj = env->GetObjectField(dmg_obj, scache_fid);
                     if (!env->ExceptionCheck() && sa_obj) {
                         jclass sa_cls = env->GetObjectClass(sa_obj);
                         if (!env->ExceptionCheck() && sa_cls) {
@@ -463,7 +511,21 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         env->ExceptionClear();
     }
 
-    // 3. 覆写 Resources.getSystem()
+    // 2. 覆写 DisplayMetrics 静态基准值 DENSITY_DEVICE 与 DENSITY_DEVICE_STABLE
+    jclass dm_static_cls = env->FindClass("android/util/DisplayMetrics");
+    if (!env->ExceptionCheck() && dm_static_cls) {
+        jfieldID dev_fid = env->GetStaticFieldID(dm_static_cls, "DENSITY_DEVICE", "I");
+        if (!env->ExceptionCheck() && dev_fid) env->SetStaticIntField(dm_static_cls, dev_fid, dpi);
+        else env->ExceptionClear();
+
+        jfieldID stb_fid = env->GetStaticFieldID(dm_static_cls, "DENSITY_DEVICE_STABLE", "I");
+        if (!env->ExceptionCheck() && stb_fid) env->SetStaticIntField(dm_static_cls, stb_fid, dpi);
+        else env->ExceptionClear();
+    } else {
+        env->ExceptionClear();
+    }
+
+    // 3. 覆写 Resources.getSystem() (含 updateConfiguration)
     jclass res_cls = env->FindClass("android/content/res/Resources");
     if (!env->ExceptionCheck() && res_cls) {
         jmethodID get_sys = env->GetStaticMethodID(res_cls, "getSystem", "()Landroid/content/res/Resources;");
@@ -481,7 +543,7 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         env->ExceptionClear();
     }
 
-    // 4. 遍历 ResourcesManager.getInstance() 中的 mResConfiguration、mResourceImpls 与 mResourceReferences
+    // 4. 遍历 ResourcesManager.getInstance() 中的全部 Resources 与 ResourcesImpl
     int patched_impl_count = 0;
     jclass rm_cls = env->FindClass("android/app/ResourcesManager");
     if (!env->ExceptionCheck() && rm_cls) {
@@ -504,7 +566,6 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                     : nullptr;
                 env->ExceptionClear();
 
-                // 4a. 遍历 mResourceImpls (ArrayMap<ResourcesKey, WeakReference<ResourcesImpl>>)
                 jfieldID impls_fid = env->GetFieldID(rm_cls, "mResourceImpls", "Landroid/util/ArrayMap;");
                 if (!env->ExceptionCheck() && impls_fid && wref_get) {
                     jobject map_obj = env->GetObjectField(rm_obj, impls_fid);
@@ -550,7 +611,6 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                     env->ExceptionClear();
                 }
 
-                // 4b. 遍历 mResourceReferences (ArrayList<WeakReference<Resources>>)
                 jfieldID refs_fid = env->GetFieldID(rm_cls, "mResourceReferences", "Ljava/util/ArrayList;");
                 if (!env->ExceptionCheck() && refs_fid && wref_get) {
                     jobject list_obj = env->GetObjectField(rm_obj, refs_fid);
@@ -604,7 +664,7 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         env->ExceptionClear();
     }
 
-    // 5. 覆写 ActivityThread 的 Application 与所有活跃 Activity (含 Activity 绑定的 Display 实例)
+    // 5. 覆写 ActivityThread 的 Application 与所有活跃 Activity
     bool app_ready = false;
     jclass at_cls = env->FindClass("android/app/ActivityThread");
     if (!env->ExceptionCheck() && at_cls) {
@@ -646,7 +706,6 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                     env->ExceptionClear();
                 }
 
-                // 遍历 mActivities (ArrayMap<IBinder, ActivityClientRecord>)，覆写每个 Activity 的 Resources 与 Display
                 jfieldID acts_fid = env->GetFieldID(at_cls, "mActivities", "Landroid/util/ArrayMap;");
                 if (!env->ExceptionCheck() && acts_fid) {
                     jobject acts_map = env->GetObjectField(at_obj, acts_fid);
@@ -758,41 +817,49 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
     return app_ready && (patched_impl_count > 0);
 }
 
-// 独立守护线程：高频覆盖 handleBindApplication 与 Activity.onCreate 前后的全部时间窗
-inline void *dpi_guardian_worker(void *) {
-    if (!g_jvm || g_cfg.build.app_dpi < 120 || g_cfg.build.app_dpi > 960) return nullptr;
-
+// 后台同步守护线程：同时负责增量扫描晚加载的 .so (如 libvulkan_info.so) 与锁定 DPI
+inline void *runtime_sync_guardian_worker(void *) {
     JNIEnv *env = nullptr;
-    JavaVMAttachArgs args{JNI_VERSION_1_6, "MirageDpiSync", nullptr};
-    if (g_jvm->AttachCurrentThreadAsDaemon(&env, &args) != JNI_OK || !env) {
-        return nullptr;
+    bool need_dpi = (g_cfg.build.enabled && g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960);
+
+    if (need_dpi && g_jvm) {
+        JavaVMAttachArgs args{JNI_VERSION_1_6, "MirageRuntimeSync", nullptr};
+        if (g_jvm->AttachCurrentThreadAsDaemon(&env, &args) != JNI_OK) {
+            env = nullptr;
+        }
     }
 
     const useconds_t delays_us[] = {
-        3000, 7000, 12000, 20000, 35000, 60000, 100000, 180000, 300000, 500000, 900000, 1500000
+        3000, 8000, 18000, 40000, 80000, 160000, 300000, 600000, 1200000, 2500000
     };
     bool logged = false;
 
     for (useconds_t d : delays_us) {
         usleep(d);
-        if (apply_app_dpi_virtualization(env) && !logged) {
-            logged = true;
-            emit_probe("DPI_SPOOF", "DisplayInfo+ResourcesImpl.densityDpi", std::to_string(g_cfg.build.app_dpi));
+        if (g_cfg.gl.enabled || g_cfg.vfs.enabled || g_cfg.build.enabled) {
+            scan_and_commit_plt_hooks();
+        }
+        if (need_dpi && env) {
+            if (apply_app_dpi_virtualization(env) && !logged) {
+                logged = true;
+                emit_probe("DPI_SPOOF", "DisplayCache+AssetManager.densityDpi", std::to_string(g_cfg.build.app_dpi));
+            }
         }
     }
 
-    g_jvm->DetachCurrentThread();
+    if (env && g_jvm) {
+        g_jvm->DetachCurrentThread();
+    }
     return nullptr;
 }
 
-inline void start_dpi_guardian_after_specialize(JNIEnv *env) {
-    int dpi = g_cfg.build.app_dpi;
-    if (!g_cfg.build.enabled || dpi < 120 || dpi > 960) return;
-
-    apply_app_dpi_virtualization(env);
+inline void start_runtime_guardian_after_specialize(JNIEnv *env) {
+    if (g_cfg.build.enabled && g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
+        apply_app_dpi_virtualization(env);
+    }
 
     pthread_t tid;
-    if (pthread_create(&tid, nullptr, dpi_guardian_worker, nullptr) == 0) {
+    if (pthread_create(&tid, nullptr, runtime_sync_guardian_worker, nullptr) == 0) {
         pthread_detach(tid);
     }
 }
