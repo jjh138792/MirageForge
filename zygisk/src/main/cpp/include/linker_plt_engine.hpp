@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <set>
+#include <tuple>
 #include <mutex>
 #include <dlfcn.h>
 #include <sys/sysmacros.h>
@@ -18,7 +19,8 @@ namespace mirage {
 
 inline zygisk::Api *g_zygisk_api = nullptr;
 inline std::mutex g_maps_mtx;
-inline std::set<std::pair<dev_t, ino_t>> g_hooked_elves;
+// 按可执行段 (start_addr, dev, ino) 去重，解决 extractNativeLibs="false" 下 base.apk 内多个 .so 共享同一 inode 导致漏挂载的 Bug
+inline std::set<std::tuple<uintptr_t, dev_t, ino_t>> g_hooked_exec_segments;
 inline void *g_discard_old_slot = nullptr;
 
 inline void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
@@ -65,11 +67,11 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
         return true;
     }
 
-    // 包含 libnativeloader.so 与 libdl_android.so，确保 Java 层 System.loadLibrary 100% 触发增量 PLT 挂载
     static const char *const kSystemBridgeLibs[] = {
         "libnativeloader.so",
         "libnativeloader_lazy.so",
         "libdl_android.so",
+        "libopenjdkjvm.so",
         "libandroid_runtime.so",
         "libjavacore.so",
         "libopenjdk.so",
@@ -183,7 +185,6 @@ inline bool should_rescan_on_dlopen(const char *filename) noexcept {
 
 inline void *hook_dlopen(const char *filename, int flags) {
     void *handle = orig_dlopen ? orig_dlopen(filename, flags) : nullptr;
-    maybe_sync_dpi_post_bind();
     if (handle && should_rescan_on_dlopen(filename)) {
         ScopedHookGuard guard;
         if (guard) {
@@ -196,7 +197,6 @@ inline void *hook_dlopen(const char *filename, int flags) {
 
 inline void *hook_android_dlopen_ext(const char *filename, int flags, const void *extinfo) {
     void *handle = orig_android_dlopen_ext ? orig_android_dlopen_ext(filename, flags, extinfo) : nullptr;
-    maybe_sync_dpi_post_bind();
     if (handle && should_rescan_on_dlopen(filename)) {
         ScopedHookGuard guard;
         if (guard) {
@@ -218,7 +218,7 @@ inline void scan_and_commit_plt_hooks() {
     }
 
     char line[1024];
-    bool dirty = false;
+    std::set<std::pair<dev_t, ino_t>> to_register;
 
     while (std::fgets(line, sizeof(line), fp)) {
         uintptr_t start = 0, end = 0, offset = 0;
@@ -231,7 +231,8 @@ inline void scan_and_commit_plt_hooks() {
                         &start, &end, perms, &offset, &dev_maj, &dev_min, &inode_ul, &path_pos) < 7) {
             continue;
         }
-        if (inode_ul == 0) continue;
+        // 仅追踪包含可执行权限 ('x') 的代码段映射，确保 base.apk 内后续 dlopen 映射的每个 .so 都能被捕获
+        if (inode_ul == 0 || std::strchr(perms, 'x') == nullptr) continue;
 
         char *path = line + path_pos;
         while (*path == ' ' || *path == '\t') ++path;
@@ -246,11 +247,16 @@ inline void scan_and_commit_plt_hooks() {
 
         dev_t dev = makedev(dev_maj, dev_min);
         ino_t inode = static_cast<ino_t>(inode_ul);
-        auto id_pair = std::make_pair(dev, inode);
-        if (!g_hooked_elves.insert(id_pair).second) {
-            continue;
+        auto seg_key = std::make_tuple(start, dev, inode);
+        if (g_hooked_exec_segments.insert(seg_key).second) {
+            to_register.emplace(dev, inode);
         }
-        dirty = true;
+    }
+    if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
+
+    for (const auto &pair : to_register) {
+        dev_t dev = pair.first;
+        ino_t inode = pair.second;
 
         auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
             void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &g_discard_old_slot;
@@ -315,9 +321,8 @@ inline void scan_and_commit_plt_hooks() {
             reg("AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString));
         }
     }
-    if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
 
-    if (dirty) {
+    if (!to_register.empty()) {
         g_zygisk_api->pltHookCommit();
     }
     g_maps_mtx.unlock();
