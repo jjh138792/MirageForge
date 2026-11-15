@@ -129,12 +129,7 @@ public:
             init_popen_symbol();
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
-            if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
-                g_dpi_sync_remaining.store(3, std::memory_order_release);
-                apply_app_dpi_virtualization(env);
-            }
         }
-        // 严格 0 改动隔离：仅当 VFS 真正启用时才解析文件 I/O 符号与 CPU 频率表
         if (g_cfg.vfs.enabled) {
             init_vfs_symbols();
             init_vfs_clusters_lightweight();
@@ -155,7 +150,7 @@ public:
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
             if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
-                apply_app_dpi_virtualization(env);
+                start_dpi_guardian_after_specialize(env);
             }
             g_cfg.build.wipe_volatile_reflection_maps();
         }
@@ -241,7 +236,6 @@ private:
                 }
                 g_cfg.build.version_map[v_field] = v;
             } else {
-                // 严格 0 改动：未开启 force_spoof_sdk 时，拦截所有分区的 SDK 与 Android 版本属性
                 if (!g_cfg.build.force_spoof_sdk && is_sdk_or_release_prop(k)) {
                     continue;
                 }
@@ -249,7 +243,6 @@ private:
             }
         }
 
-        // 若同时启用了 GL 与 Build 模块，自动填充云端 GPU 属性通道，防止定制 ROM 从属性表读取真实 Vulkan/GLES 设备名
         if (g_cfg.gl.enabled && g_cfg.build.enabled && !g_cfg.gl.gl_renderer.empty()) {
             g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_devicename"] = g_cfg.gl.gl_renderer;
             g_cfg.build.prop_map["persist.sys.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
