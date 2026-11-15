@@ -308,37 +308,15 @@ inline void patch_display_obj(JNIEnv *env, jobject disp_obj, int dpi) {
     env->DeleteLocalRef(disp_cls);
 }
 
-// 同步更新 Resources / ResourcesImpl，并调用 updateConfiguration 刷新底层 C++ AssetManager2 的 densityDpi
+// 核心修复：构造全新的 Configuration(origCfg) 副本并将原 densityDpi 置为 1，
+// 确保 ResourcesImpl.updateConfiguration 100% 识别到 CONFIG_DENSITY 变化并刷新底层 C++ AssetManager2！
 inline void patch_resources_or_impl_obj(JNIEnv *env, jobject obj, int dpi) {
     if (!env || !obj) return;
     jclass cls = env->GetObjectClass(obj);
     if (!cls) { env->ExceptionClear(); return; }
 
     jfieldID impl_fid = env->GetFieldID(cls, "mResourcesImpl", "Landroid/content/res/ResourcesImpl;");
-    if (!env->ExceptionCheck() && impl_fid) {
-        jobject impl_obj = env->GetObjectField(obj, impl_fid);
-        if (!env->ExceptionCheck() && impl_obj) {
-            patch_resources_or_impl_obj(env, impl_obj, dpi);
-            env->DeleteLocalRef(impl_obj);
-        } else {
-            env->ExceptionClear();
-        }
-    } else {
-        env->ExceptionClear();
-    }
-
-    jfieldID da_fid = env->GetFieldID(cls, "mDisplayAdjustments", "Landroid/view/DisplayAdjustments;");
-    if (!env->ExceptionCheck() && da_fid) {
-        jobject da_obj = env->GetObjectField(obj, da_fid);
-        if (!env->ExceptionCheck() && da_obj) {
-            patch_display_adjustments_obj(env, da_obj, dpi);
-            env->DeleteLocalRef(da_obj);
-        } else {
-            env->ExceptionClear();
-        }
-    } else {
-        env->ExceptionClear();
-    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
 
     jobject dm = nullptr;
     jfieldID dm_fid = env->GetFieldID(cls, "mMetrics", "Landroid/util/DisplayMetrics;");
@@ -352,36 +330,105 @@ inline void patch_resources_or_impl_obj(JNIEnv *env, jobject obj, int dpi) {
     }
     if (env->ExceptionCheck()) { env->ExceptionClear(); dm = nullptr; }
 
-    jobject cfg = nullptr;
+    jobject orig_cfg = nullptr;
     jfieldID cfg_fid = env->GetFieldID(cls, "mConfiguration", "Landroid/content/res/Configuration;");
     if (!env->ExceptionCheck() && cfg_fid) {
-        cfg = env->GetObjectField(obj, cfg_fid);
+        orig_cfg = env->GetObjectField(obj, cfg_fid);
     } else {
         env->ExceptionClear();
         jmethodID get_cfg = env->GetMethodID(cls, "getConfiguration", "()Landroid/content/res/Configuration;");
-        if (!env->ExceptionCheck() && get_cfg) cfg = env->CallObjectMethod(obj, get_cfg);
+        if (!env->ExceptionCheck() && get_cfg) orig_cfg = env->CallObjectMethod(obj, get_cfg);
         else env->ExceptionClear();
     }
-    if (env->ExceptionCheck()) { env->ExceptionClear(); cfg = nullptr; }
+    if (env->ExceptionCheck()) { env->ExceptionClear(); orig_cfg = nullptr; }
 
-    patch_dm_and_cfg_fields(env, dm, cfg, dpi);
+    if (orig_cfg && dm) {
+        jclass cfg_cls = env->GetObjectClass(orig_cfg);
+        jmethodID copy_ctor = cfg_cls
+            ? env->GetMethodID(cfg_cls, "<init>", "(Landroid/content/res/Configuration;)V")
+            : nullptr;
+        if (!env->ExceptionCheck() && cfg_cls && copy_ctor) {
+            // 1. 先克隆出一份独立的 new_cfg，设置目标 DPI 与重算后的 dp 宽高
+            jobject new_cfg = env->NewObject(cfg_cls, copy_ctor, orig_cfg);
+            if (!env->ExceptionCheck() && new_cfg) {
+                patch_dm_and_cfg_fields(env, dm, new_cfg, dpi);
 
-    // 关键一步：当传入的是 Resources 实例时，调用 updateConfiguration(cfg, dm) 同步更新 C++ AssetManager2！
-    if (impl_fid && cfg && dm) {
-        jmethodID upd_mid = env->GetMethodID(
-            cls, "updateConfiguration",
-            "(Landroid/content/res/Configuration;Landroid/util/DisplayMetrics;)V");
-        if (!env->ExceptionCheck() && upd_mid) {
-            ScopedHookGuard guard;
-            env->CallVoidMethod(obj, upd_mid, cfg, dm);
-            if (env->ExceptionCheck()) env->ExceptionClear();
+                // 2. 将原 mConfiguration.densityDpi 故意改为 1，迫使 updateFrom(new_cfg) 判定 CONFIG_DENSITY 发生变化！
+                jfieldID dpi_fid = env->GetFieldID(cfg_cls, "densityDpi", "I");
+                if (!env->ExceptionCheck() && dpi_fid) {
+                    int cur_dpi = env->GetIntField(orig_cfg, dpi_fid);
+                    if (cur_dpi != dpi) {
+                        env->SetIntField(orig_cfg, dpi_fid, 1);
+                    }
+                } else {
+                    env->ExceptionClear();
+                }
+
+                // 3. 调用 updateConfiguration(new_cfg, dm) 驱动底层 C++ AssetManager2.setConfiguration 更新密度
+                if (impl_fid) {
+                    jmethodID upd_mid = env->GetMethodID(
+                        cls, "updateConfiguration",
+                        "(Landroid/content/res/Configuration;Landroid/util/DisplayMetrics;)V");
+                    if (!env->ExceptionCheck() && upd_mid) {
+                        ScopedHookGuard guard;
+                        env->CallVoidMethod(obj, upd_mid, new_cfg, dm);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                    } else {
+                        env->ExceptionClear();
+                    }
+                } else {
+                    jmethodID upd_impl_mid = env->GetMethodID(
+                        cls, "updateConfiguration",
+                        "(Landroid/content/res/Configuration;Landroid/util/DisplayMetrics;Landroid/content/res/CompatibilityInfo;)V");
+                    if (!env->ExceptionCheck() && upd_impl_mid) {
+                        ScopedHookGuard guard;
+                        env->CallVoidMethod(obj, upd_impl_mid, new_cfg, dm, nullptr);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                    } else {
+                        env->ExceptionClear();
+                    }
+                }
+
+                // 4. 再次写入确保 mMetrics 与 mConfiguration 最终值精确等于目标 DPI
+                patch_dm_and_cfg_fields(env, dm, orig_cfg, dpi);
+                env->DeleteLocalRef(new_cfg);
+            } else {
+                env->ExceptionClear();
+            }
+        } else {
+            env->ExceptionClear();
+            patch_dm_and_cfg_fields(env, dm, orig_cfg, dpi);
+        }
+        if (cfg_cls) env->DeleteLocalRef(cfg_cls);
+    }
+
+    if (impl_fid) {
+        jobject impl_obj = env->GetObjectField(obj, impl_fid);
+        if (!env->ExceptionCheck() && impl_obj) {
+            jclass impl_cls = env->GetObjectClass(impl_obj);
+            if (impl_cls) {
+                jfieldID da_fid = env->GetFieldID(impl_cls, "mDisplayAdjustments", "Landroid/view/DisplayAdjustments;");
+                if (!env->ExceptionCheck() && da_fid) {
+                    jobject da_obj = env->GetObjectField(impl_obj, da_fid);
+                    if (!env->ExceptionCheck() && da_obj) {
+                        patch_display_adjustments_obj(env, da_obj, dpi);
+                        env->DeleteLocalRef(da_obj);
+                    } else {
+                        env->ExceptionClear();
+                    }
+                } else {
+                    env->ExceptionClear();
+                }
+                env->DeleteLocalRef(impl_cls);
+            }
+            env->DeleteLocalRef(impl_obj);
         } else {
             env->ExceptionClear();
         }
     }
 
     if (dm) env->DeleteLocalRef(dm);
-    if (cfg) env->DeleteLocalRef(cfg);
+    if (orig_cfg) env->DeleteLocalRef(orig_cfg);
     env->DeleteLocalRef(cls);
 }
 
@@ -397,7 +444,34 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         return false;
     }
 
-    // 1. 覆写 DisplayManagerGlobal 内部的真实缓存对象（而非 getDisplayInfo 返回的克隆副本！）
+    // 1. 覆写 Bitmap.sDefaultDensity 与 DisplayMetrics.DENSITY_DEVICE*
+    jclass bmp_cls = env->FindClass("android/graphics/Bitmap");
+    if (!env->ExceptionCheck() && bmp_cls) {
+        jmethodID set_def = env->GetStaticMethodID(bmp_cls, "setDefaultDensity", "(I)V");
+        if (!env->ExceptionCheck() && set_def) {
+            env->CallStaticVoidMethod(bmp_cls, set_def, dpi);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        } else {
+            env->ExceptionClear();
+        }
+    } else {
+        env->ExceptionClear();
+    }
+
+    jclass dm_static_cls = env->FindClass("android/util/DisplayMetrics");
+    if (!env->ExceptionCheck() && dm_static_cls) {
+        jfieldID dev_fid = env->GetStaticFieldID(dm_static_cls, "DENSITY_DEVICE", "I");
+        if (!env->ExceptionCheck() && dev_fid) env->SetStaticIntField(dm_static_cls, dev_fid, dpi);
+        else env->ExceptionClear();
+
+        jfieldID stb_fid = env->GetStaticFieldID(dm_static_cls, "DENSITY_DEVICE_STABLE", "I");
+        if (!env->ExceptionCheck() && stb_fid) env->SetStaticIntField(dm_static_cls, stb_fid, dpi);
+        else env->ExceptionClear();
+    } else {
+        env->ExceptionClear();
+    }
+
+    // 2. 穿透 DisplayManagerGlobal 内部缓存
     jclass dmg_cls = env->FindClass("android/hardware/display/DisplayManagerGlobal");
     if (!env->ExceptionCheck() && dmg_cls) {
         jmethodID get_inst = env->GetStaticMethodID(
@@ -405,7 +479,6 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         if (!env->ExceptionCheck() && get_inst) {
             jobject dmg_obj = env->CallStaticObjectMethod(dmg_cls, get_inst);
             if (!env->ExceptionCheck() && dmg_obj) {
-                // 1a. 先触发一次 getDisplayInfo(0) 确保内部缓存已填充
                 jmethodID get_di = env->GetMethodID(dmg_cls, "getDisplayInfo", "(I)Landroid/view/DisplayInfo;");
                 if (!env->ExceptionCheck() && get_di) {
                     jobject tmp = env->CallObjectMethod(dmg_obj, get_di, 0);
@@ -415,7 +488,6 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                     env->ExceptionClear();
                 }
 
-                // 1b. 直接调用私有方法 getDisplayInfoLocked(0) 拿内部缓存的原始 DisplayInfo 引用并改写！
                 jmethodID get_locked = env->GetMethodID(
                     dmg_cls, "getDisplayInfoLocked", "(I)Landroid/view/DisplayInfo;");
                 if (!env->ExceptionCheck() && get_locked) {
@@ -429,7 +501,6 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                     env->ExceptionClear();
                 }
 
-                // 1c. 同时穿透 Android 11~16 的 mDisplayCache (PropertyInvalidatedCache<Integer, DisplayInfo>)
                 jfieldID pcache_fid = env->GetFieldID(
                     dmg_cls, "mDisplayCache", "Landroid/app/PropertyInvalidatedCache;");
                 if (!env->ExceptionCheck() && pcache_fid) {
@@ -465,42 +536,6 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                 } else {
                     env->ExceptionClear();
                 }
-
-                // 1d. 兼容旧版 mDisplayInfoCache (SparseArray<DisplayInfo>)
-                jfieldID scache_fid = env->GetFieldID(dmg_cls, "mDisplayInfoCache", "Landroid/util/SparseArray;");
-                if (!env->ExceptionCheck() && scache_fid) {
-                    jobject sa_obj = env->GetObjectField(dmg_obj, scache_fid);
-                    if (!env->ExceptionCheck() && sa_obj) {
-                        jclass sa_cls = env->GetObjectClass(sa_obj);
-                        if (!env->ExceptionCheck() && sa_cls) {
-                            jmethodID sz_mid = env->GetMethodID(sa_cls, "size", "()I");
-                            jmethodID val_mid = env->GetMethodID(sa_cls, "valueAt", "(I)Ljava/lang/Object;");
-                            if (!env->ExceptionCheck() && sz_mid && val_mid) {
-                                jint count = env->CallIntMethod(sa_obj, sz_mid);
-                                if (!env->ExceptionCheck() && count > 0 && count < 32) {
-                                    for (jint i = 0; i < count; ++i) {
-                                        jobject dinfo = env->CallObjectMethod(sa_obj, val_mid, i);
-                                        if (!env->ExceptionCheck() && dinfo) {
-                                            patch_display_info_obj(env, dinfo, dpi);
-                                        } else {
-                                            env->ExceptionClear();
-                                        }
-                                    }
-                                } else {
-                                    env->ExceptionClear();
-                                }
-                            } else {
-                                env->ExceptionClear();
-                            }
-                        } else {
-                            env->ExceptionClear();
-                        }
-                    } else {
-                        env->ExceptionClear();
-                    }
-                } else {
-                    env->ExceptionClear();
-                }
             } else {
                 env->ExceptionClear();
             }
@@ -511,21 +546,7 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         env->ExceptionClear();
     }
 
-    // 2. 覆写 DisplayMetrics 静态基准值 DENSITY_DEVICE 与 DENSITY_DEVICE_STABLE
-    jclass dm_static_cls = env->FindClass("android/util/DisplayMetrics");
-    if (!env->ExceptionCheck() && dm_static_cls) {
-        jfieldID dev_fid = env->GetStaticFieldID(dm_static_cls, "DENSITY_DEVICE", "I");
-        if (!env->ExceptionCheck() && dev_fid) env->SetStaticIntField(dm_static_cls, dev_fid, dpi);
-        else env->ExceptionClear();
-
-        jfieldID stb_fid = env->GetStaticFieldID(dm_static_cls, "DENSITY_DEVICE_STABLE", "I");
-        if (!env->ExceptionCheck() && stb_fid) env->SetStaticIntField(dm_static_cls, stb_fid, dpi);
-        else env->ExceptionClear();
-    } else {
-        env->ExceptionClear();
-    }
-
-    // 3. 覆写 Resources.getSystem() (含 updateConfiguration)
+    // 3. 覆写 Resources.getSystem()
     jclass res_cls = env->FindClass("android/content/res/Resources");
     if (!env->ExceptionCheck() && res_cls) {
         jmethodID get_sys = env->GetStaticMethodID(res_cls, "getSystem", "()Landroid/content/res/Resources;");
@@ -543,7 +564,7 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
         env->ExceptionClear();
     }
 
-    // 4. 遍历 ResourcesManager.getInstance() 中的全部 Resources 与 ResourcesImpl
+    // 4. 遍历 ResourcesManager.getInstance() 中的全部 mResourceReferences 与 mResourceImpls
     int patched_impl_count = 0;
     jclass rm_cls = env->FindClass("android/app/ResourcesManager");
     if (!env->ExceptionCheck() && rm_cls) {
@@ -566,26 +587,26 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                     : nullptr;
                 env->ExceptionClear();
 
-                jfieldID impls_fid = env->GetFieldID(rm_cls, "mResourceImpls", "Landroid/util/ArrayMap;");
-                if (!env->ExceptionCheck() && impls_fid && wref_get) {
-                    jobject map_obj = env->GetObjectField(rm_obj, impls_fid);
-                    if (!env->ExceptionCheck() && map_obj) {
-                        jclass map_cls = env->GetObjectClass(map_obj);
-                        if (!env->ExceptionCheck() && map_cls) {
-                            jmethodID sz_mid = env->GetMethodID(map_cls, "size", "()I");
-                            jmethodID val_mid = env->GetMethodID(map_cls, "valueAt", "(I)Ljava/lang/Object;");
-                            if (!env->ExceptionCheck() && sz_mid && val_mid) {
+                jfieldID refs_fid = env->GetFieldID(rm_cls, "mResourceReferences", "Ljava/util/ArrayList;");
+                if (!env->ExceptionCheck() && refs_fid && wref_get) {
+                    jobject list_obj = env->GetObjectField(rm_obj, refs_fid);
+                    if (!env->ExceptionCheck() && list_obj) {
+                        jclass list_cls = env->GetObjectClass(list_obj);
+                        if (!env->ExceptionCheck() && list_cls) {
+                            jmethodID sz_mid = env->GetMethodID(list_cls, "size", "()I");
+                            jmethodID get_mid = env->GetMethodID(list_cls, "get", "(I)Ljava/lang/Object;");
+                            if (!env->ExceptionCheck() && sz_mid && get_mid) {
                                 env->MonitorEnter(rm_obj);
-                                jint count = env->CallIntMethod(map_obj, sz_mid);
+                                jint count = env->CallIntMethod(list_obj, sz_mid);
                                 if (!env->ExceptionCheck() && count > 0 && count < 128) {
                                     for (jint i = 0; i < count; ++i) {
-                                        jobject wref = env->CallObjectMethod(map_obj, val_mid, i);
+                                        jobject wref = env->CallObjectMethod(list_obj, get_mid, i);
                                         if (!env->ExceptionCheck() && wref) {
-                                            jobject impl = env->CallObjectMethod(wref, wref_get);
-                                            if (!env->ExceptionCheck() && impl) {
-                                                patch_resources_or_impl_obj(env, impl, dpi);
+                                            jobject res_item = env->CallObjectMethod(wref, wref_get);
+                                            if (!env->ExceptionCheck() && res_item) {
+                                                patch_resources_or_impl_obj(env, res_item, dpi);
                                                 ++patched_impl_count;
-                                                env->DeleteLocalRef(impl);
+                                                env->DeleteLocalRef(res_item);
                                             } else {
                                                 env->ExceptionClear();
                                             }
@@ -611,25 +632,26 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
                     env->ExceptionClear();
                 }
 
-                jfieldID refs_fid = env->GetFieldID(rm_cls, "mResourceReferences", "Ljava/util/ArrayList;");
-                if (!env->ExceptionCheck() && refs_fid && wref_get) {
-                    jobject list_obj = env->GetObjectField(rm_obj, refs_fid);
-                    if (!env->ExceptionCheck() && list_obj) {
-                        jclass list_cls = env->GetObjectClass(list_obj);
-                        if (!env->ExceptionCheck() && list_cls) {
-                            jmethodID sz_mid = env->GetMethodID(list_cls, "size", "()I");
-                            jmethodID get_mid = env->GetMethodID(list_cls, "get", "(I)Ljava/lang/Object;");
-                            if (!env->ExceptionCheck() && sz_mid && get_mid) {
+                jfieldID impls_fid = env->GetFieldID(rm_cls, "mResourceImpls", "Landroid/util/ArrayMap;");
+                if (!env->ExceptionCheck() && impls_fid && wref_get) {
+                    jobject map_obj = env->GetObjectField(rm_obj, impls_fid);
+                    if (!env->ExceptionCheck() && map_obj) {
+                        jclass map_cls = env->GetObjectClass(map_obj);
+                        if (!env->ExceptionCheck() && map_cls) {
+                            jmethodID sz_mid = env->GetMethodID(map_cls, "size", "()I");
+                            jmethodID val_mid = env->GetMethodID(map_cls, "valueAt", "(I)Ljava/lang/Object;");
+                            if (!env->ExceptionCheck() && sz_mid && val_mid) {
                                 env->MonitorEnter(rm_obj);
-                                jint count = env->CallIntMethod(list_obj, sz_mid);
+                                jint count = env->CallIntMethod(map_obj, sz_mid);
                                 if (!env->ExceptionCheck() && count > 0 && count < 128) {
                                     for (jint i = 0; i < count; ++i) {
-                                        jobject wref = env->CallObjectMethod(list_obj, get_mid, i);
+                                        jobject wref = env->CallObjectMethod(map_obj, val_mid, i);
                                         if (!env->ExceptionCheck() && wref) {
-                                            jobject res_item = env->CallObjectMethod(wref, wref_get);
-                                            if (!env->ExceptionCheck() && res_item) {
-                                                patch_resources_or_impl_obj(env, res_item, dpi);
-                                                env->DeleteLocalRef(res_item);
+                                            jobject impl = env->CallObjectMethod(wref, wref_get);
+                                            if (!env->ExceptionCheck() && impl) {
+                                                patch_resources_or_impl_obj(env, impl, dpi);
+                                                ++patched_impl_count;
+                                                env->DeleteLocalRef(impl);
                                             } else {
                                                 env->ExceptionClear();
                                             }
@@ -817,46 +839,37 @@ inline bool apply_app_dpi_virtualization(JNIEnv *env) {
     return app_ready && (patched_impl_count > 0);
 }
 
-// 后台同步守护线程：同时负责增量扫描晚加载的 .so (如 libvulkan_info.so) 与锁定 DPI
 inline void *runtime_sync_guardian_worker(void *) {
     JNIEnv *env = nullptr;
     bool need_dpi = (g_cfg.build.enabled && g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960);
+    if (!need_dpi || !g_jvm) return nullptr;
 
-    if (need_dpi && g_jvm) {
-        JavaVMAttachArgs args{JNI_VERSION_1_6, "MirageRuntimeSync", nullptr};
-        if (g_jvm->AttachCurrentThreadAsDaemon(&env, &args) != JNI_OK) {
-            env = nullptr;
-        }
+    JavaVMAttachArgs args{JNI_VERSION_1_6, "MirageDpiSync", nullptr};
+    if (g_jvm->AttachCurrentThreadAsDaemon(&env, &args) != JNI_OK || !env) {
+        return nullptr;
     }
 
     const useconds_t delays_us[] = {
-        3000, 8000, 18000, 40000, 80000, 160000, 300000, 600000, 1200000, 2500000
+        2000, 6000, 14000, 30000, 60000, 120000, 250000, 500000, 1000000, 2000000
     };
     bool logged = false;
 
     for (useconds_t d : delays_us) {
         usleep(d);
-        if (g_cfg.gl.enabled || g_cfg.vfs.enabled || g_cfg.build.enabled) {
-            scan_and_commit_plt_hooks();
-        }
-        if (need_dpi && env) {
-            if (apply_app_dpi_virtualization(env) && !logged) {
-                logged = true;
-                emit_probe("DPI_SPOOF", "DisplayCache+AssetManager.densityDpi", std::to_string(g_cfg.build.app_dpi));
-            }
+        if (apply_app_dpi_virtualization(env) && !logged) {
+            logged = true;
+            emit_probe("DPI_SPOOF", "AssetManager2+DisplayCache.densityDpi", std::to_string(g_cfg.build.app_dpi));
         }
     }
 
-    if (env && g_jvm) {
-        g_jvm->DetachCurrentThread();
-    }
+    g_jvm->DetachCurrentThread();
     return nullptr;
 }
 
 inline void start_runtime_guardian_after_specialize(JNIEnv *env) {
-    if (g_cfg.build.enabled && g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
-        apply_app_dpi_virtualization(env);
-    }
+    if (!g_cfg.build.enabled || g_cfg.build.app_dpi < 120 || g_cfg.build.app_dpi > 960) return;
+
+    apply_app_dpi_virtualization(env);
 
     pthread_t tid;
     if (pthread_create(&tid, nullptr, runtime_sync_guardian_worker, nullptr) == 0) {
