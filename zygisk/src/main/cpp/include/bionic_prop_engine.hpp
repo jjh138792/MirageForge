@@ -15,17 +15,15 @@
 
 namespace mirage {
 
-// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构
 struct alignas(4) BionicPropInfoCompat {
     uint32_t serial;              // 偏移 0..3
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
     char name[1];                 // 偏移 96..N
 };
 
-// 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 锁定为 r--p 只读状态
 class ReadOnlyMmapPropArena {
 public:
-    static constexpr size_t kArenaSize = 65536; // 64KB 足够容纳 400+ 条属性
+    static constexpr size_t kArenaSize = 65536;
 
     void ensure_mapped() {
         if (arena_base_) return;
@@ -119,6 +117,7 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
+// 严格 0 改动：仅将 .conf 中显式编译下发的 prop_map 写入只读属性池，不硬编码塞入任何未声明属性
 inline void freeze_bionic_prop_arena() {
     if (!g_cfg.build.enabled) return;
 
@@ -129,28 +128,6 @@ inline void freeze_bionic_prop_arena() {
         g_cfg.build.prop_map["persist.sys.dpi"] = dpi_s;
         g_cfg.build.prop_map["ro.vendor.display.default_dpi"] = dpi_s;
     }
-
-    auto set_default_restricted = [&](const char *k, const char *v) {
-        if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
-            g_cfg.build.prop_map[k] = v;
-        }
-    };
-    set_default_restricted("ro.boot.vbmeta.device_state", "locked");
-    set_default_restricted("ro.boot.vbmeta.avb_version", "1.2");
-    set_default_restricted("ro.boot.vbmeta.hash_alg", "sha256");
-    set_default_restricted("ro.boot.verifiedbootstate", "green");
-    set_default_restricted("ro.boot.veritymode", "enforcing");
-    set_default_restricted("ro.boot.flash.locked", "1");
-    set_default_restricted("ro.boot.warranty_bit", "0");
-    set_default_restricted("ro.warranty_bit", "0");
-    set_default_restricted("ro.build.selinux", "1");
-    set_default_restricted("ro.debuggable", "0");
-    set_default_restricted("ro.secure", "1");
-    set_default_restricted("ro.adb.secure", "1");
-    set_default_restricted("sys.oem_unlock_allowed", "0");
-    set_default_restricted("sys.usb.state", "none");
-    set_default_restricted("sys.usb.config", "none");
-    set_default_restricted("init.svc.adbd", "stopped");
 
     for (const auto &kv : g_cfg.build.prop_map) {
         g_prop_arena.insert_before_freeze(kv.first, kv.second);
