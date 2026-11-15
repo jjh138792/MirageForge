@@ -25,6 +25,9 @@ constexpr uint32_t VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256U;
 constexpr uint32_t VK_UUID_SIZE = 16U;
 constexpr uint32_t VK_MAX_DRIVER_NAME_SIZE = 256U;
 constexpr uint32_t VK_MAX_DRIVER_INFO_SIZE = 256U;
+
+// Vulkan 驱动属性扩展 sType 常量 (涵盖 VK_KHR_driver_properties 与 Vulkan 1.2 核心属性)
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES = 52U;
 constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000U;
 
 struct VkBaseOutStructureCompat {
@@ -32,6 +35,7 @@ struct VkBaseOutStructureCompat {
     VkBaseOutStructureCompat *pNext;
 };
 
+// VkPhysicalDeviceDriverProperties 与 VkPhysicalDeviceVulkan12Properties 的前 5 个字段内存布局完全一致
 struct VkPhysicalDeviceDriverPropertiesCompat {
     uint32_t sType;
     void *pNext;
@@ -59,6 +63,7 @@ struct VkPhysicalDeviceProperties2Compat {
 
 using PFN_vkVoidFunction = void (*)(void);
 using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction (*)(void *instance, const char *pName);
+using PFN_vkGetDeviceProcAddr = PFN_vkVoidFunction (*)(void *device, const char *pName);
 using PFN_vkGetPhysicalDeviceProperties = void (*)(void *physicalDevice, VkPhysicalDevicePropertiesCompat *pProperties);
 using PFN_vkGetPhysicalDeviceProperties2 = void (*)(void *physicalDevice, VkPhysicalDeviceProperties2Compat *pProperties);
 
@@ -73,7 +78,6 @@ inline PFN_vkGetPhysicalDeviceProperties orig_vkGetPhysicalDeviceProperties = nu
 inline PFN_vkGetPhysicalDeviceProperties2 orig_vkGetPhysicalDeviceProperties2 = nullptr;
 inline PFN_AMediaDrm_getPropertyString orig_AMediaDrm_getPropertyString = nullptr;
 
-// 主动加载并解析 OpenGL ES、Vulkan 与 MediaDrm 全部底层符号，确保直连 PLT 调用时 orig_vk* 绝不为空
 inline void init_graphics_symbols() {
     if (!orig_glGetString) {
         orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(dlsym(RTLD_DEFAULT, "glGetString"));
@@ -110,7 +114,6 @@ inline void init_graphics_symbols() {
 }
 
 inline const GLubyte *hook_glGetString(GLenum name) {
-    maybe_sync_dpi_post_bind();
     if (g_cfg.gl.enabled) {
         switch (name) {
             case GL_VENDOR:
@@ -157,28 +160,42 @@ inline __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const cha
 
 inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props, void *pNext = nullptr) {
     if (!props || !g_cfg.gl.enabled) return;
+
+    bool is_arm = (g_cfg.gl.vulkan_vendor_id == 0x13B5) ||
+                  (g_cfg.gl.gl_vendor.find("ARM") != std::string::npos) ||
+                  (g_cfg.gl.gl_renderer.find("Mali") != std::string::npos) ||
+                  (g_cfg.gl.gl_renderer.find("Immortalis") != std::string::npos);
+
     if (!g_cfg.gl.gl_renderer.empty()) {
         std::strncpy(props->deviceName, g_cfg.gl.gl_renderer.c_str(), VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
         props->deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1] = '\0';
     }
-    if (g_cfg.gl.vulkan_vendor_id != 0) {
-        props->vendorID = g_cfg.gl.vulkan_vendor_id;
-    }
-    if (g_cfg.gl.vulkan_device_id != 0) {
-        props->deviceID = g_cfg.gl.vulkan_device_id;
-    }
 
-    // 同步清洗 pNext 扩展链中的 VkPhysicalDeviceDriverProperties (防止暴露 Mali / PowerVR 原始驱动名)
+    props->vendorID = is_arm ? 0x13B5U : 0x5143U;
+    props->deviceID = is_arm ? 0x92500010U : 0x43050A01U;
+    props->driverVersion = is_arm ? ((49U << 22) | (0U << 12)) : ((512U << 22) | (800U << 12));
+
+    // 遍历 pNext 链表：同时覆盖 VkPhysicalDeviceDriverProperties (1000196000) 与 VkPhysicalDeviceVulkan12Properties (52)
     auto *curr = static_cast<VkBaseOutStructureCompat *>(pNext);
     int depth = 0;
-    while (curr && depth++ < 16) {
-        if (curr->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES && !g_cfg.gl.gl_vendor.empty()) {
+    while (curr && depth++ < 24) {
+        if (curr->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES ||
+            curr->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES) {
             auto *drv = reinterpret_cast<VkPhysicalDeviceDriverPropertiesCompat *>(curr);
-            bool is_arm = (g_cfg.gl.vulkan_vendor_id == 0x13B5);
-            drv->driverID = is_arm ? 10U : 2U; // 10: ARM Proprietary, 2: Qualcomm Proprietary
-            const char *drv_name = is_arm ? "Arm Proprietary" : "Qualcomm Technologies Inc. Adreno Vulkan Driver";
+            drv->driverID = is_arm ? 10U : 2U; // 10: VK_DRIVER_ID_ARM_PROPRIETARY, 2: VK_DRIVER_ID_QUALCOMM_PROPRIETARY
+
+            const char *drv_name = is_arm
+                ? "Arm Proprietary"
+                : "Qualcomm Technologies Inc. Adreno Vulkan Driver";
+            const char *drv_info = is_arm
+                ? "v1.r49p0-01eac0.c98b5e361bf988b3714d3d9a835a1d5e"
+                : "Build Date: 11/15/24, Shader Compiler Version: E031.47.12.08";
+
             std::strncpy(drv->driverName, drv_name, VK_MAX_DRIVER_NAME_SIZE - 1);
             drv->driverName[VK_MAX_DRIVER_NAME_SIZE - 1] = '\0';
+
+            std::strncpy(drv->driverInfo, drv_info, VK_MAX_DRIVER_INFO_SIZE - 1);
+            drv->driverInfo[VK_MAX_DRIVER_INFO_SIZE - 1] = '\0';
         }
         curr = curr->pNext;
     }
