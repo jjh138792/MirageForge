@@ -1,5 +1,12 @@
 use crate::models::{AppRoute, DeviceTemplate};
 
+fn is_sdk_or_release_key(k: &str) -> bool {
+    k.contains("build.version.sdk")
+        || k.contains("build.version.release")
+        || k.contains("first_api_level")
+        || k == "ro.board.api_level"
+}
+
 pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(128);
 
@@ -9,11 +16,9 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         }
     };
 
-    // 计算生效的 DPI：优先使用应用路由单独指定的 DPI，其次使用模板自带的 DEFAULT_DPI
+    // 严格 0 改动：仅当用户为该应用明确指定了独立 DPI (120..=960) 时才启用 DPI 虚拟化
     let effective_dpi = if (120..=960).contains(&route.dpi) {
         route.dpi
-    } else if (120..=960).contains(&tpl.default_dpi) {
-        tpl.default_dpi
     } else {
         0
     };
@@ -55,7 +60,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "VFS:KERNEL_VERSION", &tpl.kernel_version);
     }
 
-    // 4. Build 反射、全分区属性与 SELinux 受限属性区模块 (仅在开启 Build 开关时输出)
+    // 4. Build 反射与系统属性池模块 (仅在开启 Build 开关时输出)
     if route.build {
         let abis = if tpl.supported_abis.is_empty() {
             "arm64-v8a,armeabi-v7a,armeabi"
@@ -63,9 +68,6 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             &tpl.supported_abis
         };
         let build_utc = tpl.build_time.parse::<i64>().unwrap_or(1736899200000) / 1000;
-        let ram_str = format!("{}GB", ram_gb);
-        let ram_mb_str = (ram_gb * 1024).to_string();
-        let ddr_full = format!("{},{},{}", ram_str, ddr_vendor, ddr_type);
 
         let display_id = if !tpl.display_id.is_empty() {
             &tpl.display_id
@@ -88,7 +90,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             "builder"
         };
 
-        // Java android.os.Build 反射字段 (含 BOARD, SOC_MODEL, DISPLAY, HOST, USER)
+        // Java android.os.Build 反射字段
         push_kv(&mut lines, "BUILD:MODEL", &tpl.model);
         push_kv(&mut lines, "BUILD:BRAND", &tpl.brand);
         push_kv(&mut lines, "BUILD:MANUFACTURER", &tpl.manufacturer);
@@ -111,7 +113,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "BUILD:TYPE", "user");
         push_kv(&mut lines, "BUILD:TIME", &tpl.build_time);
 
-        // Java android.os.Build$VERSION 反射字段 (含 INCREMENTAL, SECURITY_PATCH)
+        // Java android.os.Build$VERSION 反射字段
         push_kv(&mut lines, "VERSION:INCREMENTAL", incremental);
         push_kv(&mut lines, "VERSION:SECURITY_PATCH", &tpl.security_patch);
         push_kv(&mut lines, "VERSION:CODENAME", "REL");
@@ -122,7 +124,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             push_kv(&mut lines, "VERSION:DEVICE_INITIAL_SDK_INT", &tpl.sdk_int);
         }
 
-        // Bionic SystemProperties 全分区覆盖 (system / vendor / odm / product / system_ext)
+        // Bionic SystemProperties 全分区覆盖
         for part in &["", "system.", "vendor.", "odm.", "product.", "system_ext."] {
             push_kv(&mut lines, &format!("ro.product.{}model", part), &tpl.model);
             push_kv(&mut lines, &format!("ro.product.{}brand", part), &tpl.brand);
@@ -146,6 +148,8 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "ro.boot.bootloader", &tpl.bootloader);
         push_kv(&mut lines, "ro.soc.manufacturer", &tpl.soc_manufacturer);
         push_kv(&mut lines, "ro.soc.model", &tpl.soc_model);
+        push_kv(&mut lines, "ro.boot.hardware.sku", &tpl.device);
+        push_kv(&mut lines, "ro.boot.product.hardware.sku", &tpl.device);
         push_kv(&mut lines, "ro.product.cpu.abi", "arm64-v8a");
         push_kv(&mut lines, "ro.product.cpu.abilist", abis);
         push_kv(&mut lines, "ro.product.cpu.abilist64", "arm64-v8a");
@@ -158,39 +162,36 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "ro.build.tags", "release-keys");
         push_kv(&mut lines, "ro.build.type", "user");
 
-        // SELinux app 域不可读/受限属性区虚拟化 (通过 ReadOnlyMmapPropArena 暴露为合法只读属性)
-        push_kv(&mut lines, "ro.boot.vbmeta.device_state", "locked");
-        push_kv(&mut lines, "ro.boot.vbmeta.avb_version", "1.2");
-        push_kv(&mut lines, "ro.boot.vbmeta.hash_alg", "sha256");
-        push_kv(&mut lines, "ro.boot.verifiedbootstate", "green");
-        push_kv(&mut lines, "ro.boot.flash.locked", "1");
-        push_kv(&mut lines, "ro.boot.veritymode", "enforcing");
-        push_kv(&mut lines, "ro.boot.warranty_bit", "0");
-        push_kv(&mut lines, "ro.warranty_bit", "0");
-        push_kv(&mut lines, "ro.build.selinux", "1");
-        push_kv(&mut lines, "ro.debuggable", "0");
-        push_kv(&mut lines, "ro.secure", "1");
-        push_kv(&mut lines, "ro.adb.secure", "1");
-        push_kv(&mut lines, "sys.oem_unlock_allowed", "0");
-        push_kv(&mut lines, "sys.usb.state", "none");
-        push_kv(&mut lines, "sys.usb.config", "none");
-        push_kv(&mut lines, "init.svc.adbd", "stopped");
-        push_kv(&mut lines, "ro.boot.hardware.sku", &tpl.device);
-        push_kv(&mut lines, "ro.boot.product.hardware.sku", &tpl.device);
+        // 仅当同时启用了 VFS (内存/CPU虚拟化) 时，才注入物理 DDR 内存属性
+        if route.vfs {
+            let ram_str = format!("{}GB", ram_gb);
+            let ram_mb_str = (ram_gb * 1024).to_string();
+            let ddr_full = format!("{},{},{}", ram_str, ddr_vendor, ddr_type);
 
-        // 物理 DDR 对称属性池
-        push_kv(&mut lines, "ro.boot.hardware.ddr", &ddr_full);
-        push_kv(&mut lines, "ro.boot.ddr_size", &ram_str);
-        push_kv(&mut lines, "ro.boot.ddr_type", ddr_type);
-        push_kv(&mut lines, "ro.boot.ddr_info", &ddr_full);
-        push_kv(&mut lines, "ro.boot.ramsize", &ram_str);
-        push_kv(&mut lines, "ro.boot.memsize", &ram_str);
-        push_kv(&mut lines, "ro.hardware.ddr", &ddr_full);
-        push_kv(&mut lines, "ro.vendor.hw.ram", &ram_str);
-        push_kv(&mut lines, "ro.product.ram", &ram_str);
-        push_kv(&mut lines, "ro.config.ram_size", &ram_mb_str);
-        push_kv(&mut lines, "ro.sys.ram_size", &ram_str);
-        push_kv(&mut lines, "persist.sys.ram_size", &ram_str);
+            push_kv(&mut lines, "ro.boot.hardware.ddr", &ddr_full);
+            push_kv(&mut lines, "ro.boot.ddr_size", &ram_str);
+            push_kv(&mut lines, "ro.boot.ddr_type", ddr_type);
+            push_kv(&mut lines, "ro.boot.ddr_info", &ddr_full);
+            push_kv(&mut lines, "ro.boot.ramsize", &ram_str);
+            push_kv(&mut lines, "ro.boot.memsize", &ram_str);
+            push_kv(&mut lines, "ro.hardware.ddr", &ddr_full);
+            push_kv(&mut lines, "ro.vendor.hw.ram", &ram_str);
+            push_kv(&mut lines, "ro.product.ram", &ram_str);
+            push_kv(&mut lines, "ro.config.ram_size", &ram_mb_str);
+            push_kv(&mut lines, "ro.sys.ram_size", &ram_str);
+            push_kv(&mut lines, "persist.sys.ram_size", &ram_str);
+        }
+
+        // 仅当同时启用了 GL 图形伪装时，才注入云端 GPU 属性通道
+        if route.gl && !tpl.gl_renderer.is_empty() {
+            push_kv(&mut lines, "persist.sys.cloud.gpu.vk_devicename", &tpl.gl_renderer);
+            push_kv(&mut lines, "persist.sys.gpu.gl_renderer", &tpl.gl_renderer);
+            push_kv(&mut lines, "persist.sys.cloud.gpu.gl_renderer", &tpl.gl_renderer);
+            if !tpl.gl_vendor.is_empty() {
+                push_kv(&mut lines, "persist.sys.gpu.gl_vendor", &tpl.gl_vendor);
+                push_kv(&mut lines, "persist.sys.cloud.gpu.gl_vendor", &tpl.gl_vendor);
+            }
+        }
 
         if effective_dpi > 0 {
             let dpi_s = effective_dpi.to_string();
@@ -201,16 +202,26 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         }
 
         if route.sdk_spoof {
-            push_kv(&mut lines, "ro.build.version.release", &tpl.release);
-            push_kv(&mut lines, "ro.build.version.sdk", &tpl.sdk_int);
+            for part in &["", "system.", "vendor.", "odm.", "product.", "system_ext."] {
+                push_kv(&mut lines, &format!("ro.{}build.version.release", part), &tpl.release);
+                push_kv(&mut lines, &format!("ro.{}build.version.sdk", part), &tpl.sdk_int);
+            }
             push_kv(&mut lines, "ro.product.build.version.sdk", &tpl.sdk_int);
-            push_kv(&mut lines, "ro.system.build.version.sdk", &tpl.sdk_int);
         }
 
+        // 附加自定义属性（未开启 sdk_spoof 时严格剔除任何 SDK / Release 属性）
         for raw in tpl.custom_props.lines() {
             let tr = raw.trim();
-            if !tr.is_empty() && !tr.starts_with('#') && tr.contains('=') {
-                lines.push(tr.to_string());
+            if tr.is_empty() || tr.starts_with('#') {
+                continue;
+            }
+            if let Some(eq) = tr.find('=') {
+                let k = tr[..eq].trim();
+                let v = tr[eq + 1..].trim();
+                if !route.sdk_spoof && is_sdk_or_release_key(k) {
+                    continue;
+                }
+                push_kv(&mut lines, k, v);
             }
         }
     }
