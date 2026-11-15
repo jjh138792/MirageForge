@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
+#include "jvm_art_engine.hpp"
 
 #ifndef GL_VENDOR
 #define GL_VENDOR                   0x1F00
@@ -22,6 +23,23 @@ using __eglMustCastToProperFunctionPointerType = void (*)(void);
 
 constexpr uint32_t VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256U;
 constexpr uint32_t VK_UUID_SIZE = 16U;
+constexpr uint32_t VK_MAX_DRIVER_NAME_SIZE = 256U;
+constexpr uint32_t VK_MAX_DRIVER_INFO_SIZE = 256U;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000U;
+
+struct VkBaseOutStructureCompat {
+    uint32_t sType;
+    VkBaseOutStructureCompat *pNext;
+};
+
+struct VkPhysicalDeviceDriverPropertiesCompat {
+    uint32_t sType;
+    void *pNext;
+    uint32_t driverID;
+    char driverName[VK_MAX_DRIVER_NAME_SIZE];
+    char driverInfo[VK_MAX_DRIVER_INFO_SIZE];
+    uint32_t conformanceVersion;
+};
 
 struct VkPhysicalDevicePropertiesCompat {
     uint32_t apiVersion;
@@ -55,16 +73,44 @@ inline PFN_vkGetPhysicalDeviceProperties orig_vkGetPhysicalDeviceProperties = nu
 inline PFN_vkGetPhysicalDeviceProperties2 orig_vkGetPhysicalDeviceProperties2 = nullptr;
 inline PFN_AMediaDrm_getPropertyString orig_AMediaDrm_getPropertyString = nullptr;
 
-// 仅在启用 GL/Vulkan 模块时按需解析图形符号
+// 主动加载并解析 OpenGL ES、Vulkan 与 MediaDrm 全部底层符号，确保直连 PLT 调用时 orig_vk* 绝不为空
 inline void init_graphics_symbols() {
-    if (orig_glGetString) return;
-    orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(dlsym(RTLD_DEFAULT, "glGetString"));
-    orig_eglGetProcAddress = reinterpret_cast<decltype(orig_eglGetProcAddress)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
-    orig_vkGetInstanceProcAddr = reinterpret_cast<decltype(orig_vkGetInstanceProcAddr)>(dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr"));
-    orig_AMediaDrm_getPropertyString = reinterpret_cast<decltype(orig_AMediaDrm_getPropertyString)>(dlsym(RTLD_DEFAULT, "AMediaDrm_getPropertyString"));
+    if (!orig_glGetString) {
+        orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(dlsym(RTLD_DEFAULT, "glGetString"));
+    }
+    if (!orig_eglGetProcAddress) {
+        orig_eglGetProcAddress = reinterpret_cast<decltype(orig_eglGetProcAddress)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
+    }
+    if (!orig_AMediaDrm_getPropertyString) {
+        orig_AMediaDrm_getPropertyString = reinterpret_cast<decltype(orig_AMediaDrm_getPropertyString)>(
+            dlsym(RTLD_DEFAULT, "AMediaDrm_getPropertyString"));
+    }
+
+    void *vk_handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    auto resolve_vk = [&](const char *sym) -> void * {
+        void *p = vk_handle ? dlsym(vk_handle, sym) : nullptr;
+        return p ? p : dlsym(RTLD_DEFAULT, sym);
+    };
+
+    if (!orig_vkGetInstanceProcAddr) {
+        orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(resolve_vk("vkGetInstanceProcAddr"));
+    }
+    if (!orig_vkGetPhysicalDeviceProperties) {
+        orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            resolve_vk("vkGetPhysicalDeviceProperties"));
+    }
+    if (!orig_vkGetPhysicalDeviceProperties2) {
+        orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            resolve_vk("vkGetPhysicalDeviceProperties2"));
+        if (!orig_vkGetPhysicalDeviceProperties2) {
+            orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                resolve_vk("vkGetPhysicalDeviceProperties2KHR"));
+        }
+    }
 }
 
 inline const GLubyte *hook_glGetString(GLenum name) {
+    maybe_sync_dpi_post_bind();
     if (g_cfg.gl.enabled) {
         switch (name) {
             case GL_VENDOR:
@@ -109,7 +155,7 @@ inline __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const cha
     return orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
 }
 
-inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
+inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props, void *pNext = nullptr) {
     if (!props || !g_cfg.gl.enabled) return;
     if (!g_cfg.gl.gl_renderer.empty()) {
         std::strncpy(props->deviceName, g_cfg.gl.gl_renderer.c_str(), VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
@@ -121,27 +167,52 @@ inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
     if (g_cfg.gl.vulkan_device_id != 0) {
         props->deviceID = g_cfg.gl.vulkan_device_id;
     }
+
+    // 同步清洗 pNext 扩展链中的 VkPhysicalDeviceDriverProperties (防止暴露 Mali / PowerVR 原始驱动名)
+    auto *curr = static_cast<VkBaseOutStructureCompat *>(pNext);
+    int depth = 0;
+    while (curr && depth++ < 16) {
+        if (curr->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES && !g_cfg.gl.gl_vendor.empty()) {
+            auto *drv = reinterpret_cast<VkPhysicalDeviceDriverPropertiesCompat *>(curr);
+            bool is_arm = (g_cfg.gl.vulkan_vendor_id == 0x13B5);
+            drv->driverID = is_arm ? 10U : 2U; // 10: ARM Proprietary, 2: Qualcomm Proprietary
+            const char *drv_name = is_arm ? "Arm Proprietary" : "Qualcomm Technologies Inc. Adreno Vulkan Driver";
+            std::strncpy(drv->driverName, drv_name, VK_MAX_DRIVER_NAME_SIZE - 1);
+            drv->driverName[VK_MAX_DRIVER_NAME_SIZE - 1] = '\0';
+        }
+        curr = curr->pNext;
+    }
+
     ScopedHookGuard guard;
     if (guard) emit_probe("VULKAN", "VkPhysicalDeviceProperties.deviceName", props->deviceName);
 }
 
 inline void hook_vkGetPhysicalDeviceProperties(void *physicalDevice, VkPhysicalDevicePropertiesCompat *pProperties) {
+    if (!orig_vkGetPhysicalDeviceProperties) {
+        init_graphics_symbols();
+    }
     if (orig_vkGetPhysicalDeviceProperties) {
         orig_vkGetPhysicalDeviceProperties(physicalDevice, pProperties);
-        spoof_vulkan_props_struct(pProperties);
+        spoof_vulkan_props_struct(pProperties, nullptr);
     }
 }
 
 inline void hook_vkGetPhysicalDeviceProperties2(void *physicalDevice, VkPhysicalDeviceProperties2Compat *pProperties) {
+    if (!orig_vkGetPhysicalDeviceProperties2) {
+        init_graphics_symbols();
+    }
     if (orig_vkGetPhysicalDeviceProperties2) {
         orig_vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
         if (pProperties) {
-            spoof_vulkan_props_struct(&pProperties->properties);
+            spoof_vulkan_props_struct(&pProperties->properties, pProperties->pNext);
         }
     }
 }
 
 inline PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void *instance, const char *pName) {
+    if (!orig_vkGetInstanceProcAddr) {
+        init_graphics_symbols();
+    }
     PFN_vkVoidFunction real_fn = orig_vkGetInstanceProcAddr ? orig_vkGetInstanceProcAddr(instance, pName) : nullptr;
     if (!real_fn || !pName || !g_cfg.gl.enabled) return real_fn;
 
@@ -153,6 +224,10 @@ inline PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void *instance, const char 
         std::strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
         orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_fn);
         return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties2);
+    }
+    if (std::strcmp(pName, "vkGetInstanceProcAddr") == 0) {
+        orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_fn);
+        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetInstanceProcAddr);
     }
     return real_fn;
 }
