@@ -7,6 +7,7 @@
 #include <sys/system_properties.h>
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
+#include "jvm_art_engine.hpp"
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
@@ -147,6 +148,9 @@ inline bool is_interesting_unmapped_prop(const char *name) noexcept {
 }
 
 inline const prop_info *hook_system_property_find(const char *name) {
+    if (__builtin_expect(g_dpi_sync_remaining.load(std::memory_order_relaxed) > 0, 0)) {
+        maybe_sync_dpi_post_bind();
+    }
     if (name) {
         if (g_cfg.build.enabled) {
             const std::string *syn_val = nullptr;
