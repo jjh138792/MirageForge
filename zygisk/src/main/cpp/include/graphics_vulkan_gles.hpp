@@ -55,13 +55,51 @@ inline PFN_vkGetPhysicalDeviceProperties orig_vkGetPhysicalDeviceProperties = nu
 inline PFN_vkGetPhysicalDeviceProperties2 orig_vkGetPhysicalDeviceProperties2 = nullptr;
 inline PFN_AMediaDrm_getPropertyString orig_AMediaDrm_getPropertyString = nullptr;
 
-// 仅在启用 GL/Vulkan 模块时按需解析图形符号
+// 供 linker_plt_engine.hpp 共享的原版 dlsym 声明，避免循环拦截
+inline void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
+
+inline void *raw_dlsym_lookup(void *handle, const char *sym) noexcept {
+    return orig_dlsym ? orig_dlsym(handle, sym) : dlsym(handle, sym);
+}
+
+// 懒加载补齐 Vulkan 真实函数指针（解决 preAppSpecialize 时 libvulkan.so 尚未加载的问题）
+inline void ensure_vulkan_symbols_loaded() noexcept {
+    if (!orig_vkGetInstanceProcAddr) {
+        orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "vkGetInstanceProcAddr"));
+    }
+    if (!orig_vkGetPhysicalDeviceProperties) {
+        orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "vkGetPhysicalDeviceProperties"));
+    }
+    if (!orig_vkGetPhysicalDeviceProperties2) {
+        orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "vkGetPhysicalDeviceProperties2"));
+    }
+    if (!orig_vkGetPhysicalDeviceProperties && orig_vkGetInstanceProcAddr) {
+        orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            orig_vkGetInstanceProcAddr(nullptr, "vkGetPhysicalDeviceProperties"));
+    }
+    if (!orig_vkGetPhysicalDeviceProperties2 && orig_vkGetInstanceProcAddr) {
+        orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            orig_vkGetInstanceProcAddr(nullptr, "vkGetPhysicalDeviceProperties2"));
+    }
+}
+
 inline void init_graphics_symbols() {
-    if (orig_glGetString) return;
-    orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(dlsym(RTLD_DEFAULT, "glGetString"));
-    orig_eglGetProcAddress = reinterpret_cast<decltype(orig_eglGetProcAddress)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
-    orig_vkGetInstanceProcAddr = reinterpret_cast<decltype(orig_vkGetInstanceProcAddr)>(dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr"));
-    orig_AMediaDrm_getPropertyString = reinterpret_cast<decltype(orig_AMediaDrm_getPropertyString)>(dlsym(RTLD_DEFAULT, "AMediaDrm_getPropertyString"));
+    if (!orig_glGetString) {
+        orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "glGetString"));
+    }
+    if (!orig_eglGetProcAddress) {
+        orig_eglGetProcAddress = reinterpret_cast<decltype(orig_eglGetProcAddress)>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "eglGetProcAddress"));
+    }
+    if (!orig_AMediaDrm_getPropertyString) {
+        orig_AMediaDrm_getPropertyString = reinterpret_cast<decltype(orig_AMediaDrm_getPropertyString)>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "AMediaDrm_getPropertyString"));
+    }
+    ensure_vulkan_symbols_loaded();
 }
 
 inline const GLubyte *hook_glGetString(GLenum name) {
@@ -97,16 +135,29 @@ inline const GLubyte *hook_glGetString(GLenum name) {
                 break;
         }
     }
+    if (!orig_glGetString) {
+        orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "glGetString"));
+    }
     return orig_glGetString ? orig_glGetString(name) : nullptr;
 }
 
 inline __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const char *procname) {
+    if (!orig_eglGetProcAddress) {
+        orig_eglGetProcAddress = reinterpret_cast<decltype(orig_eglGetProcAddress)>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "eglGetProcAddress"));
+    }
+    __eglMustCastToProperFunctionPointerType real_fn =
+        orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
     if (procname && g_cfg.gl.enabled) {
         if (std::strcmp(procname, "glGetString") == 0) {
+            if (!orig_glGetString && real_fn) {
+                orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(real_fn);
+            }
             return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(hook_glGetString);
         }
     }
-    return orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
+    return real_fn;
 }
 
 inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
@@ -126,6 +177,9 @@ inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
 }
 
 inline void hook_vkGetPhysicalDeviceProperties(void *physicalDevice, VkPhysicalDevicePropertiesCompat *pProperties) {
+    if (!orig_vkGetPhysicalDeviceProperties) {
+        ensure_vulkan_symbols_loaded();
+    }
     if (orig_vkGetPhysicalDeviceProperties) {
         orig_vkGetPhysicalDeviceProperties(physicalDevice, pProperties);
         spoof_vulkan_props_struct(pProperties);
@@ -133,31 +187,51 @@ inline void hook_vkGetPhysicalDeviceProperties(void *physicalDevice, VkPhysicalD
 }
 
 inline void hook_vkGetPhysicalDeviceProperties2(void *physicalDevice, VkPhysicalDeviceProperties2Compat *pProperties) {
+    if (!orig_vkGetPhysicalDeviceProperties2) {
+        ensure_vulkan_symbols_loaded();
+    }
     if (orig_vkGetPhysicalDeviceProperties2) {
         orig_vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
         if (pProperties) {
             spoof_vulkan_props_struct(&pProperties->properties);
         }
+    } else if (orig_vkGetPhysicalDeviceProperties && pProperties) {
+        orig_vkGetPhysicalDeviceProperties(physicalDevice, &pProperties->properties);
+        spoof_vulkan_props_struct(&pProperties->properties);
     }
 }
 
 inline PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void *instance, const char *pName) {
+    if (!orig_vkGetInstanceProcAddr) {
+        ensure_vulkan_symbols_loaded();
+    }
     PFN_vkVoidFunction real_fn = orig_vkGetInstanceProcAddr ? orig_vkGetInstanceProcAddr(instance, pName) : nullptr;
-    if (!real_fn || !pName || !g_cfg.gl.enabled) return real_fn;
+    if (!pName || !g_cfg.gl.enabled) return real_fn;
 
+    if (std::strcmp(pName, "vkGetInstanceProcAddr") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetInstanceProcAddr);
+    }
     if (std::strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
-        orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_fn);
+        if (real_fn && real_fn != reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties)) {
+            orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_fn);
+        }
         return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties);
     }
     if (std::strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
         std::strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
-        orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_fn);
+        if (real_fn && real_fn != reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties2)) {
+            orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_fn);
+        }
         return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties2);
     }
     return real_fn;
 }
 
 inline media_status_t hook_AMediaDrm_getPropertyString(void *drm, const char *propertyName, const char **propertyValue) {
+    if (!orig_AMediaDrm_getPropertyString) {
+        orig_AMediaDrm_getPropertyString = reinterpret_cast<decltype(orig_AMediaDrm_getPropertyString)>(
+            raw_dlsym_lookup(RTLD_DEFAULT, "AMediaDrm_getPropertyString"));
+    }
     media_status_t st = orig_AMediaDrm_getPropertyString
                             ? orig_AMediaDrm_getPropertyString(drm, propertyName, propertyValue)
                             : -1;

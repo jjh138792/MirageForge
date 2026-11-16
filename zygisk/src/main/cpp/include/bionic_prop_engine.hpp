@@ -22,10 +22,19 @@ struct alignas(4) BionicPropInfoCompat {
     char name[1];                 // 偏移 96..N
 };
 
+// 判断属性名是否属于 SDK 级别或 Android 大版本号属性（未开 force_spoof_sdk 时严格 0 改动）
+inline bool is_sdk_or_release_prop_key(const std::string &k) noexcept {
+    return k.find("version.sdk") != std::string::npos ||
+           k.find("version.release") != std::string::npos ||
+           k.find("version.preview_sdk") != std::string::npos ||
+           k.find("version.codename") != std::string::npos ||
+           k.find("first_api_level") != std::string::npos;
+}
+
 // 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 锁定为 r--p 只读状态
 class ReadOnlyMmapPropArena {
 public:
-    static constexpr size_t kArenaSize = 65536; // 64KB 足够容纳 400+ 条属性
+    static constexpr size_t kArenaSize = 65536;
 
     void ensure_mapped() {
         if (arena_base_) return;
@@ -119,41 +128,17 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
+// 严格遵循 0 改动：不擅自注入任何硬编码属性，且在未开 force_spoof_sdk 时二次过滤全部 SDK/Release 键
 inline void freeze_bionic_prop_arena() {
     if (!g_cfg.build.enabled) return;
 
-    if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
-        std::string dpi_s = std::to_string(g_cfg.build.app_dpi);
-        g_cfg.build.prop_map["ro.sf.lcd_density"] = dpi_s;
-        g_cfg.build.prop_map["qemu.sf.lcd_density"] = dpi_s;
-        g_cfg.build.prop_map["persist.sys.dpi"] = dpi_s;
-        g_cfg.build.prop_map["ro.vendor.display.default_dpi"] = dpi_s;
-    }
-
-    auto set_default_restricted = [&](const char *k, const char *v) {
-        if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
-            g_cfg.build.prop_map[k] = v;
+    for (auto it = g_cfg.build.prop_map.begin(); it != g_cfg.build.prop_map.end(); ) {
+        if (!g_cfg.build.force_spoof_sdk && is_sdk_or_release_prop_key(it->first)) {
+            it = g_cfg.build.prop_map.erase(it);
+        } else {
+            g_prop_arena.insert_before_freeze(it->first, it->second);
+            ++it;
         }
-    };
-    set_default_restricted("ro.boot.vbmeta.device_state", "locked");
-    set_default_restricted("ro.boot.vbmeta.avb_version", "1.2");
-    set_default_restricted("ro.boot.vbmeta.hash_alg", "sha256");
-    set_default_restricted("ro.boot.verifiedbootstate", "green");
-    set_default_restricted("ro.boot.veritymode", "enforcing");
-    set_default_restricted("ro.boot.flash.locked", "1");
-    set_default_restricted("ro.boot.warranty_bit", "0");
-    set_default_restricted("ro.warranty_bit", "0");
-    set_default_restricted("ro.build.selinux", "1");
-    set_default_restricted("ro.debuggable", "0");
-    set_default_restricted("ro.secure", "1");
-    set_default_restricted("ro.adb.secure", "1");
-    set_default_restricted("sys.oem_unlock_allowed", "0");
-    set_default_restricted("sys.usb.state", "none");
-    set_default_restricted("sys.usb.config", "none");
-    set_default_restricted("init.svc.adbd", "stopped");
-
-    for (const auto &kv : g_cfg.build.prop_map) {
-        g_prop_arena.insert_before_freeze(kv.first, kv.second);
     }
 
     g_prop_arena.seal_readonly();

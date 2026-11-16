@@ -105,15 +105,14 @@ fn main() {
                         .map(|t| t.name.as_str())
                         .unwrap_or(&r.tpl_id);
                     println!(
-                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{} DPI:{}]",
+                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{}]",
                         r.pkg_name,
                         m_name,
                         r.build as u8,
                         r.gl as u8,
                         r.vfs as u8,
                         r.probe as u8,
-                        r.sdk_spoof as u8,
-                        r.dpi
+                        r.sdk_spoof as u8
                     );
                 }
             }
@@ -205,7 +204,6 @@ fn main() {
                     vfs: get_opt(&args, "--vfs", "1") == "1",
                     probe: get_opt(&args, "--probe", "0") == "1",
                     sdk_spoof: get_opt(&args, "--sdk", "0") == "1",
-                    dpi: get_opt(&args, "--dpi", "0").parse::<i32>().unwrap_or(0),
                 };
                 let restart = has_flag(&args, "--restart");
                 let ok = store.set_route(route, restart);

@@ -96,12 +96,11 @@ inline uint64_t hash_str(const std::string &s) noexcept {
 }
 
 // ============================================================================
-// 微模块 1：Build 反射、受限属性区与按应用 DPI 配置
+// 微模块 1：Build 反射与属性区配置
 // ============================================================================
 struct BuildModuleConfig {
     bool enabled = false;
     bool force_spoof_sdk = false;
-    int app_dpi = 0; // > 0 时开启按应用独立 DPI 伪装
     std::unordered_map<std::string, std::string> prop_map;
     std::unordered_map<std::string, std::string> build_map;
     std::unordered_map<std::string, std::string> version_map;
@@ -159,7 +158,7 @@ struct VfsModuleConfig {
 };
 
 // ============================================================================
-// 微模块 4：幻境探针与崩溃捕获配置
+// 微模块 4：幻境探针配置
 // ============================================================================
 struct ProbeModuleConfig {
     bool enabled = false;

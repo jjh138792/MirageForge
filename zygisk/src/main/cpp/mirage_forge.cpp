@@ -96,7 +96,6 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 加载微模块配置后，立即擦除临时接收数组 raw_kvs
         load_modular_config(raw_kvs);
         for (auto &kv : raw_kvs) {
             volatile_scrub_string(kv.first);
@@ -124,7 +123,6 @@ public:
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
         }
         if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
             init_vfs_symbols();
@@ -147,8 +145,6 @@ public:
         if (!g_cfg.active) return;
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
-            // 阅后即焚：反射完成后立即抹除堆内存中的 build_map 与 version_map
             g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
@@ -171,7 +167,6 @@ private:
             else if (k == "META:ENABLE_VFS")      g_cfg.vfs.enabled = (v == "1");
             else if (k == "META:ENABLE_PROBE")    g_cfg.probe.enabled = (v == "1");
             else if (k == "META:FORCE_SPOOF_SDK") g_cfg.build.force_spoof_sdk = (v == "1");
-            else if (k == "META:APP_DPI")         g_cfg.build.app_dpi = std::atoi(v.c_str());
         }
 
         for (const auto &kv : raw_kvs) {
@@ -206,7 +201,6 @@ private:
                 else if (k == "VFS:SOC_MACHINE")    g_cfg.vfs.soc_machine = v;
                 else if (k == "VFS:KERNEL_RELEASE") g_cfg.vfs.kernel_release = v;
                 else if (k == "VFS:KERNEL_VERSION") g_cfg.vfs.kernel_version = v;
-                else if (k == "VFS:DPI" && g_cfg.build.app_dpi == 0) g_cfg.build.app_dpi = std::atoi(v.c_str());
                 continue;
             }
 
@@ -221,15 +215,14 @@ private:
                 }
             } else if (k.rfind("VERSION:", 0) == 0) {
                 std::string v_field = k.substr(8);
-                if ((v_field == "SDK_INT" || v_field == "DEVICE_INITIAL_SDK_INT" || v_field == "RELEASE") &&
-                    !g_cfg.build.force_spoof_sdk) {
+                if (!g_cfg.build.force_spoof_sdk &&
+                    v_field != "SECURITY_PATCH" &&
+                    v_field != "INCREMENTAL") {
                     continue;
                 }
                 g_cfg.build.version_map[v_field] = v;
             } else {
-                if (!g_cfg.build.force_spoof_sdk &&
-                    (k == "ro.build.version.sdk" || k == "ro.product.build.version.sdk" ||
-                     k == "ro.system.build.version.sdk" || k == "ro.build.version.release")) {
+                if (!g_cfg.build.force_spoof_sdk && is_sdk_or_release_prop_key(k)) {
                     continue;
                 }
                 g_cfg.build.prop_map[k] = v;

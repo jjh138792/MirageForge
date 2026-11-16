@@ -94,8 +94,6 @@ fn default_ddr_type() -> String { "LPDDR5X".into() }
 fn default_ddr_vendor() -> String { "SKhynix".into() }
 fn default_soc_id() -> String { "618".into() }
 fn default_soc_machine() -> String { "SM8750".into() }
-fn default_kernel_rel() -> String { "6.6.30-android15-8-g94b8f12ab4c1".into() }
-fn default_kernel_ver() -> String { "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025".into() }
 fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,12 +168,10 @@ pub struct DeviceTemplate {
     pub soc_id: String,
     #[serde(rename = "SOC_MACHINE", default = "default_soc_machine")]
     pub soc_machine: String,
-    #[serde(rename = "KERNEL_RELEASE", default = "default_kernel_rel")]
+    #[serde(rename = "KERNEL_RELEASE", default)]
     pub kernel_release: String,
-    #[serde(rename = "KERNEL_VERSION", default = "default_kernel_ver")]
+    #[serde(rename = "KERNEL_VERSION", default)]
     pub kernel_version: String,
-    #[serde(rename = "DEFAULT_DPI", default, deserialize_with = "de_i32_flex")]
-    pub default_dpi: i32,
 
     #[serde(rename = "CUSTOM_PROPS", default)]
     pub custom_props: String,
@@ -197,8 +193,6 @@ pub struct AppRoute {
     pub probe: bool,
     #[serde(rename = "sdkSpoof", default)]
     pub sdk_spoof: bool,
-    #[serde(default, deserialize_with = "de_i32_flex")]
-    pub dpi: i32, // 0 表示不额外覆盖或跟随模板 DEFAULT_DPI，120..=960 表示按应用独立 DPI
 }
 
 impl AppRoute {

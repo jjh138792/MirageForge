@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { Search, RefreshCw, Zap, ShieldAlert, Smartphone } from 'lucide-vue-next';
+import { Search, RefreshCw, Zap, ShieldAlert } from 'lucide-vue-next';
 import { useI18n } from '../i18n';
 import { triggerHaptic } from '../bridge/ksu-io';
 import {
@@ -14,7 +14,6 @@ import {
 const { t } = useI18n();
 const searchQuery = ref('');
 const filterMode = ref<'all' | 'configured'>('all');
-const dpiPresets = [0, 320, 400, 480, 560];
 
 const filteredApps = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
@@ -43,7 +42,6 @@ async function handleTemplateChange(pkg: string, tplId: string) {
     vfs: existing ? existing.vfs : true,
     probe: existing ? existing.probe : false,
     sdkSpoof: existing ? existing.sdkSpoof : false,
-    dpi: existing ? existing.dpi || 0 : 0,
   };
   await updateAppRouteViaCli(pkg, nextRoute, false);
 }
@@ -55,18 +53,6 @@ async function toggleModuleSwitch(pkg: string, field: 'build' | 'gl' | 'vfs' | '
   const next: AppRoute = {
     ...cur,
     [field]: !cur[field],
-  };
-  await updateAppRouteViaCli(pkg, next, false);
-}
-
-async function setAppDpi(pkg: string, dpiVal: number) {
-  triggerHaptic('light');
-  const cur = mirageStore.appRoutes[pkg];
-  if (!cur) return;
-  const cleanDpi = isNaN(dpiVal) || dpiVal < 0 ? 0 : Math.min(960, dpiVal);
-  const next: AppRoute = {
-    ...cur,
-    dpi: cleanDpi,
   };
   await updateAppRouteViaCli(pkg, next, false);
 }
@@ -170,7 +156,7 @@ async function toggleSystemApps() {
           </div>
         </div>
 
-        <!-- 五维微模块开关 + 按应用独立 DPI 调节器 -->
+        <!-- 五维微模块按需隔离胶囊开关 -->
         <div v-if="mirageStore.appRoutes[app.packageName]" class="route-config-drawer">
           <div class="module-pills">
             <span
@@ -209,34 +195,6 @@ async function toggleSystemApps() {
               <ShieldAlert :size="12" />
               <span>{{ t('apps.swSdk') }}</span>
             </span>
-          </div>
-
-          <!-- 按应用独立 DPI 伪装控制栏 -->
-          <div class="dpi-bar">
-            <div class="dpi-title">
-              <Smartphone :size="13" />
-              <span>{{ t('apps.dpiLabel') }}</span>
-            </div>
-            <div class="dpi-controls">
-              <button
-                v-for="p in dpiPresets"
-                :key="p"
-                type="button"
-                class="dpi-chip tactile-press"
-                :class="{ active: (mirageStore.appRoutes[app.packageName].dpi || 0) === p }"
-                @click="setAppDpi(app.packageName, p)"
-              >
-                {{ p === 0 ? 'Auto' : p }}
-              </button>
-              <input
-                type="number"
-                class="liquid-input dpi-num-input"
-                :value="mirageStore.appRoutes[app.packageName].dpi || 0"
-                min="0"
-                max="960"
-                @change="(e) => setAppDpi(app.packageName, parseInt((e.target as HTMLInputElement).value, 10))"
-              />
-            </div>
           </div>
         </div>
       </div>
@@ -401,56 +359,5 @@ async function toggleSystemApps() {
   background: rgba(245, 158, 11, 0.16);
   color: #f59e0b;
   border-color: rgba(245, 158, 11, 0.42);
-}
-
-.dpi-bar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  background: var(--subcard-bg);
-  padding: 6px 10px;
-  border-radius: 11px;
-  border: 1px solid var(--glass-border);
-}
-
-.dpi-title {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-secondary);
-}
-
-.dpi-controls {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  flex-wrap: wrap;
-}
-
-.dpi-chip {
-  padding: 3px 8px;
-  border-radius: 7px;
-  font-size: 10.5px;
-  font-weight: 700;
-  background: transparent;
-  color: var(--text-secondary);
-  border: 1px solid var(--glass-border);
-}
-
-.dpi-chip.active {
-  background: var(--accent-primary);
-  color: #fff;
-  border-color: var(--accent-primary);
-}
-
-.dpi-num-input {
-  width: 68px;
-  padding: 3px 7px;
-  font-size: 11px;
-  text-align: center;
 }
 </style>

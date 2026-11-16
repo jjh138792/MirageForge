@@ -16,6 +16,7 @@
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
 #include "fd_cloak_tracker.hpp"
+#include "bionic_prop_engine.hpp"
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
@@ -33,6 +34,8 @@ inline int (*orig_openat64_2)(int dirfd, const char *pathname, int flags) = null
 inline FILE *(*orig_fopen)(const char *pathname, const char *mode) = nullptr;
 inline FILE *(*orig_fopen64)(const char *pathname, const char *mode) = nullptr;
 inline int (*orig_close)(int fd) = nullptr;
+inline int (*orig_fclose)(FILE *fp) = nullptr;
+inline int (*orig_android_fdsan_close_with_tag)(int fd, uint64_t tag) = nullptr;
 inline off_t (*orig_lseek)(int fd, off_t offset, int whence) = nullptr;
 inline off64_t (*orig_lseek64)(int fd, off64_t offset, int whence) = nullptr;
 
@@ -54,7 +57,6 @@ inline int (*orig_uname)(struct utsname *buf) = nullptr;
 inline int (*orig_sysinfo)(struct sysinfo *info) = nullptr;
 inline long (*orig_sysconf)(int name) = nullptr;
 
-// 仅在启用 VFS 或 Build(popen) 时按需解析底层符号
 inline void init_vfs_symbols() {
     if (orig_openat) return;
     orig_open = reinterpret_cast<decltype(orig_open)>(dlsym(RTLD_DEFAULT, "open"));
@@ -67,6 +69,9 @@ inline void init_vfs_symbols() {
     orig_fopen = reinterpret_cast<decltype(orig_fopen)>(dlsym(RTLD_DEFAULT, "fopen"));
     orig_fopen64 = reinterpret_cast<decltype(orig_fopen64)>(dlsym(RTLD_DEFAULT, "fopen64"));
     orig_close = reinterpret_cast<decltype(orig_close)>(dlsym(RTLD_DEFAULT, "close"));
+    orig_fclose = reinterpret_cast<decltype(orig_fclose)>(dlsym(RTLD_DEFAULT, "fclose"));
+    orig_android_fdsan_close_with_tag = reinterpret_cast<decltype(orig_android_fdsan_close_with_tag)>(
+        dlsym(RTLD_DEFAULT, "android_fdsan_close_with_tag"));
     orig_lseek = reinterpret_cast<decltype(orig_lseek)>(dlsym(RTLD_DEFAULT, "lseek"));
     orig_lseek64 = reinterpret_cast<decltype(orig_lseek64)>(dlsym(RTLD_DEFAULT, "lseek64"));
 
@@ -89,19 +94,15 @@ inline void init_vfs_symbols() {
     orig_sysconf = reinterpret_cast<decltype(orig_sysconf)>(dlsym(RTLD_DEFAULT, "sysconf"));
 }
 
-// 3 指令极速前缀过滤：立即放行 /data, /apex, /dev, /storage, /mnt 等 99.5% 的普通路径
 inline bool is_vfs_candidate_prefix(const char *p) noexcept {
     if (!p || p[0] != '/') return false;
     while (*p == '/') ++p;
-    // 仅拦截 proc, sys, system, vendor, product, odm
     return (p[0] == 'p' || p[0] == 's' || p[0] == 'v' || p[0] == 'o');
 }
 
-// 快速判断 openat/fstatat 传入的相对文件名是否可能是 cpufreq 子节点，避免对普通相对路径调 readlink
 inline bool is_cpufreq_relative_candidate(const char *rel) noexcept {
     if (!rel || rel[0] == '/' || rel[0] == '.') return false;
     char c = rel[0];
-    // scaling_*, cpuinfo_*, online, cpu_capacity, related_cpus, affected_cpus, time_in_state, midr_el1, revidr_el1, topology/*, cpufreq/*
     return (c == 's' || c == 'c' || c == 'o' || c == 'r' || c == 'a' || c == 't' || c == 'm' || c == 'p');
 }
 
@@ -127,7 +128,6 @@ inline std::vector<int> build_opp_steps(int min_khz, int max_khz) {
     return steps;
 }
 
-// 仅初始化轻量级分簇参数表（不预生成任何文件字符串，0 内存浪费）
 inline void init_vfs_clusters_lightweight() {
     if (!g_cfg.vfs.enabled) return;
     g_cfg.vfs.clusters.clear();
@@ -201,7 +201,6 @@ inline int sample_live_core_freq_khz(int core_idx) noexcept {
     return cl->opp_freqs_khz[idx];
 }
 
-// 算式级按需解析任意单核 cpufreq 或 policy* 叶子节点（零预生成内存占用）
 inline bool synthesize_cpufreq_leaf(int core_id, const char *leaf, std::string *out_content, int *out_dyn_core) {
     const CpuClusterSpec *cl = find_cluster_for_core(core_id);
     if (!cl || !leaf || !out_content) return false;
@@ -301,14 +300,13 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
         }
         clean_ss << line;
     }
-    std::fclose(real_fp);
+    if (orig_fclose) orig_fclose(real_fp); else std::fclose(real_fp);
 
     *out_clean = clean_ss.str();
     emit_probe("MAPS_CLOAK", norm_path, "Stripped " + std::to_string(stripped) + " traces");
     return true;
 }
 
-// 核心：On-Demand 按需实时合成 VFS 节点内容（读哪个节点才生成哪个，未读节点 0 开销）
 inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *out_content, int *out_dyn_core = nullptr) {
     if (!g_cfg.vfs.enabled || norm.empty() || !out_content) return false;
     if (out_dyn_core) *out_dyn_core = -1;
@@ -338,7 +336,6 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
             return true;
         }
 
-        // 匹配 cpu<N>/...
         if (std::strncmp(cpu_sub, "cpu", 3) == 0 && cpu_sub[3] >= '0' && cpu_sub[3] <= '9') {
             char *endp = nullptr;
             int core_id = static_cast<int>(std::strtol(cpu_sub + 3, &endp, 10));
@@ -362,7 +359,6 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
             }
         }
 
-        // 匹配 cpufreq/policy<P>/...
         if (std::strncmp(cpu_sub, "cpufreq/policy", 14) == 0 && cpu_sub[14] >= '0' && cpu_sub[14] <= '9') {
             char *endp = nullptr;
             int pol_id = static_cast<int>(std::strtol(cpu_sub + 14, &endp, 10));
@@ -422,25 +418,35 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
             *out_content = std::to_string(g_cfg.vfs.ram_gb) + "GB " + g_cfg.vfs.ddr_type + " (" + g_cfg.vfs.ddr_vendor + ")\n";
             return true;
         }
-        if (norm == "/proc/version") {
+        if (norm == "/proc/version" && !g_cfg.vfs.kernel_release.empty() && !g_cfg.vfs.kernel_version.empty()) {
             *out_content = "Linux version " + g_cfg.vfs.kernel_release + " (kleaf@build-host) " + g_cfg.vfs.kernel_version + "\n";
             return true;
         }
-        if (norm == "/proc/sys/kernel/osrelease") {
+        if (norm == "/proc/sys/kernel/osrelease" && !g_cfg.vfs.kernel_release.empty()) {
             *out_content = g_cfg.vfs.kernel_release + "\n";
             return true;
         }
         return sanitize_live_proc_file(norm, out_content);
     }
 
-    // 3. /sys/class/kgsl & /sys/devices/soc0 & /sys/devices/system/chip-info
+    // 3. 严格 0 改动：仅当 GL 开关开启时才拦截 kgsl gpu_model
     if (norm == "/sys/class/kgsl/kgsl-3d0/gpu_model") {
-        *out_content = (g_cfg.gl.enabled && !g_cfg.gl.gl_renderer.empty() ? g_cfg.gl.gl_renderer : "Adreno (TM) 830") + "\n";
+        if (!g_cfg.gl.enabled || g_cfg.gl.gl_renderer.empty()) return false;
+        *out_content = g_cfg.gl.gl_renderer + "\n";
         return true;
     }
-    if (norm == "/sys/devices/soc0/soc_id") { *out_content = g_cfg.vfs.soc_id + "\n"; return true; }
-    if (norm == "/sys/devices/soc0/family") { *out_content = g_cfg.vfs.soc_family + "\n"; return true; }
-    if (norm == "/sys/devices/soc0/machine") { *out_content = g_cfg.vfs.soc_machine + "\n"; return true; }
+    if (norm == "/sys/devices/soc0/soc_id" && !g_cfg.vfs.soc_id.empty()) {
+        *out_content = g_cfg.vfs.soc_id + "\n";
+        return true;
+    }
+    if (norm == "/sys/devices/soc0/family" && !g_cfg.vfs.soc_family.empty()) {
+        *out_content = g_cfg.vfs.soc_family + "\n";
+        return true;
+    }
+    if (norm == "/sys/devices/soc0/machine" && !g_cfg.vfs.soc_machine.empty()) {
+        *out_content = g_cfg.vfs.soc_machine + "\n";
+        return true;
+    }
     if (norm == "/sys/devices/system/chip-info/ddr_info") {
         *out_content = std::to_string(g_cfg.vfs.ram_gb) + "GB " + g_cfg.vfs.ddr_type + " (" + g_cfg.vfs.ddr_vendor + ")\n";
         return true;
@@ -455,7 +461,7 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
         return true;
     }
 
-    // 4. 全分区 build.prop 按需合成 (仅当同时开启了 build 属性池时才生成虚拟 build.prop)
+    // 4. 全分区 build.prop 按需合成
     if (g_cfg.build.enabled &&
         (norm == "/system/build.prop" || norm == "/system/etc/build.prop" ||
          norm == "/vendor/build.prop" || norm == "/vendor/etc/build.prop" ||
@@ -538,7 +544,7 @@ inline int open_cloaked_vfs_fd(const char *raw_path) {
 }
 
 // ============================================================================
-// Bionic I/O & Fortify 全家族极速 Hook 实现
+// Bionic I/O & FDSAN 全家族极速 Hook 实现
 // ============================================================================
 inline int hook_open(const char *pathname, int flags, mode_t mode) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname), 0)) {
@@ -638,7 +644,25 @@ inline FILE *hook_fopen64(const char *pathname, const char *mode) {
 }
 
 inline int hook_close(int fd) {
-    g_fd_cloak.unregister_fd(fd); // 内部使用 O(1) 无锁位图预检，普通 fd 1 周期返回
+    g_fd_cloak.unregister_fd(fd);
+    return orig_close ? orig_close(fd) : close(fd);
+}
+
+// 拦截 C 标准库 fclose，防止通过 fopen 打开的虚拟 fd 关闭后残留位图记录
+inline int hook_fclose(FILE *fp) {
+    if (fp) {
+        int fd = fileno(fp);
+        if (fd >= 0) g_fd_cloak.unregister_fd(fd);
+    }
+    return orig_fclose ? orig_fclose(fp) : std::fclose(fp);
+}
+
+// 拦截 Android 10+ Bionic FDSAN 关闭路径（libjavacore.so / unique_fd 均走此函数关闭 fd！）
+inline int hook_android_fdsan_close_with_tag(int fd, uint64_t tag) {
+    g_fd_cloak.unregister_fd(fd);
+    if (orig_android_fdsan_close_with_tag) {
+        return orig_android_fdsan_close_with_tag(fd, tag);
+    }
     return orig_close ? orig_close(fd) : close(fd);
 }
 
@@ -863,12 +887,35 @@ inline FILE *hook_popen(const char *command, const char *type) {
                     }
                 }
             } else {
+                // 无参 getprop：保留系统原有的全部真实属性，仅覆写 prop_map 中配置过的键（严格遵守 0 改动）
                 std::ostringstream ss;
-                for (const auto &kv : g_cfg.build.prop_map) {
-                    ss << "[" << kv.first << "]: [" << kv.second << "]\n";
+                if (orig_system_property_foreach && orig_system_property_read_callback) {
+                    struct GetpropAllCtx {
+                        std::ostringstream *out;
+                        std::unordered_set<std::string> seen;
+                    } ctx{&ss, {}};
+
+                    auto foreach_fn = [](const prop_info *pi, void *cookie) {
+                        auto *c = static_cast<GetpropAllCtx *>(cookie);
+                        auto read_cb = [](void *ck, const char *name, const char *val, uint32_t) {
+                            if (!name || !val) return;
+                            auto *inner = static_cast<GetpropAllCtx *>(ck);
+                            inner->seen.insert(name);
+                            auto it = g_cfg.build.prop_map.find(name);
+                            const char *final_v = (it != g_cfg.build.prop_map.end()) ? it->second.c_str() : val;
+                            *(inner->out) << "[" << name << "]: [" << final_v << "]\n";
+                        };
+                        orig_system_property_read_callback(pi, read_cb, c);
+                    };
+                    orig_system_property_foreach(foreach_fn, &ctx);
+                    for (const auto &kv : g_cfg.build.prop_map) {
+                        if (ctx.seen.find(kv.first) == ctx.seen.end()) {
+                            ss << "[" << kv.first << "]: [" << kv.second << "]\n";
+                        }
+                    }
+                    output = ss.str();
+                    emit_probe("POPEN_GETPROP", "ALL", "MergedWithRealProps");
                 }
-                output = ss.str();
-                emit_probe("POPEN_GETPROP", "ALL", "Synthesized");
             }
 
             if (!output.empty()) {
