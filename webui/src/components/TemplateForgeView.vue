@@ -293,11 +293,11 @@ async function handleExportBackup() {
                 <input v-model="form.BUILD_USER" class="liquid-input" placeholder="builder" />
               </label>
               <label>
-                <span>RELEASE (Android 版本, 需开强改SDK)</span>
+                <span>RELEASE (Android 版本)</span>
                 <input v-model="form.RELEASE" class="liquid-input" placeholder="15" />
               </label>
               <label>
-                <span>SDK_INT (API 级别, 需开强改SDK)</span>
+                <span>SDK_INT (API 级别)</span>
                 <input v-model="form.SDK_INT" class="liquid-input" placeholder="35" />
               </label>
               <label class="span-2">
@@ -354,7 +354,7 @@ async function handleExportBackup() {
                 <input v-model="form.CPU_CLUSTERS" class="liquid-input" />
               </div>
 
-              <label>
+              <label class="span-2">
                 <span>/proc/cpuinfo Hardware</span>
                 <input v-model="form.CPU_HARDWARE" class="liquid-input" />
               </label>
@@ -369,6 +369,10 @@ async function handleExportBackup() {
               <label>
                 <span>DDR_VENDOR (颗粒厂商)</span>
                 <input v-model="form.DDR_VENDOR" class="liquid-input" placeholder="SKhynix / Samsung" />
+              </label>
+              <label>
+                <span>SOC_ID (/sys/devices/soc0)</span>
+                <input v-model="form.SOC_ID" class="liquid-input" placeholder="618" />
               </label>
               <label class="span-2">
                 <span>附加跨品牌与受限属性池 (KEY=VALUE 每行一条)</span>

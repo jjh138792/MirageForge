@@ -249,7 +249,7 @@ function isDpiPropKey(k: string): boolean {
 }
 
 /**
- * TypeScript 内存级微模块 .conf 编译器（与 Rust cli/src/compiler.rs 100% 严格对齐）
+ * TypeScript 内存级微模块 .conf 编译器 (与 Rust compiler.rs 100% 对齐，严格遵守 0 改动原则)
  */
 function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
   const lines: string[] = [];
@@ -324,7 +324,6 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('BUILD:TYPE', 'user');
     push('BUILD:TIME', tpl.BUILD_TIME);
 
-    // 严格遵守 sdkSpoof 0 改动边界
     push('VERSION:INCREMENTAL', incremental);
     push('VERSION:SECURITY_PATCH', tpl.SECURITY_PATCH);
     if (route.sdkSpoof) {
@@ -374,7 +373,7 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.build.tags', 'release-keys');
     push('ro.build.type', 'user');
 
-    // 静态 Bootloader 锁状态属性（不干预 sys.usb / adbd 运行态属性）
+    // Bootloader 静态安全属性与物理 DDR 对称属性 (不触碰 sys.usb / adbd 等运行态属性)
     push('ro.boot.vbmeta.device_state', 'locked');
     push('ro.boot.vbmeta.avb_version', '1.2');
     push('ro.boot.vbmeta.hash_alg', 'sha256');
@@ -389,7 +388,6 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.boot.hardware.sku', tpl.DEVICE);
     push('ro.boot.product.hardware.sku', tpl.DEVICE);
 
-    // 物理 DDR 对称属性
     push('ro.boot.hardware.ddr', ddrFull);
     push('ro.boot.ddr_size', ramStr);
     push('ro.boot.ddr_type', ddrType);
@@ -406,11 +404,11 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     for (const raw of (tpl.CUSTOM_PROPS || '').split(/\r?\n/)) {
       const tr = raw.trim();
       if (!tr || tr.startsWith('#')) continue;
-      const eqIdx = tr.indexOf('=');
-      if (eqIdx <= 0) continue;
-      const k = tr.slice(0, eqIdx).trim();
-      if (isDpiPropKey(k)) continue;
-      if (!route.sdkSpoof && isSdkOrReleasePropKey(k)) continue;
+      const eq = tr.indexOf('=');
+      if (eq <= 0) continue;
+      const key = tr.slice(0, eq).trim();
+      if (isDpiPropKey(key)) continue;
+      if (!route.sdkSpoof && isSdkOrReleasePropKey(key)) continue;
       lines.push(tr);
     }
   }

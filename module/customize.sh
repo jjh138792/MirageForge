@@ -8,7 +8,7 @@ MOD_CODE=$(grep_prop versionCode "$MODPATH/module.prop")
 
 ui_print "========================================================"
 ui_print "   蜃楼工坊 · MirageForge $MOD_VER (Build $MOD_CODE)     "
-ui_print "   Volatile Arena | Zero-Fork WebUI | Per-App DPI       "
+ui_print "   Volatile Arena | Zero-Touch On-Demand | Liquid WebUI  "
 ui_print "========================================================"
 ui_print "- 设备架构: $ARCH ($ABI) | Android API: $API"
 
@@ -16,15 +16,13 @@ if [ "$API" -lt 26 ]; then
   abort "! 错误：MirageForge 仅支持 Android 8.0 (API 26) 及以上版本"
 fi
 
-ui_print "- 正在解压模块核心组件与光学液态玻璃 WebUI 资源..."
-unzip -o "$ZIPFILE" \
-  "module.prop" \
-  "action.sh" \
-  "uninstall.sh" \
-  "bin/*" \
-  "zygisk/*" \
-  "webroot/*" \
-  -d "$MODPATH" >&2 || abort "! 解压模块文件失败，请检查刷入包完整性"
+ui_print "- 正在清理旧版缓存并全量解压模块与 WebUI 静态资源..."
+rm -rf "$MODPATH/webroot"
+unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >&2 || abort "! 解压模块文件失败，请检查刷入包完整性"
+
+if [ ! -f "$MODPATH/webroot/index.html" ]; then
+  abort "! 错误：WebUI 资源解压不完整 (缺少 webroot/index.html)"
+fi
 
 if [ ! -f "$MODPATH/zygisk/$ABI.so" ]; then
   abort "! 错误：未找到适配当前架构 ($ABI) 的 Zygisk 引擎库"

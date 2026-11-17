@@ -48,7 +48,7 @@ const messages = {
       parseBtn: '立即炼成全息模板',
     },
     apps: {
-      searchPlaceholder: '搜索应用名称或包名 (如 DevCheck / AIDA64)...',
+      searchPlaceholder: '搜索应用名称或包名 (如 DevCheck / 王者荣耀)...',
       filterAll: '全部应用',
       filterConfigured: '仅已伪装',
       sysApps: '系统应用',
@@ -62,8 +62,8 @@ const messages = {
       swSdk: '强改 SDK 版本',
     },
     probe: {
-      crashTitle: 'Native 致命异常捕获 (crash_events.log)',
-      crashEmpty: '运行稳定，未捕获到任何目标应用致命异常信号。',
+      crashTitle: 'Native 崩溃信号现场捕获 (crash_events.log)',
+      crashEmpty: '运行稳定，未捕获到任何目标应用 Native 崩溃信号。',
       teleTitle: 'Zygisk 实时注入遥测 (launch_history.log)',
       teleEmpty: '暂无启动遥测记录，运行已绑定的应用后自动生成。',
       clearTele: '清空遥测',
@@ -121,7 +121,7 @@ const messages = {
       parseBtn: '立即煉成全息模板',
     },
     apps: {
-      searchPlaceholder: '搜尋應用名稱或包名 (如 DevCheck / AIDA64)...',
+      searchPlaceholder: '搜尋應用名稱或包名 (如 DevCheck / 王者榮耀)...',
       filterAll: '全部應用',
       filterConfigured: '僅已偽裝',
       sysApps: '系統應用',
@@ -135,8 +135,8 @@ const messages = {
       swSdk: '強改 SDK 版本',
     },
     probe: {
-      crashTitle: 'Native 致命異常捕獲 (crash_events.log)',
-      crashEmpty: '運行穩定，未捕獲到任何目標應用致命異常信號。',
+      crashTitle: 'Native 崩潰信號現場捕獲 (crash_events.log)',
+      crashEmpty: '運行穩定，未捕獲到任何目標應用 Native 崩潰信號。',
       teleTitle: 'Zygisk 實時注入遙測 (launch_history.log)',
       teleEmpty: '暫無啟動遙測記錄，運行已綁定的應用後自動生成。',
       clearTele: '清空遙測',
@@ -208,8 +208,8 @@ const messages = {
       swSdk: 'Force Spoof SDK',
     },
     probe: {
-      crashTitle: 'Native Fatal Signal Inspector (crash_events.log)',
-      crashEmpty: 'All target processes healthy. No SIGABRT/SIGBUS/SIGILL captured.',
+      crashTitle: 'Native Crash Signal Inspector (crash_events.log)',
+      crashEmpty: 'All target processes healthy. No SIGABRT/SIGBUS captured.',
       teleTitle: 'Live Zygisk Injection Telemetry (launch_history.log)',
       teleEmpty: 'No recent app launches recorded yet.',
       clearTele: 'Clear',

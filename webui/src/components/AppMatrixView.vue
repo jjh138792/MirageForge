@@ -156,7 +156,7 @@ async function toggleSystemApps() {
           </div>
         </div>
 
-        <!-- 五维微模块按需隔离胶囊开关 -->
+        <!-- 五维微模块按需独立开关 (未开启项在底层 0 改动) -->
         <div v-if="mirageStore.appRoutes[app.packageName]" class="route-config-drawer">
           <div class="module-pills">
             <span
