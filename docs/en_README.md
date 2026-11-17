@@ -94,6 +94,9 @@ su -c "mirageforge_cli route remove com.tencent.tmgp.sgame --restart"
 
 In the spirit of full transparency: **this README (as well as a hefty chunk of the code refactoring in this repository) was written by Google Gemini**. Without AI cleaning up my mess, this README would still be the three-line placeholder it started as.
 
+### Credits
+
+- [device_faker](https://github.com/Seyud/device_faker) —— Some of the features and update notes in this project were inspired by that project.
 ---
 
 ## 📄 License
