@@ -106,6 +106,10 @@ su -c "mirageforge_cli probe list --limit 30"
 
 为了保持诚实：**这份看起来人模狗样的 README 文档（以及项目里相当一部分被我折磨出来的代码重构）是由 Google Gemini 写的**。如果没有 AI 帮我收拾烂摊子，这篇文档大概真的就只有最开始那三行字。
 
+### 致谢
+
+- [device_faker](https://github.com/Seyud/device_faker) —— 本项目的部分功能条目与更新文案参考了该项目。
+
 ---
 
 ## 📄 开源协议
