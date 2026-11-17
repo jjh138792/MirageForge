@@ -83,6 +83,7 @@ impl StoreEngine {
                     vfs: parts[4] == "1",
                     probe: parts[5] == "1",
                     sdk_spoof: parts.get(6).copied() == Some("1"),
+                    dpi: parts.get(7).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0),
                 };
                 if r.is_any_enabled() {
                     self.routes.insert(r.pkg_name.clone(), r);
@@ -133,14 +134,15 @@ impl StoreEngine {
         r_lines.push(format!("# MirageForge v{} Routes Table", self.meta.version));
         for r in self.routes.values() {
             r_lines.push(format!(
-                "{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}",
                 r.pkg_name,
                 r.tpl_id,
                 if r.build { "1" } else { "0" },
                 if r.gl { "1" } else { "0" },
                 if r.vfs { "1" } else { "0" },
                 if r.probe { "1" } else { "0" },
-                if r.sdk_spoof { "1" } else { "0" }
+                if r.sdk_spoof { "1" } else { "0" },
+                r.dpi
             ));
         }
         write_file_atomic(ROUTES_DB, &(r_lines.join("\n") + "\n"), 0o600);
@@ -293,8 +295,9 @@ impl StoreEngine {
                 ddr_vendor: "SKhynix".into(),
                 soc_id: "618".into(),
                 soc_machine: "SM8750".into(),
-                kernel_release: String::new(),
-                kernel_version: String::new(),
+                kernel_release: "6.6.30-android15-8-g94b8f12ab4c1".into(),
+                kernel_version: "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025".into(),
+                default_dpi: 0,
                 custom_props: "ro.miui.ui.version.code=15\nro.miui.ui.version.name=V816\nro.product.marketname=Xiaomi 15 Pro".into(),
             },
             DeviceTemplate {
@@ -333,8 +336,9 @@ impl StoreEngine {
                 ddr_vendor: "SKhynix".into(),
                 soc_id: "618".into(),
                 soc_machine: "SM8750".into(),
-                kernel_release: String::new(),
-                kernel_version: String::new(),
+                kernel_release: "6.6.30-android15-8-rog9".into(),
+                kernel_version: "#1 SMP PREEMPT Mon Jan 20 08:30:00 UTC 2025".into(),
+                default_dpi: 0,
                 custom_props: "ro.product.asus.series=ROG Phone 9\nro.vendor.asus.gaming=1".into(),
             },
             DeviceTemplate {
@@ -373,8 +377,9 @@ impl StoreEngine {
                 ddr_vendor: "SKhynix".into(),
                 soc_id: "618".into(),
                 soc_machine: "SM8750".into(),
-                kernel_release: String::new(),
-                kernel_version: String::new(),
+                kernel_release: "6.6.30-android15-8-redmagic".into(),
+                kernel_version: "#1 SMP PREEMPT Fri Jan 10 21:35:12 CST 2025".into(),
+                default_dpi: 0,
                 custom_props: "ro.product.marketname=红魔 10 Pro+".into(),
             },
             DeviceTemplate {
@@ -413,8 +418,9 @@ impl StoreEngine {
                 ddr_vendor: "SKhynix".into(),
                 soc_id: "6991".into(),
                 soc_machine: "MT6991".into(),
-                kernel_release: String::new(),
-                kernel_version: String::new(),
+                kernel_release: "6.6.30-android15-8-mt6991".into(),
+                kernel_version: "#1 SMP PREEMPT Wed Nov 20 15:12:00 CST 2024".into(),
+                default_dpi: 0,
                 custom_props: "ro.vivo.os.build.display.id=OriginOS 5\nro.vivo.market.name=vivo X200 Pro".into(),
             },
         ];

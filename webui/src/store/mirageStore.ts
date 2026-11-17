@@ -64,6 +64,7 @@ export interface DeviceTemplate {
   SOC_MACHINE: string;
   KERNEL_RELEASE: string;
   KERNEL_VERSION: string;
+  DEFAULT_DPI: number;
   CUSTOM_PROPS: string;
 }
 
@@ -74,6 +75,7 @@ export interface AppRoute {
   vfs: boolean;
   probe: boolean;
   sdkSpoof: boolean;
+  dpi: number;
 }
 
 export interface ProbeEvent {
@@ -144,6 +146,9 @@ export function triggerLiquidToast(msg: string) {
   }, 2800);
 }
 
+/**
+ * 1. 日夜与跟随系统主题控制器 (带平滑过渡)
+ */
 export function applyThemeMode(mode?: ThemeMode) {
   if (mode) {
     mirageStore.themeMode = mode;
@@ -188,6 +193,9 @@ if (typeof window !== 'undefined' && window.matchMedia) {
     });
 }
 
+/**
+ * 2. 动态读取 module.prop 版本号 (彻底告别硬编码)
+ */
 export async function loadVersionFromModuleProp() {
   const raw = await readFileZeroFork(MODULE_PROP_FILE);
   if (!raw) return;
@@ -201,6 +209,9 @@ export async function loadVersionFromModuleProp() {
   }
 }
 
+/**
+ * 3. 在线检查更新 (拉取 GitHub update.json 并对比 versionCode)
+ */
 export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
   mirageStore.updateInfo.checking = true;
   triggerHaptic('light');
@@ -230,26 +241,8 @@ export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
   }
 }
 
-function isSdkOrReleasePropKey(k: string): boolean {
-  return (
-    k.includes('version.sdk') ||
-    k.includes('version.release') ||
-    k.includes('version.preview_sdk') ||
-    k.includes('version.codename') ||
-    k.includes('first_api_level')
-  );
-}
-
-function isDpiPropKey(k: string): boolean {
-  return (
-    k.includes('lcd_density') ||
-    k === 'persist.sys.dpi' ||
-    k === 'ro.vendor.display.default_dpi'
-  );
-}
-
 /**
- * TypeScript 内存级微模块 .conf 编译器 (与 Rust compiler.rs 100% 对齐，严格遵守 0 改动原则)
+ * 4. TypeScript 内存级微模块 .conf 编译器 (用于 Native I/O 模式下 0 Shell Fork 编译配置)
  */
 function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
   const lines: string[] = [];
@@ -259,11 +252,19 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     }
   };
 
+  const effectiveDpi =
+    route.dpi >= 120 && route.dpi <= 960
+      ? route.dpi
+      : tpl.DEFAULT_DPI >= 120 && tpl.DEFAULT_DPI <= 960
+      ? tpl.DEFAULT_DPI
+      : 0;
+
   push('META:ENABLE_BUILD', route.build ? '1' : '0');
   push('META:ENABLE_GL', route.gl ? '1' : '0');
   push('META:ENABLE_VFS', route.vfs ? '1' : '0');
   push('META:ENABLE_PROBE', route.probe ? '1' : '0');
   push('META:FORCE_SPOOF_SDK', route.sdkSpoof ? '1' : '0');
+  if (effectiveDpi > 0) push('META:APP_DPI', effectiveDpi);
 
   if (route.gl) {
     push('GLES:VENDOR', tpl.GL_VENDOR);
@@ -292,9 +293,7 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
 
   if (route.build) {
     const abis = tpl.SUPPORTED_ABIS || 'arm64-v8a,armeabi-v7a,armeabi';
-    const buildUtc = Math.floor(
-      (parseInt(tpl.BUILD_TIME || '1736899200000', 10) || 1736899200000) / 1000
-    );
+    const buildUtc = Math.floor((parseInt(tpl.BUILD_TIME || '1736899200000', 10) || 1736899200000) / 1000);
     const ramStr = `${ramGb}GB`;
     const ddrFull = `${ramStr},${ddrVendor},${ddrType}`;
     const displayId = tpl.DISPLAY_ID || `${tpl.BUILD_ID} release-keys`;
@@ -326,12 +325,12 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
 
     push('VERSION:INCREMENTAL', incremental);
     push('VERSION:SECURITY_PATCH', tpl.SECURITY_PATCH);
+    push('VERSION:CODENAME', 'REL');
+    push('VERSION:PREVIEW_SDK_INT', '0');
     if (route.sdkSpoof) {
       push('VERSION:RELEASE', tpl.RELEASE);
       push('VERSION:SDK_INT', tpl.SDK_INT);
       push('VERSION:DEVICE_INITIAL_SDK_INT', tpl.SDK_INT);
-      push('VERSION:CODENAME', 'REL');
-      push('VERSION:PREVIEW_SDK_INT', '0');
     }
 
     for (const part of ['', 'system.', 'vendor.', 'odm.', 'product.', 'system_ext.']) {
@@ -344,10 +343,6 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
       push(`ro.${part}build.display.id`, displayId);
       push(`ro.${part}build.version.incremental`, incremental);
       push(`ro.${part}build.fingerprint`, tpl.FINGERPRINT);
-      if (route.sdkSpoof) {
-        push(`ro.${part}build.version.release`, tpl.RELEASE);
-        push(`ro.${part}build.version.sdk`, tpl.SDK_INT);
-      }
     }
     push('ro.product.build.id', tpl.BUILD_ID);
     push('ro.product.build.fingerprint', tpl.FINGERPRINT);
@@ -373,10 +368,9 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.build.tags', 'release-keys');
     push('ro.build.type', 'user');
 
-    // Bootloader 静态安全属性与物理 DDR 对称属性 (不触碰 sys.usb / adbd 等运行态属性)
+    // app 域受限属性区与 DDR 对称属性
     push('ro.boot.vbmeta.device_state', 'locked');
     push('ro.boot.vbmeta.avb_version', '1.2');
-    push('ro.boot.vbmeta.hash_alg', 'sha256');
     push('ro.boot.verifiedbootstate', 'green');
     push('ro.boot.flash.locked', '1');
     push('ro.boot.veritymode', 'enforcing');
@@ -385,9 +379,10 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.build.selinux', '1');
     push('ro.debuggable', '0');
     push('ro.secure', '1');
-    push('ro.boot.hardware.sku', tpl.DEVICE);
-    push('ro.boot.product.hardware.sku', tpl.DEVICE);
-
+    push('ro.adb.secure', '1');
+    push('sys.oem_unlock_allowed', '0');
+    push('sys.usb.state', 'none');
+    push('init.svc.adbd', 'stopped');
     push('ro.boot.hardware.ddr', ddrFull);
     push('ro.boot.ddr_size', ramStr);
     push('ro.boot.ddr_type', ddrType);
@@ -401,15 +396,23 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.sys.ram_size', ramStr);
     push('persist.sys.ram_size', ramStr);
 
+    if (effectiveDpi > 0) {
+      push('ro.sf.lcd_density', effectiveDpi);
+      push('qemu.sf.lcd_density', effectiveDpi);
+      push('persist.sys.dpi', effectiveDpi);
+      push('ro.vendor.display.default_dpi', effectiveDpi);
+    }
+
+    if (route.sdkSpoof) {
+      push('ro.build.version.release', tpl.RELEASE);
+      push('ro.build.version.sdk', tpl.SDK_INT);
+      push('ro.product.build.version.sdk', tpl.SDK_INT);
+      push('ro.system.build.version.sdk', tpl.SDK_INT);
+    }
+
     for (const raw of (tpl.CUSTOM_PROPS || '').split(/\r?\n/)) {
       const tr = raw.trim();
-      if (!tr || tr.startsWith('#')) continue;
-      const eq = tr.indexOf('=');
-      if (eq <= 0) continue;
-      const key = tr.slice(0, eq).trim();
-      if (isDpiPropKey(key)) continue;
-      if (!route.sdkSpoof && isSdkOrReleasePropKey(key)) continue;
-      lines.push(tr);
+      if (tr && !tr.startsWith('#') && tr.includes('=')) lines.push(tr);
     }
   }
 
@@ -428,7 +431,7 @@ async function flushStateZeroFork() {
     const confText = compileModularConfInTs(tpl, r);
     await writeFileZeroFork(`${APPS_DIR_PATH}/${pkg}.conf`, confText);
     rLines.push(
-      `${pkg}|${r.tplId}|${r.build ? 1 : 0}|${r.gl ? 1 : 0}|${r.vfs ? 1 : 0}|${r.probe ? 1 : 0}|${r.sdkSpoof ? 1 : 0}`
+      `${pkg}|${r.tplId}|${r.build ? 1 : 0}|${r.gl ? 1 : 0}|${r.vfs ? 1 : 0}|${r.probe ? 1 : 0}|${r.sdkSpoof ? 1 : 0}|${r.dpi || 0}`
     );
   }
   await writeFileZeroFork(ROUTES_DB_FILE, rLines.join('\n') + '\n');
@@ -468,6 +471,7 @@ export function parseClusterBars(clustersStr: string) {
 export async function syncStateFromRustCli() {
   await loadVersionFromModuleProp();
 
+  // 优先尝试零 Shell Fork 直接读取 config.json
   if (hasZeroForkIo()) {
     const rawJson = await readFileZeroFork(CONFIG_JSON_FILE);
     if (rawJson.trim()) {
@@ -484,6 +488,7 @@ export async function syncStateFromRustCli() {
     }
   }
 
+  // 回退调用 Rust CLI
   const res = await execRootShell(`"${CLI_BIN}" state --json`);
   if (res.errno === 0 && res.stdout.trim()) {
     try {
@@ -574,7 +579,7 @@ export async function updateAppRouteViaCli(
   if (!route || !route.tplId) {
     await execRootShell(`"${CLI_BIN}" route remove "${pkg}" ${restart ? '--restart' : ''}`);
   } else {
-    const cmd = `"${CLI_BIN}" route set "${pkg}" "${route.tplId}" --build ${route.build ? 1 : 0} --gl ${route.gl ? 1 : 0} --vfs ${route.vfs ? 1 : 0} --probe ${route.probe ? 1 : 0} --sdk ${route.sdkSpoof ? 1 : 0} ${restart ? '--restart' : ''}`;
+    const cmd = `"${CLI_BIN}" route set "${pkg}" "${route.tplId}" --build ${route.build ? 1 : 0} --gl ${route.gl ? 1 : 0} --vfs ${route.vfs ? 1 : 0} --probe ${route.probe ? 1 : 0} --sdk ${route.sdkSpoof ? 1 : 0} --dpi ${route.dpi || 0} ${restart ? '--restart' : ''}`;
     await execRootShell(cmd);
   }
   await syncStateFromRustCli();

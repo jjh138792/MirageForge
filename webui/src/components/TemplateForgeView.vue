@@ -70,8 +70,9 @@ const emptyTemplate = (): DeviceTemplate => ({
   DDR_VENDOR: 'SKhynix',
   SOC_ID: '618',
   SOC_MACHINE: 'SM8750',
-  KERNEL_RELEASE: '',
-  KERNEL_VERSION: '',
+  KERNEL_RELEASE: '6.6.30-android15-8-g94b8f12ab4c1',
+  KERNEL_VERSION: '#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025',
+  DEFAULT_DPI: 0,
   CUSTOM_PROPS: '',
 });
 
@@ -153,6 +154,7 @@ async function handleExportBackup() {
       </div>
     </div>
 
+    <!-- 模板液态玻璃网格 -->
     <div class="template-grid">
       <article
         v-for="tpl in Object.values(mirageStore.templates)"
@@ -177,7 +179,10 @@ async function handleExportBackup() {
           </div>
           <div class="spec-item">
             <HardDrive :size="14" class="spec-icon" />
-            <span>{{ tpl.RAM_GB }}GB {{ tpl.DDR_TYPE || 'LPDDR5X' }} ({{ tpl.DDR_VENDOR || 'SKhynix' }})</span>
+            <span>
+              {{ tpl.RAM_GB }}GB {{ tpl.DDR_TYPE || 'LPDDR5X' }}
+              <template v-if="tpl.DEFAULT_DPI > 0">· {{ tpl.DEFAULT_DPI }} DPI</template>
+            </span>
           </div>
         </div>
 
@@ -219,6 +224,7 @@ async function handleExportBackup() {
       </article>
     </div>
 
+    <!-- 液态玻璃模态编辑窗 (含新增的深度 Build 字段与默认 DPI) -->
     <Transition name="view-morph">
       <div v-if="showModal" class="modal-overlay" @click.self="showModal = false">
         <div class="modal-sheet liquid-glass liquid-glass-elevated">
@@ -371,8 +377,8 @@ async function handleExportBackup() {
                 <input v-model="form.DDR_VENDOR" class="liquid-input" placeholder="SKhynix / Samsung" />
               </label>
               <label>
-                <span>SOC_ID (/sys/devices/soc0)</span>
-                <input v-model="form.SOC_ID" class="liquid-input" placeholder="618" />
+                <span>DEFAULT_DPI (模板默认 DPI, 0=不改)</span>
+                <input v-model.number="form.DEFAULT_DPI" type="number" class="liquid-input" placeholder="0 或 480" />
               </label>
               <label class="span-2">
                 <span>附加跨品牌与受限属性池 (KEY=VALUE 每行一条)</span>

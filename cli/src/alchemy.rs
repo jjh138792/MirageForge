@@ -97,16 +97,6 @@ pub fn infer_topology(board: &str, soc_model: &str) -> InferredTopology {
     }
 }
 
-fn is_excluded_extra_prop(k: &str) -> bool {
-    k.contains("lcd_density")
-        || k.contains(".dpi")
-        || k.contains("version.sdk")
-        || k.contains("version.release")
-        || k.contains("version.preview_sdk")
-        || k.contains("version.codename")
-        || k.contains("first_api_level")
-}
-
 pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<DeviceTemplate> {
     let mut prop_map: HashMap<String, String> = HashMap::new();
     let mut ordered_keys: Vec<String> = Vec::new();
@@ -149,31 +139,24 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         "ro.product.odm.model",
         "ro.product.system.model",
         "ro.product.product.model",
-        "ro.product.system_ext.model",
     ]);
     let brand = pick(&[
         "ro.product.brand",
         "ro.product.vendor.brand",
         "ro.product.odm.brand",
         "ro.product.system.brand",
-        "ro.product.product.brand",
-        "ro.product.system_ext.brand",
     ]);
     let manufacturer = pick(&[
         "ro.product.manufacturer",
         "ro.product.vendor.manufacturer",
         "ro.product.odm.manufacturer",
         "ro.product.system.manufacturer",
-        "ro.product.product.manufacturer",
-        "ro.product.system_ext.manufacturer",
     ]);
     let device = pick(&[
         "ro.product.device",
         "ro.product.vendor.device",
         "ro.product.odm.device",
         "ro.product.system.device",
-        "ro.product.product.device",
-        "ro.product.system_ext.device",
         "ro.build.product",
     ]);
     let product = pick(&[
@@ -181,8 +164,6 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         "ro.product.vendor.name",
         "ro.product.odm.name",
         "ro.product.system.name",
-        "ro.product.product.name",
-        "ro.product.system_ext.name",
     ]);
     let board = pick(&["ro.product.board", "ro.board.platform"]);
     let hardware = pick(&["ro.hardware", "ro.boot.hardware"]);
@@ -190,43 +171,18 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
     let soc_man = pick(&["ro.soc.manufacturer"]);
     let soc_model = pick(&["ro.soc.model", "ro.mediatek.platform", "ro.chipname"]);
     let abis = pick(&["ro.product.cpu.abilist", "ro.system.product.cpu.abilist"]);
-    let build_id = pick(&[
-        "ro.build.id",
-        "ro.product.build.id",
-        "ro.system.build.id",
-        "ro.vendor.build.id",
-        "ro.odm.build.id",
-    ]);
-    let display_id = pick(&[
-        "ro.build.display.id",
-        "ro.system.build.display.id",
-        "ro.vendor.build.display.id",
-        "ro.odm.build.display.id",
-    ]);
+    let build_id = pick(&["ro.build.id", "ro.product.build.id", "ro.system.build.id"]);
+    let display_id = pick(&["ro.build.display.id", "ro.system.build.display.id"]);
     let incremental = pick(&[
         "ro.build.version.incremental",
         "ro.system.build.version.incremental",
         "ro.vendor.build.version.incremental",
-        "ro.product.build.version.incremental",
-        "ro.odm.build.version.incremental",
     ]);
     let build_host = pick(&["ro.build.host", "ro.system.build.host"]);
     let build_user = pick(&["ro.build.user", "ro.system.build.user"]);
     let utc_sec = pick(&["ro.build.date.utc", "ro.system.build.date.utc"]);
-    let release = pick(&[
-        "ro.build.version.release",
-        "ro.system.build.version.release",
-        "ro.vendor.build.version.release",
-        "ro.product.build.version.release",
-        "ro.odm.build.version.release",
-    ]);
-    let sdk = pick(&[
-        "ro.build.version.sdk",
-        "ro.system.build.version.sdk",
-        "ro.vendor.build.version.sdk",
-        "ro.product.build.version.sdk",
-        "ro.odm.build.version.sdk",
-    ]);
+    let release = pick(&["ro.build.version.release", "ro.system.build.version.release"]);
+    let sdk = pick(&["ro.build.version.sdk", "ro.system.build.version.sdk"]);
     let patch = pick(&["ro.build.version.security_patch", "ro.vendor.build.security_patch"]);
     let fingerprint = pick(&[
         "ro.build.fingerprint",
@@ -234,9 +190,9 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         "ro.vendor.build.fingerprint",
         "ro.system.build.fingerprint",
         "ro.odm.build.fingerprint",
-        "ro.system_ext.build.fingerprint",
     ]);
 
+    let raw_dpi = pick(&["ro.sf.lcd_density", "ro.vendor.display.default_dpi"]);
     let raw_ddr = pick(&["ro.boot.hardware.ddr", "ro.boot.ddr_info", "ro.hardware.ddr"]);
     let raw_ddr_type = pick(&["ro.boot.ddr_type"]);
     let raw_ram_size = pick(&["ro.boot.ddr_size", "ro.vendor.hw.ram", "ro.boot.ramsize"]);
@@ -253,6 +209,12 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         .ok()
         .filter(|&r| (4..=32).contains(&r))
         .unwrap_or(16);
+
+    let detected_dpi = raw_dpi
+        .parse::<i32>()
+        .ok()
+        .filter(|&d| (120..=960).contains(&d))
+        .unwrap_or(0);
 
     let detected_ddr_type = if raw_ddr.contains("LPDDR5T") {
         "LPDDR5T"
@@ -325,7 +287,7 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
 
     let mut extra_lines = Vec::new();
     for k in ordered_keys {
-        if consumed.contains(&k) || is_excluded_extra_prop(&k) {
+        if consumed.contains(&k) {
             continue;
         }
         if k.starts_with("ro.") || k.starts_with("persist.") || k.starts_with("sys.") {
@@ -380,8 +342,9 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         ddr_vendor: detected_ddr_vendor.into(),
         soc_id: topo.soc_id.into(),
         soc_machine: topo.soc_machine,
-        kernel_release: String::new(),
-        kernel_version: String::new(),
+        kernel_release: "6.6.30-android15-8-g94b8f12ab4c1".into(),
+        kernel_version: "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025".into(),
+        default_dpi: detected_dpi,
         custom_props: extra_lines.join("\n"),
     })
 }
