@@ -8,6 +8,18 @@ declare global {
       fullScreen?: (enable: boolean) => void;
       listPackages?: (type: 'user' | 'system' | 'all') => string;
       getPackagesInfo?: (pkgNamesJson: string) => string;
+      // KernelSU / KSU-Next 原生 IO 扩展接口 (若存在则 0 shell fork)
+      readFile?: (path: string) => string;
+      writeFile?: (path: string, content: string) => boolean;
+      exists?: (path: string) => boolean;
+      removeFile?: (path: string) => boolean;
+    };
+    // WebUI-X / MMRL 原生 FileSystem & PackageManager 接口
+    $fs?: {
+      readFile?: (path: string) => string;
+      writeFile?: (path: string, data: string) => void;
+      exists?: (path: string) => boolean;
+      unlink?: (path: string) => void;
     };
     $packageManager?: {
       getApplicationInfo?: (pkg: string, flags: number, userId: number) => any;
@@ -35,83 +47,71 @@ export interface InstalledAppInfo {
   iconUrl: string;
 }
 
-export function safeStorageGet(key: string, fallback: string): string {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return window.localStorage.getItem(key) || fallback;
-    }
-  } catch (_) {}
-  return fallback;
-}
-
-export function safeStorageSet(key: string, val: string) {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      window.localStorage.setItem(key, val);
-    }
-  } catch (_) {}
-}
-
 /**
  * 1. 生成球面凸透镜法线位移贴图 (Spherical Lens Displacement Map)
+ * R 通道编码水平折射偏移 (128 为中心无偏移)，G 通道编码垂直折射偏移
+ * 让液态玻璃球对底下的画面产生真实的水滴边缘折射扭曲！
  */
 export function initLiquidLensNormalMap() {
-  try {
-    if (typeof document === 'undefined') return;
-    const width = 160;
-    const height = 80;
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+  if (typeof document === 'undefined') return;
+  const width = 160;
+  const height = 80;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
 
-    const imgData = ctx.createImageData(width, height);
-    const data = imgData.data;
+  const imgData = ctx.createImageData(width, height);
+  const data = imgData.data;
 
-    for (let y = 0; y < height; y++) {
-      const ny = (y / (height - 1)) * 2 - 1;
-      for (let x = 0; x < width; x++) {
-        const nx = (x / (width - 1)) * 2 - 1;
-        const dist = Math.pow(Math.abs(nx), 2.4) + Math.pow(Math.abs(ny), 2.4);
+  for (let y = 0; y < height; y++) {
+    // 归一化坐标 -1 .. 1
+    const ny = (y / (height - 1)) * 2 - 1;
+    for (let x = 0; x < width; x++) {
+      const nx = (x / (width - 1)) * 2 - 1;
+      // 胶囊超椭圆距离场 (Superellipse SDF)
+      const dist = Math.pow(Math.abs(nx), 2.4) + Math.pow(Math.abs(ny), 2.4);
 
-        let dx = 0;
-        let dy = 0;
-        if (dist < 1.0) {
-          const edgeFactor = Math.pow(dist, 1.35);
-          dx = -nx * edgeFactor * 0.85;
-          dy = -ny * edgeFactor * 0.85;
-        }
-
-        const idx = (y * width + x) * 4;
-        data[idx] = Math.max(0, Math.min(255, Math.round(128 + dx * 127)));
-        data[idx + 1] = Math.max(0, Math.min(255, Math.round(128 + dy * 127)));
-        data[idx + 2] = 128;
-        data[idx + 3] = 255;
+      let dx = 0;
+      let dy = 0;
+      if (dist < 1.0) {
+        // 在边缘区域产生强烈的向内凸透镜折射率变化 (Snell's Law 近似)
+        const edgeFactor = Math.pow(dist, 1.35);
+        dx = -nx * edgeFactor * 0.85;
+        dy = -ny * edgeFactor * 0.85;
       }
-    }
 
-    ctx.putImageData(imgData, 0, 0);
-    const dataUrl = canvas.toDataURL('image/png');
-    const feImg = document.getElementById('mirage-spherical-map');
-    if (feImg) {
-      feImg.setAttribute('href', dataUrl);
-      feImg.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', dataUrl);
+      const idx = (y * width + x) * 4;
+      data[idx] = Math.max(0, Math.min(255, Math.round(128 + dx * 127)));     // R: X 位移
+      data[idx + 1] = Math.max(0, Math.min(255, Math.round(128 + dy * 127))); // G: Y 位移
+      data[idx + 2] = 128;
+      data[idx + 3] = 255;
     }
-  } catch (_) {}
-}
+  }
 
-export function setOrbRefractionScale(scale: number) {
-  try {
-    const disp = document.getElementById('mirage-orb-disp');
-    if (disp) {
-      disp.setAttribute('scale', String(Math.round(scale)));
-    }
-  } catch (_) {}
+  ctx.putImageData(imgData, 0, 0);
+  const dataUrl = canvas.toDataURL('image/png');
+  const feImg = document.getElementById('mirage-spherical-map');
+  if (feImg) {
+    feImg.setAttribute('href', dataUrl);
+    feImg.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', dataUrl);
+  }
 }
 
 /**
- * 2. 二阶胡克定律弹簧阻尼物理求解器
+ * 动态调节液态玻璃球的折射倍率（长按放大或高速拖动时增强水波折射）
+ */
+export function setOrbRefractionScale(scale: number) {
+  const disp = document.getElementById('mirage-orb-disp');
+  if (disp) {
+    disp.setAttribute('scale', String(Math.round(scale)));
+  }
+}
+
+/**
+ * 2. 二阶胡克定律弹簧阻尼物理求解器 (Hooke's Law Spring-Damper Physics)
+ * 用于底部液态玻璃球拖动阻尼、果冻拉伸形变与回弹动画
  */
 export class SpringSolver {
   pos: number;
@@ -128,7 +128,8 @@ export class SpringSolver {
   }
 
   step(dt: number): number {
-    const safeDt = Math.min(Math.max(dt, 0.001), 0.032);
+    // 限制单步最大时间步长防止切后台后发散
+    const safeDt = Math.min(dt, 0.032);
     const force = -this.stiffness * (this.pos - this.target) - this.damping * this.vel;
     this.vel += force * safeDt;
     this.pos += this.vel * safeDt;
@@ -145,8 +146,12 @@ export class SpringSolver {
   }
 }
 
-export function detectRuntimeEnv(): 'WebUI-X' | 'KernelSU' | 'BrowserMock' {
+/**
+ * 3. 环境探测、状态栏同步与触觉引擎
+ */
+export function detectRuntimeEnv(): 'KSU-Native-IO' | 'WebUI-X' | 'KernelSU' | 'BrowserMock' {
   if (typeof window !== 'undefined') {
+    if (window.ksu?.readFile || window.$fs?.readFile) return 'KSU-Native-IO';
     if (window.$packageManager || window.webui) return 'WebUI-X';
     if (window.ksu && typeof window.ksu.exec === 'function') return 'KernelSU';
   }
@@ -176,52 +181,75 @@ export function triggerHaptic(level: 'light' | 'medium' | 'heavy' | 'success' = 
 }
 
 /**
- * 3. Root Shell 异步桥接器 (带 6 秒防挂起超时保护)
+ * 4. 零 Shell Fork 原生文件 I/O 桥接 (优先走 ksu.readFile / $fs.readFile，不支持时无感回退)
  */
 let cbSeq = 0;
 export function execRootShell(command: string): Promise<ExecResult> {
   return new Promise((resolve) => {
-    if (typeof window !== 'undefined' && window.ksu && typeof window.ksu.exec === 'function') {
+    if (window.ksu && typeof window.ksu.exec === 'function') {
       const cbName = `__mirage_io_cb_${Date.now()}_${++cbSeq}`;
-      let settled = false;
-
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          try { delete window[cbName]; } catch (_) {}
-          resolve({ errno: -1, stdout: '', stderr: 'timeout' });
-        }
-      }, 6000);
-
       window[cbName] = (errno: number, stdout: string, stderr: string) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        try { delete window[cbName]; } catch (_) {}
-        resolve({
-          errno: Number(errno ?? 0),
-          stdout: typeof stdout === 'string' ? stdout : String(stdout ?? ''),
-          stderr: typeof stderr === 'string' ? stderr : String(stderr ?? ''),
-        });
+        delete window[cbName];
+        resolve({ errno, stdout: stdout || '', stderr: stderr || '' });
       };
-
-      try {
-        window.ksu.exec(command, '{}', cbName);
-      } catch (e) {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          resolve({ errno: -1, stdout: '', stderr: String(e) });
-        }
-      }
+      window.ksu.exec(command, '{}', cbName);
     } else {
       resolve(mockShellFallback(command));
     }
   });
 }
 
+export function hasZeroForkIo(): boolean {
+  return Boolean(window.ksu?.readFile || window.$fs?.readFile);
+}
+
+export async function readFileZeroFork(path: string): Promise<string> {
+  try {
+    if (window.ksu?.readFile) {
+      return window.ksu.readFile(path) || '';
+    }
+    if (window.$fs?.readFile) {
+      return window.$fs.readFile(path) || '';
+    }
+  } catch (_) {}
+
+  // 回退路径
+  const res = await execRootShell(`cat "${path}" 2>/dev/null`);
+  return res.errno === 0 ? res.stdout : '';
+}
+
+export async function writeFileZeroFork(path: string, content: string): Promise<boolean> {
+  try {
+    if (window.ksu?.writeFile) {
+      return Boolean(window.ksu.writeFile(path, content));
+    }
+    if (window.$fs?.writeFile) {
+      window.$fs.writeFile(path, content);
+      return true;
+    }
+  } catch (_) {}
+
+  const b64 = btoa(unescape(encodeURIComponent(content)));
+  const res = await execRootShell(`echo "${b64}" | base64 -d > "${path}" && chmod 600 "${path}"`);
+  return res.errno === 0;
+}
+
+export async function removeFileZeroFork(path: string): Promise<void> {
+  try {
+    if (window.ksu?.removeFile) {
+      window.ksu.removeFile(path);
+      return;
+    }
+    if (window.$fs?.unlink) {
+      window.$fs.unlink(path);
+      return;
+    }
+  } catch (_) {}
+  await execRootShell(`rm -f "${path}"`);
+}
+
 /**
- * 4. 零 Shell Fork 包枚举器 (使用 KernelSU pm API: listPackages & 分批 getPackagesInfo)
+ * 5. 零 Shell Fork 包枚举器 (100% 优先使用 KernelSU pm API: listPackages & getPackagesInfo)
  */
 export async function fetchInstalledAppsZeroFork(
   includeSystem: boolean,
@@ -230,15 +258,19 @@ export async function fetchInstalledAppsZeroFork(
   let pkgList: string[] = [];
   const mode = includeSystem ? 'all' : 'user';
 
-  if (typeof window !== 'undefined' && window.ksu?.listPackages) {
+  // 1. 直接调用 KernelSU 原生 pm 接口 (0 shell fork!)
+  if (window.ksu?.listPackages) {
     try {
-      const raw = window.ksu.listPackages(mode);
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      if (Array.isArray(parsed)) pkgList = parsed;
+      pkgList = JSON.parse(window.ksu.listPackages(mode));
+    } catch (_) {}
+  } else if (window.$packageManager?.getInstalledPackages) {
+    try {
+      pkgList = JSON.parse(window.$packageManager.getInstalledPackages(includeSystem ? 0 : 1, 0));
     } catch (_) {}
   }
 
-  if (pkgList.length === 0) {
+  // 仅在非 KSU 环境或极旧版本才回退 pm 命令
+  if (!pkgList || pkgList.length === 0) {
     const flag = includeSystem ? '' : '-3';
     const res = await execRootShell(`pm list packages ${flag}`);
     if (res.stdout) {
@@ -252,29 +284,23 @@ export async function fetchInstalledAppsZeroFork(
   const mergedPkgs = Array.from(new Set([...configuredPkgs, ...pkgList]));
   const infoMap: Record<string, { appLabel?: string; versionName?: string }> = {};
 
-  if (typeof window !== 'undefined' && window.ksu?.getPackagesInfo && mergedPkgs.length > 0) {
-    // 分批查询（每批 40 个），避免一次性传入几百个包名导致 WebView Bridge 溢出失败
-    const chunkSize = 40;
-    for (let i = 0; i < mergedPkgs.length; i += chunkSize) {
-      const chunk = mergedPkgs.slice(i, i + chunkSize);
-      try {
-        const raw = window.ksu.getPackagesInfo(JSON.stringify(chunk));
-        const rawInfos = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        if (Array.isArray(rawInfos)) {
-          for (const item of rawInfos) {
-            if (item?.packageName) infoMap[item.packageName] = item;
-          }
+  if (window.ksu?.getPackagesInfo && mergedPkgs.length > 0) {
+    try {
+      const rawInfos = JSON.parse(window.ksu.getPackagesInfo(JSON.stringify(mergedPkgs)));
+      if (Array.isArray(rawInfos)) {
+        for (const item of rawInfos) {
+          if (item?.packageName) infoMap[item.packageName] = item;
         }
-      } catch (_) {}
-    }
-  } else if (typeof window !== 'undefined' && window.$packageManager?.getApplicationInfo) {
+      }
+    } catch (_) {}
+  } else if (window.$packageManager?.getApplicationInfo) {
     for (const pkg of mergedPkgs) {
       try {
         const info = window.$packageManager.getApplicationInfo(pkg, 0, 0);
         if (info) {
           infoMap[pkg] = {
-            appLabel: String(info.label || info.nonLocalizedLabel || pkg),
-            versionName: String(info.versionName || ''),
+            appLabel: info.label || info.nonLocalizedLabel || pkg,
+            versionName: info.versionName || '',
           };
         }
       } catch (_) {}
@@ -297,7 +323,7 @@ export function registerToastHandler(fn: (msg: string) => void) {
 export function showToast(msg: string) {
   triggerHaptic('light');
   if (customToastHandler) customToastHandler(msg);
-  else if (typeof window !== 'undefined' && window.ksu?.toast) window.ksu.toast(msg);
+  else if (window.ksu?.toast) window.ksu.toast(msg);
 }
 
 export const vTouchGlass: Directive<HTMLElement, 'light' | 'medium' | undefined> = {
@@ -373,8 +399,9 @@ function mockShellFallback(cmd: string): ExecResult {
             DDR_VENDOR: 'SKhynix',
             SOC_ID: '618',
             SOC_MACHINE: 'SM8750',
-            KERNEL_RELEASE: '',
-            KERNEL_VERSION: '',
+            KERNEL_RELEASE: '6.6.30-android15-8-g94b8f12ab4c1',
+            KERNEL_VERSION: '#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025',
+            DEFAULT_DPI: 480,
             CUSTOM_PROPS: 'ro.miui.ui.version.name=V816\nro.product.marketname=Xiaomi 15 Pro',
           },
         },
@@ -386,16 +413,10 @@ function mockShellFallback(cmd: string): ExecResult {
             vfs: true,
             probe: true,
             sdkSpoof: false,
+            dpi: 480,
           },
         },
       }),
-    };
-  }
-  if (cmd.includes('pm list packages')) {
-    return {
-      errno: 0,
-      stderr: '',
-      stdout: 'package:flar2.devcheck\npackage:com.finalwire.aida64\npackage:com.tencent.tmgp.sgame\n',
     };
   }
   return { errno: 0, stdout: '[]', stderr: '' };
