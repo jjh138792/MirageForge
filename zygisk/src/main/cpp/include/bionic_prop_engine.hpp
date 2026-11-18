@@ -15,17 +15,15 @@
 
 namespace mirage {
 
-// AOSP Bionic `prop_info` 1:1 真实二进制内存布局结构
 struct alignas(4) BionicPropInfoCompat {
     uint32_t serial;              // 偏移 0..3
     char value[PROP_VALUE_MAX];   // 偏移 4..95 (PROP_VALUE_MAX == 92)
     char name[1];                 // 偏移 96..N
 };
 
-// 只读匿名映射页属性池：在单线程阶段构建后，通过 mprotect 锁定为 r--p 只读状态
 class ReadOnlyMmapPropArena {
 public:
-    static constexpr size_t kArenaSize = 65536; // 64KB 足够容纳 400+ 条属性
+    static constexpr size_t kArenaSize = 65536;
 
     void ensure_mapped() {
         if (arena_base_) return;
@@ -111,6 +109,7 @@ inline const prop_info *(*orig_system_property_find_nth)(unsigned n) = nullptr;
 
 inline void init_bionic_prop_symbols() {
     if (orig_system_property_find) return;
+    ErrnoRestorer errno_guard;
     orig_system_property_find = reinterpret_cast<decltype(orig_system_property_find)>(dlsym(RTLD_DEFAULT, "__system_property_find"));
     orig_system_property_read_callback = reinterpret_cast<decltype(orig_system_property_read_callback)>(dlsym(RTLD_DEFAULT, "__system_property_read_callback"));
     orig_system_property_read = reinterpret_cast<decltype(orig_system_property_read)>(dlsym(RTLD_DEFAULT, "__system_property_read"));
@@ -122,19 +121,13 @@ inline void init_bionic_prop_symbols() {
 inline void freeze_bionic_prop_arena() {
     if (!g_cfg.build.enabled) return;
 
-    if (g_cfg.build.app_dpi >= 120 && g_cfg.build.app_dpi <= 960) {
-        std::string dpi_s = std::to_string(g_cfg.build.app_dpi);
-        g_cfg.build.prop_map["ro.sf.lcd_density"] = dpi_s;
-        g_cfg.build.prop_map["qemu.sf.lcd_density"] = dpi_s;
-        g_cfg.build.prop_map["persist.sys.dpi"] = dpi_s;
-        g_cfg.build.prop_map["ro.vendor.display.default_dpi"] = dpi_s;
-    }
-
-    auto set_default_restricted = [&](const char *k, const char *v) {
+    auto set_default_restricted = [&](const char *k, const std::string &v) {
         if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
             g_cfg.build.prop_map[k] = v;
         }
     };
+
+    // 1. 补齐 SELinux 受限属性区与云控 Root 暴露属性（修复日志中抓到的 ro.sys.cloud.magisk=1 泄露）
     set_default_restricted("ro.boot.vbmeta.device_state", "locked");
     set_default_restricted("ro.boot.vbmeta.avb_version", "1.2");
     set_default_restricted("ro.boot.vbmeta.hash_alg", "sha256");
@@ -151,6 +144,47 @@ inline void freeze_bionic_prop_arena() {
     set_default_restricted("sys.usb.state", "none");
     set_default_restricted("sys.usb.config", "none");
     set_default_restricted("init.svc.adbd", "stopped");
+    set_default_restricted("ro.sys.cloud.magisk", "0");
+    set_default_restricted("persist.sys.cloud.root.global", "0");
+    set_default_restricted("ro.sys.cloud.root.global", "0");
+
+    // 2. 若开启了 GPU 伪装，同步接管系统底层 EGL/Vulkan 云控属性通道（基于 DevCheck 探针日志第 9~12 行）
+    if (g_cfg.gl.enabled && !g_cfg.gl.gl_renderer.empty()) {
+        set_default_restricted("persist.sys.cloud.gpu.vk_devicename", g_cfg.gl.gl_renderer);
+        set_default_restricted("persist.sys.cloud.gpu.gl_renderer", g_cfg.gl.gl_renderer);
+        set_default_restricted("persist.sys.gpu.gl_renderer", g_cfg.gl.gl_renderer);
+        if (!g_cfg.gl.gl_vendor.empty()) {
+            set_default_restricted("persist.sys.cloud.gpu.gl_vendor", g_cfg.gl.gl_vendor);
+            set_default_restricted("persist.sys.gpu.gl_vendor", g_cfg.gl.gl_vendor);
+            set_default_restricted("persist.sys.cloud.gpu.vk_vendorid",
+                                   std::to_string(g_cfg.gl.vulkan_vendor_id != 0 ? g_cfg.gl.vulkan_vendor_id : 0x5143));
+        }
+        if (!g_cfg.gl.gl_version.empty()) {
+            set_default_restricted("persist.sys.cloud.gpu.gl_version", g_cfg.gl.gl_version);
+        }
+    }
+
+    // 3. 若开启了屏幕最高刷新率伪装，注入显示刷新率属性
+    if (g_cfg.gl.enabled && g_cfg.gl.max_refresh_rate >= 90) {
+        std::string fps_s = std::to_string(g_cfg.gl.max_refresh_rate);
+        set_default_restricted("ro.vendor.display.default_fps", fps_s);
+        set_default_restricted("persist.vendor.dfps.level", fps_s);
+        set_default_restricted("persist.sys. peak_refresh_rate", fps_s);
+        set_default_restricted("ro.surface_flinger.use_content_detection_for_refresh_rate", "true");
+    }
+
+    // 4. 严格遵守 0 改动：若未开启强改 SDK，强制从属性池中剔除一切 SDK 与 Release 版本属性
+    if (!g_cfg.build.force_spoof_sdk) {
+        for (auto it = g_cfg.build.prop_map.begin(); it != g_cfg.build.prop_map.end(); ) {
+            const std::string &k = it->first;
+            if (k.find("build.version.sdk") != std::string::npos ||
+                k.find("build.version.release") != std::string::npos) {
+                it = g_cfg.build.prop_map.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 
     for (const auto &kv : g_cfg.build.prop_map) {
         g_prop_arena.insert_before_freeze(kv.first, kv.second);

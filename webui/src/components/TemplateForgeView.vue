@@ -10,6 +10,9 @@ import {
   Gauge,
   X,
   Check,
+  Share2,
+  CloudDownload,
+  ClipboardPaste,
 } from 'lucide-vue-next';
 import { useI18n } from '../i18n';
 import { execRootShell, showToast, triggerHaptic } from '../bridge/ksu-io';
@@ -19,6 +22,9 @@ import {
   parseClusterBars,
   saveTemplateViaCli,
   deleteTemplateViaCli,
+  encodeTemplateShareCode,
+  decodeTemplateShareCode,
+  fetchOnlineTemplateHub,
   type DeviceTemplate,
 } from '../store/mirageStore';
 
@@ -33,6 +39,9 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const showModal = ref(false);
 const isEditing = ref(false);
+const showShareImportModal = ref(false);
+const shareCodeInput = ref('');
+const showOnlineHubModal = ref(false);
 
 const emptyTemplate = (): DeviceTemplate => ({
   id: `tpl_${Date.now()}`,
@@ -61,6 +70,7 @@ const emptyTemplate = (): DeviceTemplate => ({
   GL_VENDOR: 'Qualcomm',
   GL_RENDERER: 'Adreno (TM) 830',
   GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
+  MAX_REFRESH_RATE: 120,
   CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
   CPU_CORES: 8,
   CPU_MAX_FREQ: 4320000,
@@ -72,7 +82,6 @@ const emptyTemplate = (): DeviceTemplate => ({
   SOC_MACHINE: 'SM8750',
   KERNEL_RELEASE: '6.6.30-android15-8-g94b8f12ab4c1',
   KERNEL_VERSION: '#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025',
-  DEFAULT_DPI: 0,
   CUSTOM_PROPS: '',
 });
 
@@ -103,6 +112,50 @@ function openEditModal(tpl: DeviceTemplate) {
   form.value = { ...emptyTemplate(), ...tpl };
   isEditing.value = true;
   showModal.value = true;
+}
+
+async function copyShareCode(tpl: DeviceTemplate) {
+  triggerHaptic('medium');
+  const code = encodeTemplateShareCode(tpl);
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(code);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = code;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    showToast(t('templates.shareCopied'));
+  } catch (_) {
+    shareCodeInput.value = code;
+    showShareImportModal.value = true;
+  }
+}
+
+function handleConfirmShareImport() {
+  const decoded = decodeTemplateShareCode(shareCodeInput.value);
+  if (!decoded) {
+    showToast('分享口令格式无效，请检查是否以 mf:// 开头');
+    return;
+  }
+  showShareImportModal.value = false;
+  shareCodeInput.value = '';
+  form.value = { ...emptyTemplate(), ...decoded };
+  isEditing.value = false;
+  showModal.value = true;
+}
+
+async function openOnlineHub() {
+  triggerHaptic('light');
+  showOnlineHubModal.value = true;
+  await fetchOnlineTemplateHub();
+}
+
+async function importFromHub(tpl: DeviceTemplate) {
+  await saveTemplateViaCli({ ...tpl });
 }
 
 function applyClusterPreset(
@@ -143,6 +196,14 @@ async function handleExportBackup() {
     <div class="section-bar">
       <h2>{{ t('templates.header') }}</h2>
       <div class="bar-btns">
+        <button class="btn-liquid-ghost tactile-press" @click="openOnlineHub">
+          <CloudDownload :size="15" />
+          <span>{{ t('templates.hubBtn') }}</span>
+        </button>
+        <button class="btn-liquid-ghost tactile-press" @click="showShareImportModal = true">
+          <ClipboardPaste :size="15" />
+          <span>{{ t('templates.importShareBtn') }}</span>
+        </button>
         <button class="btn-liquid-ghost tactile-press" @click="handleExportBackup">
           <Download :size="15" />
           <span>{{ t('templates.exportBtn') }}</span>
@@ -180,8 +241,7 @@ async function handleExportBackup() {
           <div class="spec-item">
             <HardDrive :size="14" class="spec-icon" />
             <span>
-              {{ tpl.RAM_GB }}GB {{ tpl.DDR_TYPE || 'LPDDR5X' }}
-              <template v-if="tpl.DEFAULT_DPI > 0">· {{ tpl.DEFAULT_DPI }} DPI</template>
+              {{ tpl.RAM_GB }}GB {{ tpl.DDR_TYPE || 'LPDDR5X' }} · {{ tpl.MAX_REFRESH_RATE || 120 }}Hz
             </span>
           </div>
         </div>
@@ -212,6 +272,10 @@ async function handleExportBackup() {
         </div>
 
         <div class="tpl-card-footer">
+          <button class="btn-liquid-ghost tactile-press" @click="copyShareCode(tpl)">
+            <Share2 :size="14" />
+            <span>{{ t('templates.shareBtn') }}</span>
+          </button>
           <button class="btn-liquid-ghost tactile-press" @click="openEditModal(tpl)">
             <Edit3 :size="14" />
             <span>{{ t('templates.editBtn') }}</span>
@@ -224,7 +288,74 @@ async function handleExportBackup() {
       </article>
     </div>
 
-    <!-- 液态玻璃模态编辑窗 (含新增的深度 Build 字段与默认 DPI) -->
+    <!-- 1. 口令导入弹窗 (mf://...) -->
+    <Transition name="view-morph">
+      <div v-if="showShareImportModal" class="modal-overlay" @click.self="showShareImportModal = false">
+        <div class="modal-sheet small-sheet liquid-glass liquid-glass-elevated">
+          <div class="modal-header">
+            <h3>{{ t('templates.shareModalTitle') }}</h3>
+            <button class="icon-close tactile-press" @click="showShareImportModal = false">
+              <X :size="18" />
+            </button>
+          </div>
+          <div class="modal-body">
+            <textarea
+              v-model="shareCodeInput"
+              rows="5"
+              class="liquid-textarea"
+              :placeholder="t('templates.sharePlaceholder')"
+            ></textarea>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-liquid-ghost tactile-press" @click="showShareImportModal = false">
+              {{ t('templates.cancelBtn') }}
+            </button>
+            <button class="btn-liquid tactile-press" @click="handleConfirmShareImport">
+              <Check :size="15" />
+              <span>{{ t('templates.shareConfirm') }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- 2. 在线精选机型库弹窗 -->
+    <Transition name="view-morph">
+      <div v-if="showOnlineHubModal" class="modal-overlay" @click.self="showOnlineHubModal = false">
+        <div class="modal-sheet liquid-glass liquid-glass-elevated">
+          <div class="modal-header">
+            <h3>🌐 {{ t('templates.hubModalTitle') }}</h3>
+            <button class="icon-close tactile-press" @click="showOnlineHubModal = false">
+              <X :size="18" />
+            </button>
+          </div>
+          <div class="modal-body hub-list">
+            <div
+              v-for="item in mirageStore.hubTemplates"
+              :key="item.id"
+              class="hub-item"
+            >
+              <div class="hub-info">
+                <div class="hub-name">{{ item.name }}</div>
+                <div class="hub-meta">
+                  {{ item.BRAND }} {{ item.MODEL }} · {{ item.GL_RENDERER }} · {{ item.RAM_GB }}GB {{ item.DDR_TYPE }} · {{ item.MAX_REFRESH_RATE || 120 }}Hz
+                </div>
+              </div>
+              <button
+                class="btn-liquid tactile-press"
+                @click="importFromHub(item)"
+              >
+                <Check v-if="mirageStore.templates[item.id]" :size="14" />
+                <CloudDownload v-else :size="14" />
+                <span>{{ mirageStore.templates[item.id] ? '已入库' : t('templates.hubImportBtn') }}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- 3. 模板铸造/编辑弹窗 -->
     <Transition name="view-morph">
       <div v-if="showModal" class="modal-overlay" @click.self="showModal = false">
         <div class="modal-sheet liquid-glass liquid-glass-elevated">
@@ -322,9 +453,13 @@ async function handleExportBackup() {
                 <span>GL_RENDERER / Vulkan DeviceName</span>
                 <input v-model="form.GL_RENDERER" class="liquid-input" placeholder="Adreno (TM) 830" />
               </label>
-              <label class="span-2">
+              <label>
                 <span>GL_VERSION</span>
                 <input v-model="form.GL_VERSION" class="liquid-input" placeholder="OpenGL ES 3.2 V@0800.0" />
+              </label>
+              <label>
+                <span>MAX_REFRESH_RATE (屏幕最高刷新率 Hz)</span>
+                <input v-model.number="form.MAX_REFRESH_RATE" type="number" class="liquid-input" placeholder="120 / 144 / 165" />
               </label>
             </div>
 
@@ -360,7 +495,7 @@ async function handleExportBackup() {
                 <input v-model="form.CPU_CLUSTERS" class="liquid-input" />
               </div>
 
-              <label class="span-2">
+              <label>
                 <span>/proc/cpuinfo Hardware</span>
                 <input v-model="form.CPU_HARDWARE" class="liquid-input" />
               </label>
@@ -375,10 +510,6 @@ async function handleExportBackup() {
               <label>
                 <span>DDR_VENDOR (颗粒厂商)</span>
                 <input v-model="form.DDR_VENDOR" class="liquid-input" placeholder="SKhynix / Samsung" />
-              </label>
-              <label>
-                <span>DEFAULT_DPI (模板默认 DPI, 0=不改)</span>
-                <input v-model.number="form.DEFAULT_DPI" type="number" class="liquid-input" placeholder="0 或 480" />
               </label>
               <label class="span-2">
                 <span>附加跨品牌与受限属性池 (KEY=VALUE 每行一条)</span>
@@ -409,6 +540,7 @@ async function handleExportBackup() {
   align-items: center;
   margin-bottom: 14px;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .section-bar h2 {
@@ -418,7 +550,8 @@ async function handleExportBackup() {
 
 .bar-btns {
   display: flex;
-  gap: 8px;
+  gap: 7px;
+  flex-wrap: wrap;
 }
 
 .template-grid {
@@ -560,6 +693,10 @@ async function handleExportBackup() {
   border-radius: 28px;
 }
 
+.small-sheet {
+  max-width: 460px;
+}
+
 .modal-header {
   display: flex;
   justify-content: space-between;
@@ -584,6 +721,34 @@ async function handleExportBackup() {
   overflow-y: auto;
   padding: 10px 2px;
   flex: 1;
+}
+
+.hub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.hub-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
+}
+
+.hub-name {
+  font-size: 13.5px;
+  font-weight: 800;
+}
+
+.hub-meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 3px;
 }
 
 .sec-divider {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { Search, RefreshCw, Zap, ShieldAlert, Smartphone } from 'lucide-vue-next';
+import { Search, RefreshCw, Zap, ShieldAlert, Gauge, Lock } from 'lucide-vue-next';
 import { useI18n } from '../i18n';
 import { triggerHaptic } from '../bridge/ksu-io';
 import {
@@ -8,13 +8,14 @@ import {
   reloadAppList,
   updateAppRouteViaCli,
   forceStopApp,
+  sanitizeRefreshRate,
   type AppRoute,
 } from '../store/mirageStore';
 
 const { t } = useI18n();
 const searchQuery = ref('');
 const filterMode = ref<'all' | 'configured'>('all');
-const dpiPresets = [0, 320, 400, 480, 560];
+const fpsPresets = [0, 90, 120, 144, 165];
 
 const filteredApps = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
@@ -43,12 +44,16 @@ async function handleTemplateChange(pkg: string, tplId: string) {
     vfs: existing ? existing.vfs : true,
     probe: existing ? existing.probe : false,
     sdkSpoof: existing ? existing.sdkSpoof : false,
-    dpi: existing ? existing.dpi || 0 : 0,
+    refreshRate: existing ? sanitizeRefreshRate(existing.refreshRate) : 0,
+    seccomp: existing ? Boolean(existing.seccomp) : false,
   };
   await updateAppRouteViaCli(pkg, nextRoute, false);
 }
 
-async function toggleModuleSwitch(pkg: string, field: 'build' | 'gl' | 'vfs' | 'probe' | 'sdkSpoof') {
+async function toggleModuleSwitch(
+  pkg: string,
+  field: 'build' | 'gl' | 'vfs' | 'probe' | 'sdkSpoof' | 'seccomp'
+) {
   triggerHaptic('light');
   const cur = mirageStore.appRoutes[pkg];
   if (!cur) return;
@@ -56,18 +61,23 @@ async function toggleModuleSwitch(pkg: string, field: 'build' | 'gl' | 'vfs' | '
     ...cur,
     [field]: !cur[field],
   };
+  if (field === 'seccomp' && next.seccomp) {
+    next.vfs = true;
+  }
   await updateAppRouteViaCli(pkg, next, false);
 }
 
-async function setAppDpi(pkg: string, dpiVal: number) {
+async function setAppRefreshRate(pkg: string, hzVal: number) {
   triggerHaptic('light');
   const cur = mirageStore.appRoutes[pkg];
   if (!cur) return;
-  const cleanDpi = isNaN(dpiVal) || dpiVal < 0 ? 0 : Math.min(960, dpiVal);
   const next: AppRoute = {
     ...cur,
-    dpi: cleanDpi,
+    refreshRate: sanitizeRefreshRate(hzVal),
   };
+  if (next.refreshRate >= 90) {
+    next.gl = true;
+  }
   await updateAppRouteViaCli(pkg, next, false);
 }
 
@@ -170,7 +180,7 @@ async function toggleSystemApps() {
           </div>
         </div>
 
-        <!-- 五维微模块开关 + 按应用独立 DPI 调节器 -->
+        <!-- 六维按需微模块开关 + 屏幕最高刷新率欺骗控制栏 -->
         <div v-if="mirageStore.appRoutes[app.packageName]" class="route-config-drawer">
           <div class="module-pills">
             <span
@@ -195,6 +205,14 @@ async function toggleSystemApps() {
               🛡️ {{ t('apps.swVfs') }}
             </span>
             <span
+              class="mod-pill seccomp tactile-press"
+              :class="{ on: mirageStore.appRoutes[app.packageName].seccomp }"
+              @click="toggleModuleSwitch(app.packageName, 'seccomp')"
+            >
+              <Lock :size="12" />
+              <span>{{ t('apps.swSeccomp') }}</span>
+            </span>
+            <span
               class="mod-pill probe tactile-press"
               :class="{ on: mirageStore.appRoutes[app.packageName].probe }"
               @click="toggleModuleSwitch(app.packageName, 'probe')"
@@ -211,31 +229,23 @@ async function toggleSystemApps() {
             </span>
           </div>
 
-          <!-- 按应用独立 DPI 伪装控制栏 -->
-          <div class="dpi-bar">
-            <div class="dpi-title">
-              <Smartphone :size="13" />
-              <span>{{ t('apps.dpiLabel') }}</span>
+          <!-- 屏幕最高刷新率欺骗控制栏 (0 = 原生 0 改动) -->
+          <div class="fps-bar">
+            <div class="fps-title">
+              <Gauge :size="13" />
+              <span>{{ t('apps.fpsLabel') }}</span>
             </div>
-            <div class="dpi-controls">
+            <div class="fps-controls">
               <button
-                v-for="p in dpiPresets"
-                :key="p"
+                v-for="hz in fpsPresets"
+                :key="hz"
                 type="button"
-                class="dpi-chip tactile-press"
-                :class="{ active: (mirageStore.appRoutes[app.packageName].dpi || 0) === p }"
-                @click="setAppDpi(app.packageName, p)"
+                class="fps-chip tactile-press"
+                :class="{ active: (mirageStore.appRoutes[app.packageName].refreshRate || 0) === hz }"
+                @click="setAppRefreshRate(app.packageName, hz)"
               >
-                {{ p === 0 ? 'Auto' : p }}
+                {{ hz === 0 ? 'OFF (0改动)' : `${hz}Hz` }}
               </button>
-              <input
-                type="number"
-                class="liquid-input dpi-num-input"
-                :value="mirageStore.appRoutes[app.packageName].dpi || 0"
-                min="0"
-                max="960"
-                @change="(e) => setAppDpi(app.packageName, parseInt((e.target as HTMLInputElement).value, 10))"
-              />
             </div>
           </div>
         </div>
@@ -391,6 +401,12 @@ async function toggleSystemApps() {
   border-color: rgba(6, 182, 212, 0.42);
 }
 
+.mod-pill.seccomp.on {
+  background: rgba(139, 92, 246, 0.22);
+  color: var(--accent-primary);
+  border-color: rgba(139, 92, 246, 0.48);
+}
+
 .mod-pill.probe.on {
   background: rgba(244, 63, 94, 0.16);
   color: #f43f5e;
@@ -403,7 +419,7 @@ async function toggleSystemApps() {
   border-color: rgba(245, 158, 11, 0.42);
 }
 
-.dpi-bar {
+.fps-bar {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -415,7 +431,7 @@ async function toggleSystemApps() {
   border: 1px solid var(--glass-border);
 }
 
-.dpi-title {
+.fps-title {
   display: flex;
   align-items: center;
   gap: 5px;
@@ -424,15 +440,15 @@ async function toggleSystemApps() {
   color: var(--text-secondary);
 }
 
-.dpi-controls {
+.fps-controls {
   display: flex;
   align-items: center;
   gap: 5px;
   flex-wrap: wrap;
 }
 
-.dpi-chip {
-  padding: 3px 8px;
+.fps-chip {
+  padding: 3px 9px;
   border-radius: 7px;
   font-size: 10.5px;
   font-weight: 700;
@@ -441,16 +457,9 @@ async function toggleSystemApps() {
   border: 1px solid var(--glass-border);
 }
 
-.dpi-chip.active {
+.fps-chip.active {
   background: var(--accent-primary);
   color: #fff;
   border-color: var(--accent-primary);
-}
-
-.dpi-num-input {
-  width: 68px;
-  padding: 3px 7px;
-  font-size: 11px;
-  text-align: center;
 }
 </style>

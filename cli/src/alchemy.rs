@@ -1,4 +1,4 @@
-use crate::models::DeviceTemplate;
+use crate::models::{sanitize_refresh_rate, DeviceTemplate};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -97,6 +97,14 @@ pub fn infer_topology(board: &str, soc_model: &str) -> InferredTopology {
     }
 }
 
+fn is_forbidden_extra_prop(k: &str) -> bool {
+    k.contains("build.version.sdk")
+        || k.contains("build.version.release")
+        || k.contains("first_api_level")
+        || k.contains("lcd_density")
+        || k.ends_with(".dpi")
+}
+
 pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<DeviceTemplate> {
     let mut prop_map: HashMap<String, String> = HashMap::new();
     let mut ordered_keys: Vec<String> = Vec::new();
@@ -181,8 +189,18 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
     let build_host = pick(&["ro.build.host", "ro.system.build.host"]);
     let build_user = pick(&["ro.build.user", "ro.system.build.user"]);
     let utc_sec = pick(&["ro.build.date.utc", "ro.system.build.date.utc"]);
-    let release = pick(&["ro.build.version.release", "ro.system.build.version.release"]);
-    let sdk = pick(&["ro.build.version.sdk", "ro.system.build.version.sdk"]);
+    let release = pick(&[
+        "ro.build.version.release",
+        "ro.system.build.version.release",
+        "ro.vendor.build.version.release",
+        "ro.product.build.version.release",
+    ]);
+    let sdk = pick(&[
+        "ro.build.version.sdk",
+        "ro.system.build.version.sdk",
+        "ro.vendor.build.version.sdk",
+        "ro.product.build.version.sdk",
+    ]);
     let patch = pick(&["ro.build.version.security_patch", "ro.vendor.build.security_patch"]);
     let fingerprint = pick(&[
         "ro.build.fingerprint",
@@ -192,7 +210,11 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         "ro.odm.build.fingerprint",
     ]);
 
-    let raw_dpi = pick(&["ro.sf.lcd_density", "ro.vendor.display.default_dpi"]);
+    let raw_fps = pick(&[
+        "ro.vendor.display.default_fps",
+        "persist.vendor.dfps.level",
+        "ro.surface_flinger.max_frame_buffer_acquired_buffers",
+    ]);
     let raw_ddr = pick(&["ro.boot.hardware.ddr", "ro.boot.ddr_info", "ro.hardware.ddr"]);
     let raw_ddr_type = pick(&["ro.boot.ddr_type"]);
     let raw_ram_size = pick(&["ro.boot.ddr_size", "ro.vendor.hw.ram", "ro.boot.ramsize"]);
@@ -210,11 +232,12 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         .filter(|&r| (4..=32).contains(&r))
         .unwrap_or(16);
 
-    let detected_dpi = raw_dpi
+    let detected_fps = raw_fps
         .parse::<i32>()
         .ok()
-        .filter(|&d| (120..=960).contains(&d))
-        .unwrap_or(0);
+        .map(sanitize_refresh_rate)
+        .filter(|&hz| hz >= 90)
+        .unwrap_or(120);
 
     let detected_ddr_type = if raw_ddr.contains("LPDDR5T") {
         "LPDDR5T"
@@ -287,7 +310,7 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
 
     let mut extra_lines = Vec::new();
     for k in ordered_keys {
-        if consumed.contains(&k) {
+        if consumed.contains(&k) || is_forbidden_extra_prop(&k) {
             continue;
         }
         if k.starts_with("ro.") || k.starts_with("persist.") || k.starts_with("sys.") {
@@ -333,6 +356,7 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         gl_vendor: topo.gl_vendor.into(),
         gl_renderer: topo.gl_renderer.into(),
         gl_version: "OpenGL ES 3.2 V@0800.0".into(),
+        max_refresh_rate: detected_fps,
         cpu_hardware: topo.cpu_hw,
         cpu_cores: 8,
         cpu_max_freq: topo.max_freq_khz,
@@ -344,7 +368,6 @@ pub fn parse_build_prop(raw_text: &str, custom_id: Option<&str>) -> Option<Devic
         soc_machine: topo.soc_machine,
         kernel_release: "6.6.30-android15-8-g94b8f12ab4c1".into(),
         kernel_version: "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025".into(),
-        default_dpi: detected_dpi,
         custom_props: extra_lines.join("\n"),
     })
 }

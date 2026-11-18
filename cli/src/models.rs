@@ -18,7 +18,6 @@ pub struct ModuleMeta {
     pub version_code: u32,
 }
 
-/// 从 module.prop 动态读取版本号与 versionCode，告别硬编码
 pub fn read_module_meta() -> ModuleMeta {
     let candidates = [MODULE_PROP_PATH, "./module.prop", "../module/module.prop"];
     let mut version = String::new();
@@ -44,7 +43,7 @@ pub fn read_module_meta() -> ModuleMeta {
         version = env!("CARGO_PKG_VERSION").to_string();
     }
     if version_code == 0 {
-        version_code = 120;
+        version_code = 130;
     }
 
     ModuleMeta {
@@ -85,6 +84,7 @@ fn default_patch() -> String { "2025-02-01".into() }
 fn default_gl_vendor() -> String { "Qualcomm".into() }
 fn default_gl_renderer() -> String { "Adreno (TM) 830".into() }
 fn default_gl_version() -> String { "OpenGL ES 3.2 V@0800.0".into() }
+fn default_refresh_rate() -> i32 { 120 }
 fn default_cpu_hw() -> String { "Qualcomm Technologies, Inc SM8750".into() }
 fn default_cores() -> i32 { 8 }
 fn default_max_freq() -> i32 { 4320000 }
@@ -151,6 +151,8 @@ pub struct DeviceTemplate {
     pub gl_renderer: String,
     #[serde(rename = "GL_VERSION", default = "default_gl_version")]
     pub gl_version: String,
+    #[serde(rename = "MAX_REFRESH_RATE", default = "default_refresh_rate", deserialize_with = "de_i32_flex")]
+    pub max_refresh_rate: i32,
 
     #[serde(rename = "CPU_HARDWARE", default = "default_cpu_hw")]
     pub cpu_hardware: String,
@@ -174,8 +176,6 @@ pub struct DeviceTemplate {
     pub kernel_release: String,
     #[serde(rename = "KERNEL_VERSION", default = "default_kernel_ver")]
     pub kernel_version: String,
-    #[serde(rename = "DEFAULT_DPI", default, deserialize_with = "de_i32_flex")]
-    pub default_dpi: i32,
 
     #[serde(rename = "CUSTOM_PROPS", default)]
     pub custom_props: String,
@@ -197,14 +197,104 @@ pub struct AppRoute {
     pub probe: bool,
     #[serde(rename = "sdkSpoof", default)]
     pub sdk_spoof: bool,
-    #[serde(default, deserialize_with = "de_i32_flex")]
-    pub dpi: i32, // 0 表示不额外覆盖或跟随模板 DEFAULT_DPI，120..=960 表示按应用独立 DPI
+    #[serde(rename = "refreshRate", default, deserialize_with = "de_i32_flex")]
+    pub refresh_rate: i32, // 0 = 不改刷新率 (0改动), 90/120/144/165/240 = 开启高刷欺骗
+    #[serde(default)]
+    pub seccomp: bool,     // false = 0改动, true = 开启按需 Seccomp-BPF 拦截裸 svc #0
 }
 
 impl AppRoute {
     pub fn is_any_enabled(&self) -> bool {
         self.build || self.gl || self.vfs || self.probe
     }
+}
+
+pub fn sanitize_refresh_rate(hz: i32) -> i32 {
+    if (90..=240).contains(&hz) {
+        hz
+    } else {
+        0
+    }
+}
+
+// ============================================================================
+// 零第三方依赖的 URL-Safe Base64 模板分享码编解码器 (mf://...)
+// ============================================================================
+const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+pub fn base64_url_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(B64_CHARS[((n >> 18) & 0x3F) as usize] as char);
+        out.push(B64_CHARS[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(B64_CHARS[((n >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(B64_CHARS[(n & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
+pub fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut vals = Vec::with_capacity(input.len());
+    for b in input.bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        vals.push(v as u32);
+    }
+
+    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
+    for chunk in vals.chunks(4) {
+        if chunk.len() < 2 {
+            break;
+        }
+        let n = (chunk[0] << 18)
+            | (chunk[1] << 12)
+            | (if chunk.len() > 2 { chunk[2] << 6 } else { 0 })
+            | (if chunk.len() > 3 { chunk[3] } else { 0 });
+
+        out.push(((n >> 16) & 0xFF) as u8);
+        if chunk.len() > 2 {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push((n & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+pub fn encode_template_share_code(tpl: &DeviceTemplate) -> String {
+    let json = serde_json::to_string(tpl).unwrap_or_default();
+    format!("mf://{}", base64_url_encode(json.as_bytes()))
+}
+
+pub fn decode_template_share_code(raw_code: &str) -> Option<DeviceTemplate> {
+    let trimmed = raw_code.trim();
+    if trimmed.starts_with('{') {
+        return serde_json::from_str::<DeviceTemplate>(trimmed).ok();
+    }
+    let payload = trimmed
+        .strip_prefix("mf://")
+        .or_else(|| trimmed.strip_prefix("MF://"))
+        .unwrap_or(trimmed);
+    let bytes = base64_url_decode(payload)?;
+    let json_str = String::from_utf8(bytes).ok()?;
+    serde_json::from_str::<DeviceTemplate>(&json_str).ok()
 }
 
 #[derive(Debug, Serialize, Deserialize)]

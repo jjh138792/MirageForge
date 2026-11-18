@@ -1,4 +1,4 @@
-use crate::models::{AppRoute, DeviceTemplate};
+use crate::models::{sanitize_refresh_rate, AppRoute, DeviceTemplate};
 
 pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(128);
@@ -9,14 +9,8 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         }
     };
 
-    // 计算生效的 DPI：优先使用应用路由单独指定的 DPI，其次使用模板自带的 DEFAULT_DPI
-    let effective_dpi = if (120..=960).contains(&route.dpi) {
-        route.dpi
-    } else if (120..=960).contains(&tpl.default_dpi) {
-        tpl.default_dpi
-    } else {
-        0
-    };
+    // 严格遵守 0 改动：仅当应用路由明确开启了高刷伪装 (90..=240) 时才启用，0 表示不干预刷新率
+    let effective_fps = sanitize_refresh_rate(route.refresh_rate);
 
     // 1. 模块级总控元数据
     push_kv(&mut lines, "META:ENABLE_BUILD", if route.build { "1" } else { "0" });
@@ -24,15 +18,19 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
     push_kv(&mut lines, "META:ENABLE_VFS", if route.vfs { "1" } else { "0" });
     push_kv(&mut lines, "META:ENABLE_PROBE", if route.probe { "1" } else { "0" });
     push_kv(&mut lines, "META:FORCE_SPOOF_SDK", if route.sdk_spoof { "1" } else { "0" });
-    if effective_dpi > 0 {
-        push_kv(&mut lines, "META:APP_DPI", &effective_dpi.to_string());
+    push_kv(&mut lines, "META:ENABLE_SECCOMP", if route.vfs && route.seccomp { "1" } else { "0" });
+    if route.gl && effective_fps >= 90 {
+        push_kv(&mut lines, "META:REFRESH_RATE", &effective_fps.to_string());
     }
 
-    // 2. 图形模块 (仅在开启 GL 开关时输出)
+    // 2. 图形与高刷模块 (仅在开启 GL 开关时输出)
     if route.gl {
         push_kv(&mut lines, "GLES:VENDOR", &tpl.gl_vendor);
         push_kv(&mut lines, "GLES:RENDERER", &tpl.gl_renderer);
         push_kv(&mut lines, "GLES:VERSION", &tpl.gl_version);
+        if effective_fps >= 90 {
+            push_kv(&mut lines, "GLES:REFRESH_RATE", &effective_fps.to_string());
+        }
     }
 
     // 3. VFS 与硬件拓扑模块 (仅在开启 VFS 开关时输出)
@@ -63,9 +61,6 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             &tpl.supported_abis
         };
         let build_utc = tpl.build_time.parse::<i64>().unwrap_or(1736899200000) / 1000;
-        let ram_str = format!("{}GB", ram_gb);
-        let ram_mb_str = (ram_gb * 1024).to_string();
-        let ddr_full = format!("{},{},{}", ram_str, ddr_vendor, ddr_type);
 
         let display_id = if !tpl.display_id.is_empty() {
             &tpl.display_id
@@ -88,7 +83,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             "builder"
         };
 
-        // Java android.os.Build 反射字段 (含 BOARD, SOC_MODEL, DISPLAY, HOST, USER)
+        // Java android.os.Build 反射字段
         push_kv(&mut lines, "BUILD:MODEL", &tpl.model);
         push_kv(&mut lines, "BUILD:BRAND", &tpl.brand);
         push_kv(&mut lines, "BUILD:MANUFACTURER", &tpl.manufacturer);
@@ -111,7 +106,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "BUILD:TYPE", "user");
         push_kv(&mut lines, "BUILD:TIME", &tpl.build_time);
 
-        // Java android.os.Build$VERSION 反射字段 (含 INCREMENTAL, SECURITY_PATCH)
+        // Java android.os.Build$VERSION 反射字段
         push_kv(&mut lines, "VERSION:INCREMENTAL", incremental);
         push_kv(&mut lines, "VERSION:SECURITY_PATCH", &tpl.security_patch);
         push_kv(&mut lines, "VERSION:CODENAME", "REL");
@@ -122,7 +117,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             push_kv(&mut lines, "VERSION:DEVICE_INITIAL_SDK_INT", &tpl.sdk_int);
         }
 
-        // Bionic SystemProperties 全分区覆盖 (system / vendor / odm / product / system_ext)
+        // Bionic SystemProperties 全分区覆盖
         for part in &["", "system.", "vendor.", "odm.", "product.", "system_ext."] {
             push_kv(&mut lines, &format!("ro.product.{}model", part), &tpl.model);
             push_kv(&mut lines, &format!("ro.product.{}brand", part), &tpl.brand);
@@ -158,7 +153,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "ro.build.tags", "release-keys");
         push_kv(&mut lines, "ro.build.type", "user");
 
-        // SELinux app 域不可读/受限属性区虚拟化 (通过 ReadOnlyMmapPropArena 暴露为合法只读属性)
+        // SELinux 受限属性区与云控 Root 隐藏
         push_kv(&mut lines, "ro.boot.vbmeta.device_state", "locked");
         push_kv(&mut lines, "ro.boot.vbmeta.avb_version", "1.2");
         push_kv(&mut lines, "ro.boot.vbmeta.hash_alg", "sha256");
@@ -175,41 +170,67 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "sys.usb.state", "none");
         push_kv(&mut lines, "sys.usb.config", "none");
         push_kv(&mut lines, "init.svc.adbd", "stopped");
+        push_kv(&mut lines, "ro.sys.cloud.magisk", "0");
+        push_kv(&mut lines, "persist.sys.cloud.root.global", "0");
+        push_kv(&mut lines, "ro.sys.cloud.root.global", "0");
         push_kv(&mut lines, "ro.boot.hardware.sku", &tpl.device);
         push_kv(&mut lines, "ro.boot.product.hardware.sku", &tpl.device);
 
-        // 物理 DDR 对称属性池
-        push_kv(&mut lines, "ro.boot.hardware.ddr", &ddr_full);
-        push_kv(&mut lines, "ro.boot.ddr_size", &ram_str);
-        push_kv(&mut lines, "ro.boot.ddr_type", ddr_type);
-        push_kv(&mut lines, "ro.boot.ddr_info", &ddr_full);
-        push_kv(&mut lines, "ro.boot.ramsize", &ram_str);
-        push_kv(&mut lines, "ro.boot.memsize", &ram_str);
-        push_kv(&mut lines, "ro.hardware.ddr", &ddr_full);
-        push_kv(&mut lines, "ro.vendor.hw.ram", &ram_str);
-        push_kv(&mut lines, "ro.product.ram", &ram_str);
-        push_kv(&mut lines, "ro.config.ram_size", &ram_mb_str);
-        push_kv(&mut lines, "ro.sys.ram_size", &ram_str);
-        push_kv(&mut lines, "persist.sys.ram_size", &ram_str);
+        // 严格子模块隔离：仅当 VFS 开关也开启时，才注入 DDR 物理内存属性
+        if route.vfs {
+            let ram_str = format!("{}GB", ram_gb);
+            let ram_mb_str = (ram_gb * 1024).to_string();
+            let ddr_full = format!("{},{},{}", ram_str, ddr_vendor, ddr_type);
+            push_kv(&mut lines, "ro.boot.hardware.ddr", &ddr_full);
+            push_kv(&mut lines, "ro.boot.ddr_size", &ram_str);
+            push_kv(&mut lines, "ro.boot.ddr_type", ddr_type);
+            push_kv(&mut lines, "ro.boot.ddr_info", &ddr_full);
+            push_kv(&mut lines, "ro.boot.ramsize", &ram_str);
+            push_kv(&mut lines, "ro.boot.memsize", &ram_str);
+            push_kv(&mut lines, "ro.hardware.ddr", &ddr_full);
+            push_kv(&mut lines, "ro.vendor.hw.ram", &ram_str);
+            push_kv(&mut lines, "ro.product.ram", &ram_str);
+            push_kv(&mut lines, "ro.config.ram_size", &ram_mb_str);
+            push_kv(&mut lines, "ro.sys.ram_size", &ram_str);
+            push_kv(&mut lines, "persist.sys.ram_size", &ram_str);
+        }
 
-        if effective_dpi > 0 {
-            let dpi_s = effective_dpi.to_string();
-            push_kv(&mut lines, "ro.sf.lcd_density", &dpi_s);
-            push_kv(&mut lines, "qemu.sf.lcd_density", &dpi_s);
-            push_kv(&mut lines, "persist.sys.dpi", &dpi_s);
-            push_kv(&mut lines, "ro.vendor.display.default_dpi", &dpi_s);
+        // 严格子模块隔离：仅当 GL 开关也开启时，才注入底层 Vulkan/GLES 辅助属性
+        if route.gl && !tpl.gl_renderer.is_empty() {
+            push_kv(&mut lines, "persist.sys.cloud.gpu.vk_devicename", &tpl.gl_renderer);
+            push_kv(&mut lines, "persist.sys.cloud.gpu.gl_renderer", &tpl.gl_renderer);
+            push_kv(&mut lines, "persist.sys.gpu.gl_renderer", &tpl.gl_renderer);
+            if !tpl.gl_vendor.is_empty() {
+                push_kv(&mut lines, "persist.sys.cloud.gpu.gl_vendor", &tpl.gl_vendor);
+                push_kv(&mut lines, "persist.sys.gpu.gl_vendor", &tpl.gl_vendor);
+            }
         }
 
         if route.sdk_spoof {
-            push_kv(&mut lines, "ro.build.version.release", &tpl.release);
-            push_kv(&mut lines, "ro.build.version.sdk", &tpl.sdk_int);
-            push_kv(&mut lines, "ro.product.build.version.sdk", &tpl.sdk_int);
-            push_kv(&mut lines, "ro.system.build.version.sdk", &tpl.sdk_int);
+            for part in &["", "system.", "vendor.", "odm.", "product.", "system_ext."] {
+                push_kv(&mut lines, &format!("ro.{}build.version.release", part), &tpl.release);
+                push_kv(&mut lines, &format!("ro.{}build.version.sdk", part), &tpl.sdk_int);
+            }
         }
 
+        // 严格过滤自定义属性池：禁止残留 DPI 属性，且在未开启 sdk_spoof 时禁止任何 SDK/Release 属性混入
         for raw in tpl.custom_props.lines() {
             let tr = raw.trim();
-            if !tr.is_empty() && !tr.starts_with('#') && tr.contains('=') {
+            if tr.is_empty() || tr.starts_with('#') {
+                continue;
+            }
+            if let Some(eq) = tr.find('=') {
+                let k = tr[..eq].trim();
+                if k.contains("lcd_density") || k.ends_with(".dpi") {
+                    continue;
+                }
+                if !route.sdk_spoof
+                    && (k.contains("build.version.sdk")
+                        || k.contains("build.version.release")
+                        || k.contains("first_api_level"))
+                {
+                    continue;
+                }
                 lines.push(tr.to_string());
             }
         }
