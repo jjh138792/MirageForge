@@ -35,6 +35,9 @@ public:
         this->api = api;
         this->env = env;
         g_zygisk_api = api;
+        if (env) {
+            env->GetJavaVM(&g_jvm);
+        }
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
@@ -117,11 +120,13 @@ public:
         }
 
         init_linker_symbols();
-        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
+        if (g_cfg.build.enabled || g_cfg.gl.enabled || g_cfg.probe.enabled) {
             init_bionic_prop_symbols();
         }
-        if (g_cfg.build.enabled) {
+        if (g_cfg.build.enabled || g_cfg.gl.enabled) {
             freeze_bionic_prop_arena();
+        }
+        if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
         }
         if (g_cfg.vfs.enabled || g_cfg.build.enabled || g_cfg.probe.enabled) {
@@ -387,7 +392,6 @@ static void companion_handler(int fd) {
         (entries.count("META:ENABLE_VFS")   && entries.at("META:ENABLE_VFS") == "1")   ||
         (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
 
-    // 严格遵守 0 改动：若该应用所有子开关均为 0，立即返回未命中，不写遥测、不留痕迹
     if (!any_enabled) {
         uint8_t zero = 0;
         write_full(fd, &zero, sizeof(zero));

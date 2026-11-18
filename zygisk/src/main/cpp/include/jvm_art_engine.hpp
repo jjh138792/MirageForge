@@ -1,33 +1,49 @@
 #pragma once
 
 #include <cstdlib>
+#include <atomic>
 #include <jni.h>
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
 
 namespace mirage {
 
-// 屏幕最高刷新率欺骗引擎：仅当 max_refresh_rate >= 90 时按需修改 DisplayInfo & Display$Mode
-inline void apply_display_refresh_rate_spoof(JNIEnv *env) {
-    int target_hz = g_cfg.gl.max_refresh_rate;
-    if (!env || !g_cfg.gl.enabled || target_hz < 90 || target_hz > 240) return;
+inline JavaVM *g_jvm = nullptr;
+inline std::atomic<bool> g_fps_spoof_applied{false};
 
+// 仅在应用已经完成初始化后（例如首次调用 OpenGL/Vulkan 时）温和修补已缓存的 Display$Mode.mRefreshRate，
+// 绝不在 Zygote preAppSpecialize 阶段主动发起 Binder IPC 调用！
+inline void try_lazy_spoof_display_modes() {
+    int target_hz = g_cfg.gl.max_refresh_rate;
+    if (!g_cfg.gl.enabled || target_hz < 90 || target_hz > 240 || !g_jvm) return;
+    if (g_fps_spoof_applied.load(std::memory_order_relaxed)) return;
+
+    JNIEnv *env = nullptr;
+    if (g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        return;
+    }
+    if (env->ExceptionCheck()) return;
+
+    g_fps_spoof_applied.store(true, std::memory_order_relaxed);
     float fps = static_cast<float>(target_hz);
 
     jclass dmg_cls = env->FindClass("android/hardware/display/DisplayManagerGlobal");
     if (!dmg_cls) { env->ExceptionClear(); return; }
 
-    jmethodID get_inst = env->GetStaticMethodID(dmg_cls, "getInstance", "()Landroid/hardware/display/DisplayManagerGlobal;");
-    if (!get_inst) {
+    // 仅读取 sInstance 静态字段：若应用尚未初始化 DisplayManagerGlobal，绝不主动调 getInstance() 触发 Binder！
+    jfieldID sinst_fid = env->GetStaticFieldID(dmg_cls, "sInstance", "Landroid/hardware/display/DisplayManagerGlobal;");
+    if (env->ExceptionCheck() || !sinst_fid) {
         env->ExceptionClear();
         env->DeleteLocalRef(dmg_cls);
+        g_fps_spoof_applied.store(false, std::memory_order_relaxed);
         return;
     }
 
-    jobject dmg = env->CallStaticObjectMethod(dmg_cls, get_inst);
+    jobject dmg = env->GetStaticObjectField(dmg_cls, sinst_fid);
     if (env->ExceptionCheck() || !dmg) {
         env->ExceptionClear();
         env->DeleteLocalRef(dmg_cls);
+        g_fps_spoof_applied.store(false, std::memory_order_relaxed);
         return;
     }
 
@@ -36,30 +52,13 @@ inline void apply_display_refresh_rate_spoof(JNIEnv *env) {
         jobject di = env->CallObjectMethod(dmg, get_di, 0);
         if (!env->ExceptionCheck() && di) {
             jclass di_cls = env->GetObjectClass(di);
-            if (di_cls) {
-                jfieldID ovr_fid = env->GetFieldID(di_cls, "refreshRateOverride", "F");
-                if (!env->ExceptionCheck() && ovr_fid) {
-                    env->SetFloatField(di, ovr_fid, fps);
-                } else {
-                    env->ExceptionClear();
-                }
+            jclass mode_cls = env->FindClass("android/view/Display$Mode");
+            jfieldID mode_rr_fid = mode_cls ? env->GetFieldID(mode_cls, "mRefreshRate", "F") : nullptr;
+            if (env->ExceptionCheck()) { env->ExceptionClear(); mode_rr_fid = nullptr; }
 
-                jfieldID rfr_fid = env->GetFieldID(di_cls, "renderFrameRate", "F");
-                if (!env->ExceptionCheck() && rfr_fid) {
-                    env->SetFloatField(di, rfr_fid, fps);
-                } else {
-                    env->ExceptionClear();
-                }
-
-                // 同步提升 supportedModes 与 appsSupportedModes 中的 Display$Mode.mRefreshRate
-                jclass mode_cls = env->FindClass("android/view/Display$Mode");
-                jfieldID mode_rr_fid = mode_cls ? env->GetFieldID(mode_cls, "mRefreshRate", "F") : nullptr;
-                if (env->ExceptionCheck()) { env->ExceptionClear(); mode_rr_fid = nullptr; }
-
-                auto patch_mode_array = [&](const char *arr_field_name) {
-                    if (!mode_rr_fid) return;
-                    jfieldID arr_fid = env->GetFieldID(di_cls, arr_field_name, "[Landroid/view/Display$Mode;");
-                    if (env->ExceptionCheck() || !arr_fid) { env->ExceptionClear(); return; }
+            if (di_cls && mode_rr_fid) {
+                jfieldID arr_fid = env->GetFieldID(di_cls, "supportedModes", "[Landroid/view/Display$Mode;");
+                if (!env->ExceptionCheck() && arr_fid) {
                     auto arr = static_cast<jobjectArray>(env->GetObjectField(di, arr_fid));
                     if (!env->ExceptionCheck() && arr) {
                         jsize len = env->GetArrayLength(arr);
@@ -71,19 +70,17 @@ inline void apply_display_refresh_rate_spoof(JNIEnv *env) {
                             }
                         }
                         env->DeleteLocalRef(arr);
+                        emit_probe("DISPLAY_FPS", "Display$Mode.getRefreshRate", std::to_string(target_hz) + "Hz");
                     } else {
                         env->ExceptionClear();
                     }
-                };
-
-                patch_mode_array("supportedModes");
-                patch_mode_array("appsSupportedModes");
-
-                if (mode_cls) env->DeleteLocalRef(mode_cls);
-                env->DeleteLocalRef(di_cls);
+                } else {
+                    env->ExceptionClear();
+                }
             }
+            if (mode_cls) env->DeleteLocalRef(mode_cls);
+            if (di_cls) env->DeleteLocalRef(di_cls);
             env->DeleteLocalRef(di);
-            emit_probe("DISPLAY_FPS", "Display.getRefreshRate", std::to_string(target_hz) + "Hz");
         } else {
             env->ExceptionClear();
         }
@@ -96,13 +93,7 @@ inline void apply_display_refresh_rate_spoof(JNIEnv *env) {
 }
 
 inline void reflect_java_build_fields(JNIEnv *env) {
-    if (!env) return;
-
-    if (g_cfg.gl.enabled && g_cfg.gl.max_refresh_rate >= 90) {
-        apply_display_refresh_rate_spoof(env);
-    }
-
-    if (!g_cfg.build.enabled) return;
+    if (!g_cfg.build.enabled || !env) return;
 
     auto set_str = [&](jclass cls, const char *name, const std::string &val) {
         if (val.empty()) return;
@@ -146,7 +137,6 @@ inline void reflect_java_build_fields(JNIEnv *env) {
         env->DeleteLocalRef(str_cls);
     };
 
-    // 1. 反射 android.os.Build
     jclass build_cls = env->FindClass("android/os/Build");
     if (build_cls) {
         for (const auto &kv : g_cfg.build.build_map) {
@@ -166,7 +156,6 @@ inline void reflect_java_build_fields(JNIEnv *env) {
         env->ExceptionClear();
     }
 
-    // 2. 反射 android.os.Build$VERSION
     jclass ver_cls = env->FindClass("android/os/Build$VERSION");
     if (ver_cls) {
         for (const auto &kv : g_cfg.build.version_map) {
