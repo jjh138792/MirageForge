@@ -7,7 +7,6 @@
 #include <atomic>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include "mirage_config.hpp"
 
 namespace mirage {
@@ -57,7 +56,8 @@ public:
         struct stat real_st{};
         dev_t dev = 0;
         ino_t ino = 0;
-        if (syscall(__NR_fstat, fd, &real_st) == 0) {
+        // 本模块自身 (libmirage_forge.so) 的 PLT 未被 Hook，直接调用 ::fstat 即为原生 libc.so 实现，完美兼容 32/64 位架构
+        if (::fstat(fd, &real_st) == 0) {
             dev = real_st.st_dev;
             ino = real_st.st_ino;
         }
@@ -85,7 +85,7 @@ public:
         if (__builtin_expect(!is_tracked_fast(fd), 1)) return false;
         ErrnoRestorer errno_guard;
         struct stat cur_st{};
-        bool stat_ok = (syscall(__NR_fstat, fd, &cur_st) == 0);
+        bool stat_ok = (::fstat(fd, &cur_st) == 0);
 
         lock();
         auto it = table_.find(fd);
@@ -93,7 +93,6 @@ public:
             unlock();
             return false;
         }
-        // 核验底层 inode：若该 fd 已被关闭并被其他真实文件复用，立即自愈清除！
         if (!stat_ok || (it->second.memfd_ino != 0 &&
                          (cur_st.st_ino != it->second.memfd_ino || cur_st.st_dev != it->second.memfd_dev))) {
             erase_locked(fd);
@@ -121,7 +120,7 @@ public:
 
         ErrnoRestorer errno_guard;
         struct stat cur_st{};
-        bool stat_ok = (syscall(__NR_fstat, fd, &cur_st) == 0);
+        bool stat_ok = (::fstat(fd, &cur_st) == 0);
 
         lock();
         auto it = table_.find(fd);
@@ -145,7 +144,7 @@ public:
         if (__builtin_expect(!is_tracked_fast(fd), 1) || !buf) return false;
         ErrnoRestorer errno_guard;
         struct stat cur_st{};
-        bool stat_ok = (syscall(__NR_fstat, fd, &cur_st) == 0);
+        bool stat_ok = (::fstat(fd, &cur_st) == 0);
 
         std::string fake_path;
         size_t sz = 0;
@@ -155,7 +154,6 @@ public:
             unlock();
             return false;
         }
-        // 核心防崩溃：如果 fd 已经被复用给字体文件 (.ttf) 或 APK，inode 必然不匹配，立即剔除并放行真实 fstat！
         if (!stat_ok || (it->second.memfd_ino != 0 &&
                          (cur_st.st_ino != it->second.memfd_ino || cur_st.st_dev != it->second.memfd_dev))) {
             erase_locked(fd);

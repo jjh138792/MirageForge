@@ -79,6 +79,8 @@ inline PFN_AMediaDrm_getPropertyString orig_AMediaDrm_getPropertyString = nullpt
 inline PFN_loader_dlsym orig_loader_dlsym = nullptr;
 inline PFN_dlsym orig_dlsym = nullptr;
 
+inline void init_graphics_symbols();
+
 // 按需解析 Vulkan 底层符号（解决 preAppSpecialize 时 libvulkan.so 尚未加载导致指针为 nullptr 的问题）
 inline void ensure_vulkan_symbols_loaded() {
     if (orig_vkGetInstanceProcAddr && orig_vkGetPhysicalDeviceProperties && orig_vkGetPhysicalDeviceProperties2) {
@@ -91,7 +93,7 @@ inline void ensure_vulkan_symbols_loaded() {
     }
     auto raw_lookup = [&](const char *sym) -> void * {
         if (orig_loader_dlsym) {
-            return orig_loader_dlsym(vk_handle, sym, reinterpret_cast<const void *>(&init_graphics_symbols));
+            return orig_loader_dlsym(vk_handle, sym, reinterpret_cast<const void *>(&ensure_vulkan_symbols_loaded));
         }
         return orig_dlsym ? orig_dlsym(vk_handle, sym) : dlsym(vk_handle, sym);
     };
@@ -177,7 +179,6 @@ inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
     if (guard) emit_probe("VULKAN", "VkPhysicalDeviceProperties.deviceName", props->deviceName);
 }
 
-// 遍历 Vulkan 1.1+ pNext 扩展结构链，伪装 VkPhysicalDeviceDriverProperties
 inline void spoof_vulkan_pnext_chain(void *pNext) {
     if (!pNext || !g_cfg.gl.enabled) return;
     auto *curr = static_cast<VkBaseOutStructureCompat *>(pNext);
@@ -186,7 +187,7 @@ inline void spoof_vulkan_pnext_chain(void *pNext) {
         if (curr->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES) {
             auto *drv = reinterpret_cast<VkPhysicalDeviceDriverPropertiesCompat *>(curr);
             bool is_arm = (g_cfg.gl.vulkan_vendor_id == 0x13B5);
-            drv->driverID = is_arm ? 9U : 8U; // 8 = QUALCOMM_PROPRIETARY, 9 = ARM_PROPRIETARY
+            drv->driverID = is_arm ? 9U : 8U;
             const char *d_name = is_arm ? "Arm Proprietary" : "Qualcomm Technologies Inc. Adreno Vulkan Driver";
             std::strncpy(drv->driverName, d_name, VK_MAX_DRIVER_NAME_SIZE - 1);
             drv->driverName[VK_MAX_DRIVER_NAME_SIZE - 1] = '\0';
@@ -257,8 +258,6 @@ inline __eglMustCastToProperFunctionPointerType hook_eglGetProcAddress(const cha
     return real_fn;
 }
 
-// 拦截 dlsym：解决 libvulkan_info.so / AIDA64 通过 dlopen("libvulkan.so") + dlsym 绕过 PLT 的问题
-// 采用 __loader_dlsym 传递真实的 __builtin_return_address(0)，100% 保持原调用方的 Linker Namespace！
 inline void *hook_dlsym(void *handle, const char *symbol) {
     const void *caller_addr = __builtin_return_address(0);
     void *real_sym = nullptr;
