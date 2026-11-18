@@ -7,8 +7,102 @@
 
 namespace mirage {
 
+// 屏幕最高刷新率欺骗引擎：仅当 max_refresh_rate >= 90 时按需修改 DisplayInfo & Display$Mode
+inline void apply_display_refresh_rate_spoof(JNIEnv *env) {
+    int target_hz = g_cfg.gl.max_refresh_rate;
+    if (!env || !g_cfg.gl.enabled || target_hz < 90 || target_hz > 240) return;
+
+    float fps = static_cast<float>(target_hz);
+
+    jclass dmg_cls = env->FindClass("android/hardware/display/DisplayManagerGlobal");
+    if (!dmg_cls) { env->ExceptionClear(); return; }
+
+    jmethodID get_inst = env->GetStaticMethodID(dmg_cls, "getInstance", "()Landroid/hardware/display/DisplayManagerGlobal;");
+    if (!get_inst) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(dmg_cls);
+        return;
+    }
+
+    jobject dmg = env->CallStaticObjectMethod(dmg_cls, get_inst);
+    if (env->ExceptionCheck() || !dmg) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(dmg_cls);
+        return;
+    }
+
+    jmethodID get_di = env->GetMethodID(dmg_cls, "getDisplayInfo", "(I)Landroid/view/DisplayInfo;");
+    if (get_di) {
+        jobject di = env->CallObjectMethod(dmg, get_di, 0);
+        if (!env->ExceptionCheck() && di) {
+            jclass di_cls = env->GetObjectClass(di);
+            if (di_cls) {
+                jfieldID ovr_fid = env->GetFieldID(di_cls, "refreshRateOverride", "F");
+                if (!env->ExceptionCheck() && ovr_fid) {
+                    env->SetFloatField(di, ovr_fid, fps);
+                } else {
+                    env->ExceptionClear();
+                }
+
+                jfieldID rfr_fid = env->GetFieldID(di_cls, "renderFrameRate", "F");
+                if (!env->ExceptionCheck() && rfr_fid) {
+                    env->SetFloatField(di, rfr_fid, fps);
+                } else {
+                    env->ExceptionClear();
+                }
+
+                // 同步提升 supportedModes 与 appsSupportedModes 中的 Display$Mode.mRefreshRate
+                jclass mode_cls = env->FindClass("android/view/Display$Mode");
+                jfieldID mode_rr_fid = mode_cls ? env->GetFieldID(mode_cls, "mRefreshRate", "F") : nullptr;
+                if (env->ExceptionCheck()) { env->ExceptionClear(); mode_rr_fid = nullptr; }
+
+                auto patch_mode_array = [&](const char *arr_field_name) {
+                    if (!mode_rr_fid) return;
+                    jfieldID arr_fid = env->GetFieldID(di_cls, arr_field_name, "[Landroid/view/Display$Mode;");
+                    if (env->ExceptionCheck() || !arr_fid) { env->ExceptionClear(); return; }
+                    auto arr = static_cast<jobjectArray>(env->GetObjectField(di, arr_fid));
+                    if (!env->ExceptionCheck() && arr) {
+                        jsize len = env->GetArrayLength(arr);
+                        for (jsize i = 0; i < len; ++i) {
+                            jobject m_obj = env->GetObjectArrayElement(arr, i);
+                            if (m_obj) {
+                                env->SetFloatField(m_obj, mode_rr_fid, fps);
+                                env->DeleteLocalRef(m_obj);
+                            }
+                        }
+                        env->DeleteLocalRef(arr);
+                    } else {
+                        env->ExceptionClear();
+                    }
+                };
+
+                patch_mode_array("supportedModes");
+                patch_mode_array("appsSupportedModes");
+
+                if (mode_cls) env->DeleteLocalRef(mode_cls);
+                env->DeleteLocalRef(di_cls);
+            }
+            env->DeleteLocalRef(di);
+            emit_probe("DISPLAY_FPS", "Display.getRefreshRate", std::to_string(target_hz) + "Hz");
+        } else {
+            env->ExceptionClear();
+        }
+    } else {
+        env->ExceptionClear();
+    }
+
+    env->DeleteLocalRef(dmg);
+    env->DeleteLocalRef(dmg_cls);
+}
+
 inline void reflect_java_build_fields(JNIEnv *env) {
-    if (!g_cfg.build.enabled || !env) return;
+    if (!env) return;
+
+    if (g_cfg.gl.enabled && g_cfg.gl.max_refresh_rate >= 90) {
+        apply_display_refresh_rate_spoof(env);
+    }
+
+    if (!g_cfg.build.enabled) return;
 
     auto set_str = [&](jclass cls, const char *name, const std::string &val) {
         if (val.empty()) return;
@@ -52,7 +146,7 @@ inline void reflect_java_build_fields(JNIEnv *env) {
         env->DeleteLocalRef(str_cls);
     };
 
-    // 1. 反射 android.os.Build (含 BOARD, SOC_MODEL, SOC_MANUFACTURER, DISPLAY, HOST, USER, RADIO 等)
+    // 1. 反射 android.os.Build
     jclass build_cls = env->FindClass("android/os/Build");
     if (build_cls) {
         for (const auto &kv : g_cfg.build.build_map) {
@@ -72,7 +166,7 @@ inline void reflect_java_build_fields(JNIEnv *env) {
         env->ExceptionClear();
     }
 
-    // 2. 反射 android.os.Build$VERSION (含 INCREMENTAL, SECURITY_PATCH, CODENAME, BASE_OS 等)
+    // 2. 反射 android.os.Build$VERSION
     jclass ver_cls = env->FindClass("android/os/Build$VERSION");
     if (ver_cls) {
         for (const auto &kv : g_cfg.build.version_map) {
@@ -95,90 +189,6 @@ inline void reflect_java_build_fields(JNIEnv *env) {
     } else {
         env->ExceptionClear();
     }
-}
-
-// 按应用独立 DPI 虚拟化引擎：直接修改当前进程 Resources.getSystem() 的 DisplayMetrics 与 Configuration
-inline void apply_app_dpi_virtualization(JNIEnv *env) {
-    int dpi = g_cfg.build.app_dpi;
-    if (!env || !g_cfg.build.enabled || dpi < 120 || dpi > 960) return;
-
-    jclass res_cls = env->FindClass("android/content/res/Resources");
-    if (!res_cls) { env->ExceptionClear(); return; }
-
-    jmethodID get_sys_mid = env->GetStaticMethodID(res_cls, "getSystem", "()Landroid/content/res/Resources;");
-    if (!get_sys_mid) {
-        env->ExceptionClear();
-        env->DeleteLocalRef(res_cls);
-        return;
-    }
-
-    jobject sys_res = env->CallStaticObjectMethod(res_cls, get_sys_mid);
-    if (env->ExceptionCheck() || !sys_res) {
-        env->ExceptionClear();
-        env->DeleteLocalRef(res_cls);
-        return;
-    }
-
-    float scale = static_cast<float>(dpi) / 160.0f;
-
-    // 1. 修改 DisplayMetrics (densityDpi, density, scaledDensity, xdpi, ydpi)
-    jmethodID get_dm_mid = env->GetMethodID(res_cls, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;");
-    if (get_dm_mid) {
-        jobject dm = env->CallObjectMethod(sys_res, get_dm_mid);
-        if (!env->ExceptionCheck() && dm) {
-            jclass dm_cls = env->GetObjectClass(dm);
-            if (dm_cls) {
-                auto set_dm_int = [&](const char *name, int v) {
-                    jfieldID f = env->GetFieldID(dm_cls, name, "I");
-                    if (!env->ExceptionCheck() && f) env->SetIntField(dm, f, v);
-                    else env->ExceptionClear();
-                };
-                auto set_dm_float = [&](const char *name, float v) {
-                    jfieldID f = env->GetFieldID(dm_cls, name, "F");
-                    if (!env->ExceptionCheck() && f) env->SetFloatField(dm, f, v);
-                    else env->ExceptionClear();
-                };
-                set_dm_int("densityDpi", dpi);
-                set_dm_float("density", scale);
-                set_dm_float("scaledDensity", scale);
-                set_dm_float("xdpi", static_cast<float>(dpi));
-                set_dm_float("ydpi", static_cast<float>(dpi));
-                env->DeleteLocalRef(dm_cls);
-            }
-            env->DeleteLocalRef(dm);
-        } else {
-            env->ExceptionClear();
-        }
-    } else {
-        env->ExceptionClear();
-    }
-
-    // 2. 修改 Configuration.densityDpi
-    jmethodID get_cfg_mid = env->GetMethodID(res_cls, "getConfiguration", "()Landroid/content/res/Configuration;");
-    if (get_cfg_mid) {
-        jobject cfg = env->CallObjectMethod(sys_res, get_cfg_mid);
-        if (!env->ExceptionCheck() && cfg) {
-            jclass cfg_cls = env->GetObjectClass(cfg);
-            if (cfg_cls) {
-                jfieldID dpi_fid = env->GetFieldID(cfg_cls, "densityDpi", "I");
-                if (!env->ExceptionCheck() && dpi_fid) {
-                    env->SetIntField(cfg, dpi_fid, dpi);
-                } else {
-                    env->ExceptionClear();
-                }
-                env->DeleteLocalRef(cfg_cls);
-            }
-            env->DeleteLocalRef(cfg);
-        } else {
-            env->ExceptionClear();
-        }
-    } else {
-        env->ExceptionClear();
-    }
-
-    env->DeleteLocalRef(sys_res);
-    env->DeleteLocalRef(res_cls);
-    emit_probe("DPI_SPOOF", "DisplayMetrics.densityDpi", std::to_string(dpi));
 }
 
 } // namespace mirage

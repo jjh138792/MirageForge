@@ -96,7 +96,6 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 加载微模块配置后，立即擦除临时接收数组 raw_kvs
         load_modular_config(raw_kvs);
         for (auto &kv : raw_kvs) {
             volatile_scrub_string(kv.first);
@@ -104,7 +103,7 @@ public:
         }
         raw_kvs.clear();
 
-        if (!g_cfg.build.enabled && !g_cfg.gl.enabled && !g_cfg.vfs.enabled && !g_cfg.probe.enabled) {
+        if (!g_cfg.is_any_enabled()) {
             close(fd);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
@@ -124,9 +123,8 @@ public:
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
         }
-        if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
+        if (g_cfg.vfs.enabled || g_cfg.build.enabled || g_cfg.probe.enabled) {
             init_vfs_symbols();
         }
         if (g_cfg.vfs.enabled) {
@@ -147,8 +145,6 @@ public:
         if (!g_cfg.active) return;
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
-            apply_app_dpi_virtualization(env);
-            // 阅后即焚：反射完成后立即抹除堆内存中的 build_map 与 version_map
             g_cfg.build.wipe_volatile_reflection_maps();
         }
         scan_and_commit_plt_hooks();
@@ -171,7 +167,8 @@ private:
             else if (k == "META:ENABLE_VFS")      g_cfg.vfs.enabled = (v == "1");
             else if (k == "META:ENABLE_PROBE")    g_cfg.probe.enabled = (v == "1");
             else if (k == "META:FORCE_SPOOF_SDK") g_cfg.build.force_spoof_sdk = (v == "1");
-            else if (k == "META:APP_DPI")         g_cfg.build.app_dpi = std::atoi(v.c_str());
+            else if (k == "META:REFRESH_RATE")    g_cfg.gl.max_refresh_rate = std::atoi(v.c_str());
+            else if (k == "META:ENABLE_SECCOMP")  g_cfg.vfs.enable_seccomp = (v == "1");
         }
 
         for (const auto &kv : raw_kvs) {
@@ -188,6 +185,8 @@ private:
                     g_cfg.gl.gl_renderer = v;
                 } else if (k == "GLES:VERSION") {
                     g_cfg.gl.gl_version = v;
+                } else if (k == "GLES:REFRESH_RATE" && g_cfg.gl.max_refresh_rate == 0) {
+                    g_cfg.gl.max_refresh_rate = std::atoi(v.c_str());
                 }
                 continue;
             }
@@ -206,7 +205,6 @@ private:
                 else if (k == "VFS:SOC_MACHINE")    g_cfg.vfs.soc_machine = v;
                 else if (k == "VFS:KERNEL_RELEASE") g_cfg.vfs.kernel_release = v;
                 else if (k == "VFS:KERNEL_VERSION") g_cfg.vfs.kernel_version = v;
-                else if (k == "VFS:DPI" && g_cfg.build.app_dpi == 0) g_cfg.build.app_dpi = std::atoi(v.c_str());
                 continue;
             }
 
@@ -239,7 +237,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程：动态读取 module.prop 版本 + 内存缓存 + 异步日志落盘
+// Root Companion 守护进程
 // ============================================================================
 static std::mutex g_file_write_mtx;
 
@@ -383,6 +381,19 @@ static void companion_handler(int fd) {
     }
 
     const auto &entries = it->second;
+    bool any_enabled =
+        (entries.count("META:ENABLE_BUILD") && entries.at("META:ENABLE_BUILD") == "1") ||
+        (entries.count("META:ENABLE_GL")    && entries.at("META:ENABLE_GL") == "1")    ||
+        (entries.count("META:ENABLE_VFS")   && entries.at("META:ENABLE_VFS") == "1")   ||
+        (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
+
+    // 严格遵守 0 改动：若该应用所有子开关均为 0，立即返回未命中，不写遥测、不留痕迹
+    if (!any_enabled) {
+        uint8_t zero = 0;
+        write_full(fd, &zero, sizeof(zero));
+        return;
+    }
+
     uint8_t one = 1;
     write_full(fd, &one, sizeof(one));
     write_str(fd, g_companion_cache.cached_version);

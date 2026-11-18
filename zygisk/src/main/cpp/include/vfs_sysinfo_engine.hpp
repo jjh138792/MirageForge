@@ -4,15 +4,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cinttypes>
 #include <sstream>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <sys/stat.h>
 #include <linux/memfd.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
 #include "fd_cloak_tracker.hpp"
@@ -32,7 +37,9 @@ inline int (*orig_openat_2)(int dirfd, const char *pathname, int flags) = nullpt
 inline int (*orig_openat64_2)(int dirfd, const char *pathname, int flags) = nullptr;
 inline FILE *(*orig_fopen)(const char *pathname, const char *mode) = nullptr;
 inline FILE *(*orig_fopen64)(const char *pathname, const char *mode) = nullptr;
+inline int (*orig_fclose)(FILE *fp) = nullptr;
 inline int (*orig_close)(int fd) = nullptr;
+inline int (*orig_fdsan_close)(int fd, uint64_t tag) = nullptr;
 inline off_t (*orig_lseek)(int fd, off_t offset, int whence) = nullptr;
 inline off64_t (*orig_lseek64)(int fd, off64_t offset, int whence) = nullptr;
 
@@ -54,9 +61,9 @@ inline int (*orig_uname)(struct utsname *buf) = nullptr;
 inline int (*orig_sysinfo)(struct sysinfo *info) = nullptr;
 inline long (*orig_sysconf)(int name) = nullptr;
 
-// 仅在启用 VFS 或 Build(popen) 时按需解析底层符号
 inline void init_vfs_symbols() {
     if (orig_openat) return;
+    ErrnoRestorer errno_guard;
     orig_open = reinterpret_cast<decltype(orig_open)>(dlsym(RTLD_DEFAULT, "open"));
     orig_open64 = reinterpret_cast<decltype(orig_open64)>(dlsym(RTLD_DEFAULT, "open64"));
     orig_open_2 = reinterpret_cast<decltype(orig_open_2)>(dlsym(RTLD_DEFAULT, "__open_2"));
@@ -66,7 +73,9 @@ inline void init_vfs_symbols() {
     orig_openat64_2 = reinterpret_cast<decltype(orig_openat64_2)>(dlsym(RTLD_DEFAULT, "__openat64_2"));
     orig_fopen = reinterpret_cast<decltype(orig_fopen)>(dlsym(RTLD_DEFAULT, "fopen"));
     orig_fopen64 = reinterpret_cast<decltype(orig_fopen64)>(dlsym(RTLD_DEFAULT, "fopen64"));
+    orig_fclose = reinterpret_cast<decltype(orig_fclose)>(dlsym(RTLD_DEFAULT, "fclose"));
     orig_close = reinterpret_cast<decltype(orig_close)>(dlsym(RTLD_DEFAULT, "close"));
+    orig_fdsan_close = reinterpret_cast<decltype(orig_fdsan_close)>(dlsym(RTLD_DEFAULT, "android_fdsan_close_with_tag"));
     orig_lseek = reinterpret_cast<decltype(orig_lseek)>(dlsym(RTLD_DEFAULT, "lseek"));
     orig_lseek64 = reinterpret_cast<decltype(orig_lseek64)>(dlsym(RTLD_DEFAULT, "lseek64"));
 
@@ -89,19 +98,15 @@ inline void init_vfs_symbols() {
     orig_sysconf = reinterpret_cast<decltype(orig_sysconf)>(dlsym(RTLD_DEFAULT, "sysconf"));
 }
 
-// 3 指令极速前缀过滤：立即放行 /data, /apex, /dev, /storage, /mnt 等 99.5% 的普通路径
 inline bool is_vfs_candidate_prefix(const char *p) noexcept {
     if (!p || p[0] != '/') return false;
     while (*p == '/') ++p;
-    // 仅拦截 proc, sys, system, vendor, product, odm
     return (p[0] == 'p' || p[0] == 's' || p[0] == 'v' || p[0] == 'o');
 }
 
-// 快速判断 openat/fstatat 传入的相对文件名是否可能是 cpufreq 子节点，避免对普通相对路径调 readlink
 inline bool is_cpufreq_relative_candidate(const char *rel) noexcept {
     if (!rel || rel[0] == '/' || rel[0] == '.') return false;
     char c = rel[0];
-    // scaling_*, cpuinfo_*, online, cpu_capacity, related_cpus, affected_cpus, time_in_state, midr_el1, revidr_el1, topology/*, cpufreq/*
     return (c == 's' || c == 'c' || c == 'o' || c == 'r' || c == 'a' || c == 't' || c == 'm' || c == 'p');
 }
 
@@ -127,7 +132,6 @@ inline std::vector<int> build_opp_steps(int min_khz, int max_khz) {
     return steps;
 }
 
-// 仅初始化轻量级分簇参数表（不预生成任何文件字符串，0 内存浪费）
 inline void init_vfs_clusters_lightweight() {
     if (!g_cfg.vfs.enabled) return;
     g_cfg.vfs.clusters.clear();
@@ -201,7 +205,6 @@ inline int sample_live_core_freq_khz(int core_idx) noexcept {
     return cl->opp_freqs_khz[idx];
 }
 
-// 算式级按需解析任意单核 cpufreq 或 policy* 叶子节点（零预生成内存占用）
 inline bool synthesize_cpufreq_leaf(int core_id, const char *leaf, std::string *out_content, int *out_dyn_core) {
     const CpuClusterSpec *cl = find_cluster_for_core(core_id);
     if (!cl || !leaf || !out_content) return false;
@@ -301,19 +304,17 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
         }
         clean_ss << line;
     }
-    std::fclose(real_fp);
+    if (orig_fclose) orig_fclose(real_fp); else std::fclose(real_fp);
 
     *out_clean = clean_ss.str();
     emit_probe("MAPS_CLOAK", norm_path, "Stripped " + std::to_string(stripped) + " traces");
     return true;
 }
 
-// 核心：On-Demand 按需实时合成 VFS 节点内容（读哪个节点才生成哪个，未读节点 0 开销）
 inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *out_content, int *out_dyn_core = nullptr) {
     if (!g_cfg.vfs.enabled || norm.empty() || !out_content) return false;
     if (out_dyn_core) *out_dyn_core = -1;
 
-    // 1. /sys/devices/system/cpu/* 或 /sys/bus/cpu/devices/*
     const char *cpu_sub = nullptr;
     if (norm.rfind("/sys/devices/system/cpu/", 0) == 0) {
         cpu_sub = norm.c_str() + 24;
@@ -338,7 +339,6 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
             return true;
         }
 
-        // 匹配 cpu<N>/...
         if (std::strncmp(cpu_sub, "cpu", 3) == 0 && cpu_sub[3] >= '0' && cpu_sub[3] <= '9') {
             char *endp = nullptr;
             int core_id = static_cast<int>(std::strtol(cpu_sub + 3, &endp, 10));
@@ -362,7 +362,6 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
             }
         }
 
-        // 匹配 cpufreq/policy<P>/...
         if (std::strncmp(cpu_sub, "cpufreq/policy", 14) == 0 && cpu_sub[14] >= '0' && cpu_sub[14] <= '9') {
             char *endp = nullptr;
             int pol_id = static_cast<int>(std::strtol(cpu_sub + 14, &endp, 10));
@@ -373,7 +372,6 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
         return false;
     }
 
-    // 2. /proc/* 节点按需合成
     if (norm.rfind("/proc/", 0) == 0) {
         if (norm == "/proc/meminfo") {
             int ram_gb = g_cfg.vfs.ram_gb > 0 ? g_cfg.vfs.ram_gb : 16;
@@ -433,7 +431,6 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
         return sanitize_live_proc_file(norm, out_content);
     }
 
-    // 3. /sys/class/kgsl & /sys/devices/soc0 & /sys/devices/system/chip-info
     if (norm == "/sys/class/kgsl/kgsl-3d0/gpu_model") {
         *out_content = (g_cfg.gl.enabled && !g_cfg.gl.gl_renderer.empty() ? g_cfg.gl.gl_renderer : "Adreno (TM) 830") + "\n";
         return true;
@@ -455,7 +452,6 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
         return true;
     }
 
-    // 4. 全分区 build.prop 按需合成 (仅当同时开启了 build 属性池时才生成虚拟 build.prop)
     if (g_cfg.build.enabled &&
         (norm == "/system/build.prop" || norm == "/system/etc/build.prop" ||
          norm == "/vendor/build.prop" || norm == "/vendor/etc/build.prop" ||
@@ -497,6 +493,7 @@ inline std::string resolve_dirfd_path_fast(int dirfd, const char *pathname) {
     if (pathname[0] == '/') return normalize_vfs_path(pathname);
     if (dirfd < 0 || dirfd == AT_FDCWD || !is_cpufreq_relative_candidate(pathname)) return "";
 
+    ErrnoRestorer errno_guard;
     char link_target[256] = {0};
     char proc_fd_path[64];
     std::snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/self/fd/%d", dirfd);
@@ -512,6 +509,7 @@ inline std::string resolve_dirfd_path_fast(int dirfd, const char *pathname) {
 
 inline int open_cloaked_vfs_fd_norm(const std::string &norm) {
     if (norm.empty() || !g_cfg.vfs.enabled) return -1;
+    ErrnoRestorer errno_guard;
 
     std::string content;
     int dyn_core_id = -1;
@@ -637,14 +635,30 @@ inline FILE *hook_fopen64(const char *pathname, const char *mode) {
     return hook_fopen(pathname, mode);
 }
 
+// 关键修复 1：拦截 fclose，在关闭 FILE* 前先解绑底层 fileno(fp)，防止 FD 残留污染
+inline int hook_fclose(FILE *fp) {
+    if (fp) {
+        int fd = fileno(fp);
+        if (fd >= 0) g_fd_cloak.unregister_fd(fd);
+    }
+    return orig_fclose ? orig_fclose(fp) : std::fclose(fp);
+}
+
 inline int hook_close(int fd) {
-    g_fd_cloak.unregister_fd(fd); // 内部使用 O(1) 无锁位图预检，普通 fd 1 周期返回
+    g_fd_cloak.unregister_fd(fd);
     return orig_close ? orig_close(fd) : close(fd);
+}
+
+// 关键修复 2：拦截 Android 10+ libjavacore.so 使用的 android_fdsan_close_with_tag
+inline int hook_android_fdsan_close_with_tag(int fd, uint64_t tag) {
+    g_fd_cloak.unregister_fd(fd);
+    return orig_fdsan_close ? orig_fdsan_close(fd, tag) : (orig_close ? orig_close(fd) : close(fd));
 }
 
 inline void refresh_dynamic_freq_fd_on_rewind(int fd) {
     int core_id = -1;
     if (__builtin_expect(g_fd_cloak.get_dynamic_core_id(fd, &core_id), 0)) {
+        ErrnoRestorer errno_guard;
         std::string next_freq = std::to_string(sample_live_core_freq_khz(core_id)) + "\n";
         if (orig_lseek) orig_lseek(fd, 0, SEEK_SET);
         write_full(fd, next_freq.data(), next_freq.size());
@@ -884,6 +898,125 @@ inline FILE *hook_popen(const char *command, const char *type) {
         }
     }
     return orig_popen ? orig_popen(command, type) : nullptr;
+}
+
+// ============================================================================
+// 按需 Seccomp-BPF 内联 svc #0 拦截器 (仅在开启 META:ENABLE_SECCOMP 时启用)
+// 原理：内核级 BPF 放行 libc.so 内部发起的一切合法系统调用，仅对第三方加固 .so
+//       直接发起的裸 svc #0 (openat / uname / sysinfo / readlinkat) 触发 SIGSYS 重定向！
+// ============================================================================
+inline struct sigaction g_old_sigsys{};
+inline bool g_seccomp_installed = false;
+
+#if defined(__aarch64__)
+inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw) {
+    if (sig != SIGSYS || !info || !ucontext_raw) return;
+    ErrnoRestorer errno_guard;
+    auto *uc = static_cast<ucontext_t *>(ucontext_raw);
+    int nr = info->si_syscall;
+
+    if (nr == __NR_openat) {
+        int dirfd = static_cast<int>(uc->uc_mcontext.regs[0]);
+        const char *pathname = reinterpret_cast<const char *>(uc->uc_mcontext.regs[1]);
+        int flags = static_cast<int>(uc->uc_mcontext.regs[2]);
+        mode_t mode = static_cast<mode_t>(uc->uc_mcontext.regs[3]);
+        emit_probe("SECCOMP_SVC", "inline_svc_openat", pathname ? pathname : "<null>");
+        int res = hook_openat(dirfd, pathname, flags, mode);
+        uc->uc_mcontext.regs[0] = (res >= 0) ? static_cast<uint64_t>(res) : static_cast<uint64_t>(-errno);
+        return;
+    }
+    if (nr == __NR_uname) {
+        auto *buf = reinterpret_cast<struct utsname *>(uc->uc_mcontext.regs[0]);
+        emit_probe("SECCOMP_SVC", "inline_svc_uname", "utsname");
+        int res = hook_uname(buf);
+        uc->uc_mcontext.regs[0] = (res == 0) ? 0ULL : static_cast<uint64_t>(-errno);
+        return;
+    }
+    if (nr == __NR_sysinfo) {
+        auto *s_info = reinterpret_cast<struct sysinfo *>(uc->uc_mcontext.regs[0]);
+        emit_probe("SECCOMP_SVC", "inline_svc_sysinfo", "sysinfo");
+        int res = hook_sysinfo(s_info);
+        uc->uc_mcontext.regs[0] = (res == 0) ? 0ULL : static_cast<uint64_t>(-errno);
+        return;
+    }
+    if (nr == __NR_readlinkat) {
+        int dirfd = static_cast<int>(uc->uc_mcontext.regs[0]);
+        const char *pathname = reinterpret_cast<const char *>(uc->uc_mcontext.regs[1]);
+        char *buf = reinterpret_cast<char *>(uc->uc_mcontext.regs[2]);
+        size_t bufsiz = static_cast<size_t>(uc->uc_mcontext.regs[3]);
+        emit_probe("SECCOMP_SVC", "inline_svc_readlinkat", pathname ? pathname : "<null>");
+        ssize_t res = hook_readlinkat(dirfd, pathname, buf, bufsiz);
+        uc->uc_mcontext.regs[0] = (res >= 0) ? static_cast<uint64_t>(res) : static_cast<uint64_t>(-errno);
+        return;
+    }
+}
+#endif
+
+inline void install_on_demand_seccomp_bpf() {
+    if (!g_cfg.vfs.enabled || !g_cfg.vfs.enable_seccomp || g_seccomp_installed) return;
+    g_seccomp_installed = true;
+
+#if defined(__aarch64__)
+    ErrnoRestorer errno_guard;
+    uintptr_t libc_low = 0, libc_high = 0;
+    FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
+    if (fp) {
+        char line[1024];
+        while (std::fgets(line, sizeof(line), fp)) {
+            if (std::strstr(line, "/libc.so") != nullptr && std::strstr(line, "r-xp") != nullptr) {
+                uintptr_t s = 0, e = 0;
+                if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2) {
+                    if (libc_low == 0 || s < libc_low) libc_low = s;
+                    if (e > libc_high) libc_high = e;
+                }
+            }
+        }
+        if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
+    }
+    if (libc_low == 0 || libc_high <= libc_low || (libc_low >> 32) != (libc_high >> 32)) {
+        return;
+    }
+
+    struct sigaction sa{};
+    sa.sa_sigaction = sigsys_seccomp_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    if (sigaction(SIGSYS, &sa, &g_old_sigsys) != 0) return;
+
+    uint32_t hi = static_cast<uint32_t>(libc_low >> 32);
+    uint32_t lo_start = static_cast<uint32_t>(libc_low & 0xFFFFFFFFULL);
+    uint32_t lo_end   = static_cast<uint32_t>(libc_high & 0xFFFFFFFFULL);
+
+    // BPF 规则：
+    // 1. 仅检查 openat(56), readlinkat(78), uname(160), sysinfo(179)，其余 100% 立即 ALLOW
+    // 2. 若调用指令 PC 位于 libc.so 代码段内 [libc_low, libc_high)，100% 立即 ALLOW（零信号开销、零递归）
+    // 3. 若来自外部 .so 的裸 svc #0，触发 SECCOMP_RET_TRAP 交由 sigsys_seccomp_handler 虚拟化
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_uname, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sysinfo, 0, 5),
+
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi, 0, 4),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo_start, 0, 2),
+        BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, lo_end, 1, 0),
+
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+    };
+
+    struct sock_fprog prog = {
+        .len = static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
+    emit_probe("SECCOMP_SVC", "BPF_Filter_Active", "Guarding inline svc #0");
+#endif
 }
 
 } // namespace mirage

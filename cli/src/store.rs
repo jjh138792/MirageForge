@@ -62,6 +62,7 @@ impl StoreEngine {
                 self.templates = parsed.templates;
                 for (pkg, mut r) in parsed.app_routes {
                     r.pkg_name = pkg.clone();
+                    r.refresh_rate = sanitize_refresh_rate(r.refresh_rate);
                     self.routes.insert(pkg, r);
                 }
             }
@@ -75,6 +76,7 @@ impl StoreEngine {
             }
             let parts: Vec<&str> = tr.split('|').collect();
             if parts.len() >= 6 && is_safe_token(parts[0]) && !parts[1].is_empty() {
+                let raw_col7 = parts.get(7).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
                 let r = AppRoute {
                     pkg_name: parts[0].to_string(),
                     tpl_id: parts[1].to_string(),
@@ -83,7 +85,8 @@ impl StoreEngine {
                     vfs: parts[4] == "1",
                     probe: parts[5] == "1",
                     sdk_spoof: parts.get(6).copied() == Some("1"),
-                    dpi: parts.get(7).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0),
+                    refresh_rate: sanitize_refresh_rate(raw_col7),
+                    seccomp: parts.get(8).copied() == Some("1"),
                 };
                 if r.is_any_enabled() {
                     self.routes.insert(r.pkg_name.clone(), r);
@@ -134,7 +137,7 @@ impl StoreEngine {
         r_lines.push(format!("# MirageForge v{} Routes Table", self.meta.version));
         for r in self.routes.values() {
             r_lines.push(format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.pkg_name,
                 r.tpl_id,
                 if r.build { "1" } else { "0" },
@@ -142,7 +145,8 @@ impl StoreEngine {
                 if r.vfs { "1" } else { "0" },
                 if r.probe { "1" } else { "0" },
                 if r.sdk_spoof { "1" } else { "0" },
-                r.dpi
+                sanitize_refresh_rate(r.refresh_rate),
+                if r.seccomp { "1" } else { "0" }
             ));
         }
         write_file_atomic(ROUTES_DB, &(r_lines.join("\n") + "\n"), 0o600);
@@ -166,6 +170,9 @@ impl StoreEngine {
         if tpl.incremental.is_empty() {
             tpl.incremental = tpl.build_id.clone();
         }
+        if sanitize_refresh_rate(tpl.max_refresh_rate) == 0 {
+            tpl.max_refresh_rate = 120;
+        }
         self.templates.insert(tpl.id.clone(), tpl);
         self.save_all_and_compile()
     }
@@ -180,10 +187,11 @@ impl StoreEngine {
         self.save_all_and_compile()
     }
 
-    pub fn set_route(&mut self, route: AppRoute, restart: bool) -> bool {
+    pub fn set_route(&mut self, mut route: AppRoute, restart: bool) -> bool {
         if !is_safe_token(&route.pkg_name) || !self.templates.contains_key(&route.tpl_id) {
             return false;
         }
+        route.refresh_rate = sanitize_refresh_rate(route.refresh_rate);
         let pkg = route.pkg_name.clone();
         if route.is_any_enabled() {
             self.routes.insert(pkg.clone(), route);
@@ -286,6 +294,7 @@ impl StoreEngine {
                 gl_vendor: "Qualcomm".into(),
                 gl_renderer: "Adreno (TM) 830".into(),
                 gl_version: "OpenGL ES 3.2 V@0800.0".into(),
+                max_refresh_rate: 120,
                 cpu_hardware: "Qualcomm Technologies, Inc SM8750".into(),
                 cpu_cores: 8,
                 cpu_max_freq: 4320000,
@@ -297,7 +306,6 @@ impl StoreEngine {
                 soc_machine: "SM8750".into(),
                 kernel_release: "6.6.30-android15-8-g94b8f12ab4c1".into(),
                 kernel_version: "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025".into(),
-                default_dpi: 0,
                 custom_props: "ro.miui.ui.version.code=15\nro.miui.ui.version.name=V816\nro.product.marketname=Xiaomi 15 Pro".into(),
             },
             DeviceTemplate {
@@ -327,6 +335,7 @@ impl StoreEngine {
                 gl_vendor: "Qualcomm".into(),
                 gl_renderer: "Adreno (TM) 830".into(),
                 gl_version: "OpenGL ES 3.2 V@0800.0".into(),
+                max_refresh_rate: 165,
                 cpu_hardware: "Qualcomm Technologies, Inc SM8750".into(),
                 cpu_cores: 8,
                 cpu_max_freq: 4320000,
@@ -338,12 +347,11 @@ impl StoreEngine {
                 soc_machine: "SM8750".into(),
                 kernel_release: "6.6.30-android15-8-rog9".into(),
                 kernel_version: "#1 SMP PREEMPT Mon Jan 20 08:30:00 UTC 2025".into(),
-                default_dpi: 0,
                 custom_props: "ro.product.asus.series=ROG Phone 9\nro.vendor.asus.gaming=1".into(),
             },
             DeviceTemplate {
                 id: "redmagic_10_pro".into(),
-                name: "红魔 10 Pro+ (24GB LPDDR5T 氘锋版)".into(),
+                name: "红魔 10 Pro+ (24GB LPDDR5T / 144Hz)".into(),
                 model: "NX789J".into(),
                 brand: "nubia".into(),
                 manufacturer: "ZTE".into(),
@@ -368,6 +376,7 @@ impl StoreEngine {
                 gl_vendor: "Qualcomm".into(),
                 gl_renderer: "Adreno (TM) 830".into(),
                 gl_version: "OpenGL ES 3.2 V@0800.0".into(),
+                max_refresh_rate: 144,
                 cpu_hardware: "Qualcomm Technologies, Inc SM8750".into(),
                 cpu_cores: 8,
                 cpu_max_freq: 4320000,
@@ -379,7 +388,6 @@ impl StoreEngine {
                 soc_machine: "SM8750".into(),
                 kernel_release: "6.6.30-android15-8-redmagic".into(),
                 kernel_version: "#1 SMP PREEMPT Fri Jan 10 21:35:12 CST 2025".into(),
-                default_dpi: 0,
                 custom_props: "ro.product.marketname=红魔 10 Pro+".into(),
             },
             DeviceTemplate {
@@ -409,6 +417,7 @@ impl StoreEngine {
                 gl_vendor: "ARM".into(),
                 gl_renderer: "Immortalis-G925 MC12".into(),
                 gl_version: "OpenGL ES 3.2 v1.r49p0-01eac0".into(),
+                max_refresh_rate: 120,
                 cpu_hardware: "MT6991".into(),
                 cpu_cores: 8,
                 cpu_max_freq: 3620000,
@@ -420,7 +429,6 @@ impl StoreEngine {
                 soc_machine: "MT6991".into(),
                 kernel_release: "6.6.30-android15-8-mt6991".into(),
                 kernel_version: "#1 SMP PREEMPT Wed Nov 20 15:12:00 CST 2024".into(),
-                default_dpi: 0,
                 custom_props: "ro.vivo.os.build.display.id=OriginOS 5\nro.vivo.market.name=vivo X200 Pro".into(),
             },
         ];

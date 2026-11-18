@@ -27,7 +27,7 @@ constexpr const char *ROUTES_DB_PATH   = "/data/adb/mirage_forge/routes.db";
 constexpr const char *APPS_CONF_DIR    = "/data/adb/mirage_forge/apps";
 constexpr const char *LAUNCH_LOG_PATH  = "/data/adb/mirage_forge/launch_history.log";
 
-// 从 module.prop 动态读取版本号，杜绝硬编码
+// 从 module.prop 动态读取版本号
 inline std::string read_module_prop_version() {
     std::ifstream ifs(MODULE_PROP_PATH);
     if (!ifs.is_open()) return "dynamic";
@@ -43,7 +43,7 @@ inline std::string read_module_prop_version() {
     return "dynamic";
 }
 
-// 易失性内存擦除工具：用 volatile 指针逐字节覆写 0，防止编译器优化掉清理动作
+// 易失性内存擦除工具
 inline void volatile_scrub_string(std::string &s) noexcept {
     if (s.empty()) return;
     volatile char *p = const_cast<volatile char *>(s.data());
@@ -61,12 +61,20 @@ inline void volatile_scrub_map(std::unordered_map<std::string, std::string> &m) 
     m.clear();
 }
 
-// 线程局部重入保护器
+// 严格保护线程 errno 的守卫器：防止探针 send() 或日志调用污染原系统调用的 errno
+struct ErrnoRestorer {
+    int saved_errno;
+    inline ErrnoRestorer() noexcept : saved_errno(errno) {}
+    inline ~ErrnoRestorer() noexcept { errno = saved_errno; }
+};
+
+// 线程局部重入保护器（自动附带 errno 保护）
 inline thread_local bool g_tls_in_hook = false;
 
 struct ScopedHookGuard {
+    int saved_errno;
     bool entered;
-    inline ScopedHookGuard() noexcept {
+    inline ScopedHookGuard() noexcept : saved_errno(errno) {
         if (__builtin_expect(g_tls_in_hook, 0)) {
             entered = false;
         } else {
@@ -78,6 +86,7 @@ struct ScopedHookGuard {
         if (entered) {
             g_tls_in_hook = false;
         }
+        errno = saved_errno;
     }
     explicit inline operator bool() const noexcept { return entered; }
 };
@@ -96,17 +105,15 @@ inline uint64_t hash_str(const std::string &s) noexcept {
 }
 
 // ============================================================================
-// 微模块 1：Build 反射、受限属性区与按应用 DPI 配置
+// 微模块 1：Build 反射与受限属性区配置 (已移除 DPI)
 // ============================================================================
 struct BuildModuleConfig {
     bool enabled = false;
     bool force_spoof_sdk = false;
-    int app_dpi = 0; // > 0 时开启按应用独立 DPI 伪装
     std::unordered_map<std::string, std::string> prop_map;
     std::unordered_map<std::string, std::string> build_map;
     std::unordered_map<std::string, std::string> version_map;
 
-    // 阅后即焚：当 Java 静态字段反射完成后，立即从堆内存中抹除 build_map 与 version_map
     void wipe_volatile_reflection_maps() noexcept {
         volatile_scrub_map(build_map);
         volatile_scrub_map(version_map);
@@ -114,10 +121,11 @@ struct BuildModuleConfig {
 };
 
 // ============================================================================
-// 微模块 2：OpenGL ES / Vulkan / MediaDrm 配置
+// 微模块 2：OpenGL ES / Vulkan / MediaDrm / 屏幕高刷配置
 // ============================================================================
 struct GraphicsModuleConfig {
     bool enabled = false;
+    int max_refresh_rate = 0; // 0 = 0改动；120 / 144 / 165 = 伪装屏幕最高刷新率
     std::string gl_vendor;
     std::string gl_renderer;
     std::string gl_version;
@@ -127,7 +135,7 @@ struct GraphicsModuleConfig {
 };
 
 // ============================================================================
-// 微模块 3：VFS 硬件拓扑与 Syscall 配置
+// 微模块 3：VFS 硬件拓扑与按需 Seccomp-BPF 配置
 // ============================================================================
 struct CpuClusterSpec {
     int first_core = 0;
@@ -141,6 +149,7 @@ struct CpuClusterSpec {
 
 struct VfsModuleConfig {
     bool enabled = false;
+    bool enable_seccomp = false; // false = 0改动；true = 开启按需 Seccomp-BPF 拦截裸 svc #0
     std::string cpu_hardware;
     std::string cpu_arch = "aarch64";
     std::string soc_id;
@@ -174,6 +183,10 @@ struct ModularConfig {
     GraphicsModuleConfig gl;
     VfsModuleConfig      vfs;
     ProbeModuleConfig    probe;
+
+    inline bool is_any_enabled() const noexcept {
+        return build.enabled || gl.enabled || vfs.enabled || probe.enabled;
+    }
 };
 
 inline ModularConfig g_cfg;

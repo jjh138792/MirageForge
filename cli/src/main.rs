@@ -105,7 +105,7 @@ fn main() {
                         .map(|t| t.name.as_str())
                         .unwrap_or(&r.tpl_id);
                     println!(
-                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{} DPI:{}]",
+                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{} FPS:{}Hz Seccomp:{}]",
                         r.pkg_name,
                         m_name,
                         r.build as u8,
@@ -113,7 +113,8 @@ fn main() {
                         r.vfs as u8,
                         r.probe as u8,
                         r.sdk_spoof as u8,
-                        r.dpi
+                        r.refresh_rate,
+                        r.seccomp as u8
                     );
                 }
             }
@@ -138,6 +139,36 @@ fn main() {
                     }
                     println!("{{\"ok\":false,\"error\":\"not_found\"}}");
                     process::exit(1);
+                }
+                "export-share" => {
+                    if let Some(id) = args.get(3) {
+                        if let Some(tpl) = store.templates.get(id) {
+                            let code = encode_template_share_code(tpl);
+                            if json_mode {
+                                println!("{{\"ok\":true,\"id\":\"{}\",\"code\":\"{}\"}}", id, code);
+                            } else {
+                                println!("{}", code);
+                            }
+                            return;
+                        }
+                    }
+                    println!("{{\"ok\":false,\"error\":\"not_found\"}}");
+                    process::exit(1);
+                }
+                "import-share" => {
+                    let raw = match args.get(3) {
+                        Some(s) if s != "-" => s.clone(),
+                        _ => read_stdin_all(),
+                    };
+                    if let Some(tpl) = decode_template_share_code(&raw) {
+                        if has_flag(&args, "--save") {
+                            store.upsert_template(tpl.clone());
+                        }
+                        println!("{}", serde_json::to_string(&tpl).unwrap_or_default());
+                    } else {
+                        println!("{{\"ok\":false,\"error\":\"invalid_share_code\"}}");
+                        process::exit(1);
+                    }
                 }
                 "set" | "set-stdin" => {
                     let payload = if sub == "set-stdin" {
@@ -197,6 +228,7 @@ fn main() {
         "route" => {
             let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
             if sub == "set" && args.len() >= 5 {
+                let fps_str = get_opt(&args, "--fps", get_opt(&args, "--refresh-rate", "0"));
                 let route = AppRoute {
                     pkg_name: args[3].clone(),
                     tpl_id: args[4].clone(),
@@ -205,7 +237,8 @@ fn main() {
                     vfs: get_opt(&args, "--vfs", "1") == "1",
                     probe: get_opt(&args, "--probe", "0") == "1",
                     sdk_spoof: get_opt(&args, "--sdk", "0") == "1",
-                    dpi: get_opt(&args, "--dpi", "0").parse::<i32>().unwrap_or(0),
+                    refresh_rate: sanitize_refresh_rate(fps_str.parse::<i32>().unwrap_or(0)),
+                    seccomp: get_opt(&args, "--seccomp", "0") == "1",
                 };
                 let restart = has_flag(&args, "--restart");
                 let ok = store.set_route(route, restart);
