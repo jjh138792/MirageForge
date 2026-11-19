@@ -11,6 +11,7 @@
 #include <sys/sysmacros.h>
 #include "zygisk.hpp"
 #include "mirage_config.hpp"
+#include "jvm_art_engine.hpp"
 #include "bionic_prop_engine.hpp"
 #include "vfs_sysinfo_engine.hpp"
 #include "graphics_vulkan_gles.hpp"
@@ -19,15 +20,19 @@ namespace mirage {
 
 inline zygisk::Api *g_zygisk_api = nullptr;
 inline std::mutex g_maps_mtx;
-// 使用 (dev, inode, offset) 三元组记录已挂载的 r-xp 代码段，解决 base.apk 内嵌多个 .so 共享同一个 (dev, inode) 被跳过的问题
 inline std::set<std::tuple<dev_t, ino_t, uintptr_t>> g_hooked_elves;
 inline void *g_discard_old_slot = nullptr;
 inline int g_plt_commit_pass = 0;
 inline dev_t g_self_dev = 0;
 inline ino_t g_self_ino = 0;
 
+using PFN_loader_dlopen = void *(*)(const char *filename, int flags, const void *caller_addr);
+using PFN_loader_android_dlopen_ext = void *(*)(const char *filename, int flags, const void *extinfo, const void *caller_addr);
+
 inline void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
 inline void *(*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
+inline PFN_loader_dlopen orig_loader_dlopen = nullptr;
+inline PFN_loader_android_dlopen_ext orig_loader_android_dlopen_ext = nullptr;
 
 inline void scan_and_commit_plt_hooks();
 
@@ -36,6 +41,8 @@ inline void init_linker_symbols() {
     ErrnoRestorer errno_guard;
     orig_dlopen = reinterpret_cast<decltype(orig_dlopen)>(dlsym(RTLD_DEFAULT, "dlopen"));
     orig_android_dlopen_ext = reinterpret_cast<decltype(orig_android_dlopen_ext)>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
+    orig_loader_dlopen = reinterpret_cast<PFN_loader_dlopen>(dlsym(RTLD_DEFAULT, "__loader_dlopen"));
+    orig_loader_android_dlopen_ext = reinterpret_cast<PFN_loader_android_dlopen_ext>(dlsym(RTLD_DEFAULT, "__loader_android_dlopen_ext"));
     if (!orig_loader_dlsym) {
         orig_loader_dlsym = reinterpret_cast<PFN_loader_dlsym>(dlsym(RTLD_DEFAULT, "__loader_dlsym"));
     }
@@ -43,7 +50,6 @@ inline void init_linker_symbols() {
         orig_dlsym = reinterpret_cast<PFN_dlsym>(dlsym(RTLD_DEFAULT, "dlsym"));
     }
 
-    // 获取本模块自身 (arm64-v8a.so) 的真实 (dev, ino)，确保绝不 Hook 自身
     Dl_info self_info{};
     if (dladdr(reinterpret_cast<const void *>(&init_linker_symbols), &self_info) && self_info.dli_fname) {
         struct stat st{};
@@ -63,7 +69,6 @@ inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) no
 inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
     if (path[0] != '/') return false;
 
-    // 关键修复：在完整 path 上检查 mirage_forge 与 /data/adb/，防止 /data/adb/modules/mirage_forge/zygisk/arm64-v8a.so 误伤自己！
     if (std::strstr(path, "mirage_forge") != nullptr ||
         std::strncmp(path, "/data/adb/", 10) == 0) {
         return false;
@@ -134,6 +139,10 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
     }
 
     if (g_cfg.gl.enabled) {
+        if (std::strcmp(symbol, "vk_icdGetInstanceProcAddr") == 0) {
+            orig_icd_GetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_sym);
+            return reinterpret_cast<void *>(hook_icd_GetInstanceProcAddr);
+        }
         if (std::strcmp(symbol, "vkGetInstanceProcAddr") == 0) {
             orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_sym);
             return reinterpret_cast<void *>(hook_vkGetInstanceProcAddr);
@@ -175,24 +184,32 @@ inline bool should_rescan_on_dlopen(const char *filename) noexcept {
 }
 
 inline void *hook_dlopen(const char *filename, int flags) {
-    void *handle = orig_dlopen ? orig_dlopen(filename, flags) : nullptr;
+    const void *caller_addr = __builtin_return_address(0);
+    void *handle = orig_loader_dlopen
+                       ? orig_loader_dlopen(filename, flags, caller_addr)
+                       : (orig_dlopen ? orig_dlopen(filename, flags) : nullptr);
     if (handle && should_rescan_on_dlopen(filename)) {
         ScopedHookGuard guard;
         if (guard) {
             emit_probe("DLOPEN", filename, "Incremental PLT Hook");
             scan_and_commit_plt_hooks();
+            try_lazy_spoof_display_modes();
         }
     }
     return handle;
 }
 
 inline void *hook_android_dlopen_ext(const char *filename, int flags, const void *extinfo) {
-    void *handle = orig_android_dlopen_ext ? orig_android_dlopen_ext(filename, flags, extinfo) : nullptr;
+    const void *caller_addr = __builtin_return_address(0);
+    void *handle = orig_loader_android_dlopen_ext
+                       ? orig_loader_android_dlopen_ext(filename, flags, extinfo, caller_addr)
+                       : (orig_android_dlopen_ext ? orig_android_dlopen_ext(filename, flags, extinfo) : nullptr);
     if (handle && should_rescan_on_dlopen(filename)) {
         ScopedHookGuard guard;
         if (guard) {
             emit_probe("DLOPEN_EXT", filename, "Incremental PLT Hook");
             scan_and_commit_plt_hooks();
+            try_lazy_spoof_display_modes();
         }
     }
     return handle;
@@ -223,8 +240,6 @@ inline void scan_and_commit_plt_hooks() {
                         &start, &end, perms, &offset, &dev_maj, &dev_min, &inode_ul, &path_pos) < 7) {
             continue;
         }
-        // 关键修复：仅扫描具有可执行权限 (r-xp) 的代码段映射！
-        // 避免 base.apk 的只读资源映射 (r--p) 提前占坑导致后续从 APK 内 dlopen 的 .so 被跳过
         if (inode_ul == 0 || std::strchr(perms, 'x') == nullptr) continue;
 
         dev_t dev = makedev(dev_maj, dev_min);
@@ -261,7 +276,6 @@ inline void scan_and_commit_plt_hooks() {
             reg("dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym));
         }
 
-        // 模块 1：仅当开启了 Build 或 Probe (或 GL 云机属性) 时才注册 Bionic 属性 Hook
         if (g_cfg.build.enabled || g_cfg.gl.enabled || g_cfg.probe.enabled) {
             reg("__system_property_find", reinterpret_cast<void *>(hook_system_property_find), reinterpret_cast<void **>(&orig_system_property_find));
             reg("__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read_callback), reinterpret_cast<void **>(&orig_system_property_read_callback));
@@ -274,7 +288,6 @@ inline void scan_and_commit_plt_hooks() {
             reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
         }
 
-        // 模块 2：仅当开启了 VFS 护盾时才注册文件 I/O Hook
         if (g_cfg.vfs.enabled) {
             reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
             reg("open64", reinterpret_cast<void *>(hook_open64), reinterpret_cast<void **>(&orig_open64));
@@ -307,8 +320,8 @@ inline void scan_and_commit_plt_hooks() {
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
         }
 
-        // 模块 3：仅当开启了 GL/Vulkan 模块时才注册图形与 DRM Hook
         if (g_cfg.gl.enabled) {
+            reg("hw_get_module", reinterpret_cast<void *>(hook_hw_get_module), reinterpret_cast<void **>(&orig_hw_get_module));
             reg("glGetString", reinterpret_cast<void *>(hook_glGetString), reinterpret_cast<void **>(&orig_glGetString));
             reg("eglGetProcAddress", reinterpret_cast<void *>(hook_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
             reg("vkGetInstanceProcAddr", reinterpret_cast<void *>(hook_vkGetInstanceProcAddr), reinterpret_cast<void **>(&orig_vkGetInstanceProcAddr));

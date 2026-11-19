@@ -17,12 +17,12 @@
 #include "zygisk.hpp"
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
+#include "jvm_art_engine.hpp"
 #include "fd_cloak_tracker.hpp"
 #include "bionic_prop_engine.hpp"
 #include "vfs_sysinfo_engine.hpp"
 #include "graphics_vulkan_gles.hpp"
 #include "linker_plt_engine.hpp"
-#include "jvm_art_engine.hpp"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
@@ -148,6 +148,7 @@ public:
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
         if (!g_cfg.active) return;
+        g_post_specialized.store(true, std::memory_order_release);
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
             g_cfg.build.wipe_volatile_reflection_maps();

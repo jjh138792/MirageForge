@@ -9,13 +9,15 @@
 namespace mirage {
 
 inline JavaVM *g_jvm = nullptr;
+inline std::atomic<bool> g_post_specialized{false};
 inline std::atomic<bool> g_fps_spoof_applied{false};
 
-// 仅在应用已经完成初始化后（例如首次调用 OpenGL/Vulkan 时）温和修补已缓存的 Display$Mode.mRefreshRate，
-// 绝不在 Zygote preAppSpecialize 阶段主动发起 Binder IPC 调用！
+// 仅在 postAppSpecialize 之后、且当前已在合法 Java 线程且 DisplayManagerGlobal.sInstance 已存在时修补缓存，
+// 绝不在 Zygote 阶段主动触发 Binder IPC
 inline void try_lazy_spoof_display_modes() {
     int target_hz = g_cfg.gl.max_refresh_rate;
     if (!g_cfg.gl.enabled || target_hz < 90 || target_hz > 240 || !g_jvm) return;
+    if (!g_post_specialized.load(std::memory_order_acquire)) return;
     if (g_fps_spoof_applied.load(std::memory_order_relaxed)) return;
 
     JNIEnv *env = nullptr;
@@ -24,28 +26,26 @@ inline void try_lazy_spoof_display_modes() {
     }
     if (env->ExceptionCheck()) return;
 
-    g_fps_spoof_applied.store(true, std::memory_order_relaxed);
-    float fps = static_cast<float>(target_hz);
-
     jclass dmg_cls = env->FindClass("android/hardware/display/DisplayManagerGlobal");
     if (!dmg_cls) { env->ExceptionClear(); return; }
 
-    // 仅读取 sInstance 静态字段：若应用尚未初始化 DisplayManagerGlobal，绝不主动调 getInstance() 触发 Binder！
     jfieldID sinst_fid = env->GetStaticFieldID(dmg_cls, "sInstance", "Landroid/hardware/display/DisplayManagerGlobal;");
     if (env->ExceptionCheck() || !sinst_fid) {
         env->ExceptionClear();
         env->DeleteLocalRef(dmg_cls);
-        g_fps_spoof_applied.store(false, std::memory_order_relaxed);
         return;
     }
 
     jobject dmg = env->GetStaticObjectField(dmg_cls, sinst_fid);
     if (env->ExceptionCheck() || !dmg) {
+        // 应用尚未初始化 DisplayManagerGlobal，等待下次调用再试
         env->ExceptionClear();
         env->DeleteLocalRef(dmg_cls);
-        g_fps_spoof_applied.store(false, std::memory_order_relaxed);
         return;
     }
+
+    float fps = static_cast<float>(target_hz);
+    bool patched = false;
 
     jmethodID get_di = env->GetMethodID(dmg_cls, "getDisplayInfo", "(I)Landroid/view/DisplayInfo;");
     if (get_di) {
@@ -53,12 +53,27 @@ inline void try_lazy_spoof_display_modes() {
         if (!env->ExceptionCheck() && di) {
             jclass di_cls = env->GetObjectClass(di);
             jclass mode_cls = env->FindClass("android/view/Display$Mode");
+
             jfieldID mode_rr_fid = mode_cls ? env->GetFieldID(mode_cls, "mRefreshRate", "F") : nullptr;
             if (env->ExceptionCheck()) { env->ExceptionClear(); mode_rr_fid = nullptr; }
 
-            if (di_cls && mode_rr_fid) {
-                jfieldID arr_fid = env->GetFieldID(di_cls, "supportedModes", "[Landroid/view/Display$Mode;");
-                if (!env->ExceptionCheck() && arr_fid) {
+            // Android 15+ 新增 mVsyncRate 字段
+            jfieldID mode_vsync_fid = mode_cls ? env->GetFieldID(mode_cls, "mVsyncRate", "F") : nullptr;
+            if (env->ExceptionCheck()) { env->ExceptionClear(); mode_vsync_fid = nullptr; }
+
+            if (di_cls) {
+                jfieldID ovr_fid = env->GetFieldID(di_cls, "refreshRateOverride", "F");
+                if (!env->ExceptionCheck() && ovr_fid) {
+                    env->SetFloatField(di, ovr_fid, fps);
+                    patched = true;
+                } else {
+                    env->ExceptionClear();
+                }
+
+                auto patch_mode_array = [&](const char *arr_name) {
+                    if (!mode_rr_fid) return;
+                    jfieldID arr_fid = env->GetFieldID(di_cls, arr_name, "[Landroid/view/Display$Mode;");
+                    if (env->ExceptionCheck() || !arr_fid) { env->ExceptionClear(); return; }
                     auto arr = static_cast<jobjectArray>(env->GetObjectField(di, arr_fid));
                     if (!env->ExceptionCheck() && arr) {
                         jsize len = env->GetArrayLength(arr);
@@ -66,20 +81,22 @@ inline void try_lazy_spoof_display_modes() {
                             jobject m_obj = env->GetObjectArrayElement(arr, i);
                             if (m_obj) {
                                 env->SetFloatField(m_obj, mode_rr_fid, fps);
+                                if (mode_vsync_fid) env->SetFloatField(m_obj, mode_vsync_fid, fps);
                                 env->DeleteLocalRef(m_obj);
+                                patched = true;
                             }
                         }
                         env->DeleteLocalRef(arr);
-                        emit_probe("DISPLAY_FPS", "Display$Mode.getRefreshRate", std::to_string(target_hz) + "Hz");
                     } else {
                         env->ExceptionClear();
                     }
-                } else {
-                    env->ExceptionClear();
-                }
+                };
+
+                patch_mode_array("supportedModes");
+                patch_mode_array("appsSupportedModes");
+                env->DeleteLocalRef(di_cls);
             }
             if (mode_cls) env->DeleteLocalRef(mode_cls);
-            if (di_cls) env->DeleteLocalRef(di_cls);
             env->DeleteLocalRef(di);
         } else {
             env->ExceptionClear();
@@ -90,6 +107,11 @@ inline void try_lazy_spoof_display_modes() {
 
     env->DeleteLocalRef(dmg);
     env->DeleteLocalRef(dmg_cls);
+
+    if (patched) {
+        g_fps_spoof_applied.store(true, std::memory_order_release);
+        emit_probe("DISPLAY_FPS", "DisplayInfo.supportedModes", std::to_string(target_hz) + "Hz");
+    }
 }
 
 inline void reflect_java_build_fields(JNIEnv *env) {
