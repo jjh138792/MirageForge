@@ -328,6 +328,14 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 
 inline int hook_system_property_get(const char *name, char *value) {
     if (name && value) {
+        if (g_cfg.gl.enabled && g_on_vulkan_prop_hit &&
+            std::strncmp(name, "persist.sys.cloud.gpu.vk_", 25) == 0) {
+            static std::atomic<bool> s_vk_rescanned{false};
+            if (!s_vk_rescanned.exchange(true, std::memory_order_acq_rel)) {
+                ScopedHookGuard guard;
+                if (guard) g_on_vulkan_prop_hit();
+            }
+        }
         if (g_cfg.build.enabled || g_cfg.gl.enabled) {
             auto it = g_cfg.build.prop_map.find(name);
             if (it != g_cfg.build.prop_map.end()) {

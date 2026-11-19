@@ -312,6 +312,34 @@ inline int hook_hwvulkan_open(const HwModuleCompat *module, const char *id, HwDe
     return ret;
 }
 
+// AOSP hardware/hardware.h: HARDWARE_MODULE_TAG = MAKE_TAG_CONSTANT('H','W','M','T')
+constexpr uint32_t kHardwareModuleTag = 0x48574D54U;
+
+inline const HwModuleCompat *wrap_hwvulkan_module_if_needed(const HwModuleCompat *mod) {
+    if (!mod || !g_cfg.gl.enabled) return mod;
+    if (mod->tag != kHardwareModuleTag || !mod->id || std::strcmp(mod->id, "vulkan") != 0) {
+        return mod;
+    }
+    if (!mod->methods || !mod->methods->open || mod->methods->open == hook_hwvulkan_open) {
+        return mod;
+    }
+    orig_hwvulkan_module = mod;
+    orig_hwvulkan_open = mod->methods->open;
+    g_wrapped_hwvulkan_module = *mod;
+    g_wrapped_hwvulkan_methods = *(mod->methods);
+    g_wrapped_hwvulkan_methods.open = hook_hwvulkan_open;
+    g_wrapped_hwvulkan_module.methods = &g_wrapped_hwvulkan_methods;
+    return &g_wrapped_hwvulkan_module;
+}
+
+inline int hook_hw_get_module(const char *id, const HwModuleCompat **module) {
+    int ret = orig_hw_get_module ? orig_hw_get_module(id, module) : -1;
+    if (ret == 0 && g_cfg.gl.enabled && id && std::strcmp(id, "vulkan") == 0 && module && *module) {
+        *module = wrap_hwvulkan_module_if_needed(*module);
+    }
+    return ret;
+}
+
 inline int hook_hw_get_module(const char *id, const HwModuleCompat **module) {
     int ret = orig_hw_get_module ? orig_hw_get_module(id, module) : -1;
     if (ret == 0 && g_cfg.gl.enabled && id && std::strcmp(id, "vulkan") == 0 &&

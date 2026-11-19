@@ -22,7 +22,6 @@ inline zygisk::Api *g_zygisk_api = nullptr;
 inline std::mutex g_maps_mtx;
 inline std::set<std::tuple<dev_t, ino_t, uintptr_t>> g_hooked_elves;
 inline void *g_discard_old_slot = nullptr;
-inline int g_plt_commit_pass = 0;
 inline dev_t g_self_dev = 0;
 inline ino_t g_self_ino = 0;
 
@@ -58,6 +57,7 @@ inline void init_linker_symbols() {
             g_self_ino = st.st_ino;
         }
     }
+    g_on_vulkan_prop_hit = scan_and_commit_plt_hooks;
 }
 
 inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) noexcept {
@@ -102,6 +102,10 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
         "libjavacore.so",
         "libopenjdk.so",
         "libopenjdkjvm.so",
+        "libmeminfo.so",
+        "libprocinfo.so",
+        "libhardware.so",
+        "libgraphicsenv.so",
         "libc++.so",
         "libcutils.so",
         "libutils.so",
@@ -139,6 +143,11 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
     }
 
     if (g_cfg.gl.enabled) {
+        // 拦截 libhardware.so 加载 vulkan.*.so 时查找的 HAL 模块入口结构体 "HMI"
+        if (std::strcmp(symbol, "HMI") == 0) {
+            const auto *wrapped = wrap_hwvulkan_module_if_needed(static_cast<const HwModuleCompat *>(real_sym));
+            return const_cast<HwModuleCompat *>(wrapped);
+        }
         if (std::strcmp(symbol, "vk_icdGetInstanceProcAddr") == 0) {
             orig_icd_GetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_sym);
             return reinterpret_cast<void *>(hook_icd_GetInstanceProcAddr);
@@ -169,6 +178,19 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
             return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
         }
     }
+
+    if (g_cfg.vfs.enabled) {
+        if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
+        if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
+        if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
+        if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
+        if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
+        if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
+        if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
+        if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
+        if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
+    }
+
     return real_sym;
 }
 
@@ -272,7 +294,7 @@ inline void scan_and_commit_plt_hooks() {
 
         reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
         reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
-        if (g_cfg.gl.enabled) {
+        if (g_cfg.gl.enabled || g_cfg.vfs.enabled) {
             reg("dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym));
         }
 
@@ -337,10 +359,6 @@ inline void scan_and_commit_plt_hooks() {
         g_zygisk_api->pltHookCommit();
     }
     g_maps_mtx.unlock();
-
-    if (++g_plt_commit_pass == 2 && g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {
-        install_on_demand_seccomp_bpf();
-    }
 }
 
 } // namespace mirage

@@ -70,6 +70,8 @@ struct ErrnoRestorer {
 
 // 线程局部重入保护器（自动附带 errno 保护）
 inline thread_local bool g_tls_in_hook = false;
+inline thread_local bool g_tls_in_sigsys = false;
+inline void (*g_on_vulkan_prop_hit)() = nullptr;
 
 struct ScopedHookGuard {
     int saved_errno;

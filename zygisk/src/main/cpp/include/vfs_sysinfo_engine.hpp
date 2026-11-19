@@ -901,10 +901,7 @@ inline FILE *hook_popen(const char *command, const char *type) {
 }
 
 // ============================================================================
-// ============================================================================
-// 按需 Seccomp-BPF 内联 svc #0 拦截器 (仅在开启 META:ENABLE_SECCOMP 时启用)
-// 原理：内核级 BPF 放行 libc.so 与 linker64 内部的全部合法系统调用，仅对外部加固 .so
-//       直接发起的裸 svc #0 (openat / readlinkat / uname / sysinfo) 触发 SIGSYS 重定向！
+// 按需 Seccomp-BPF 内联 svc #0 拦截器 (仅在 postAppSpecialize 末尾按需激活)
 // ============================================================================
 inline struct sigaction g_old_sigsys{};
 inline bool g_seccomp_installed = false;
@@ -913,6 +910,9 @@ inline bool g_seccomp_installed = false;
 inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw) {
     if (sig != SIGSYS || !info || !ucontext_raw) return;
     int saved_errno = errno;
+    bool prev_in_sigsys = g_tls_in_sigsys;
+    g_tls_in_sigsys = true;
+
     auto *uc = static_cast<ucontext_t *>(ucontext_raw);
     int nr = info->si_syscall;
 
@@ -923,18 +923,14 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
         mode_t mode = static_cast<mode_t>(uc->uc_mcontext.regs[3]);
 
         int res = -1;
-        // 极速无堆分配直通：99.9% 的非 VFS 路径直接走 orig_openat (位于 libc.so，BPF 自动放行)
-        if (!is_vfs_candidate_prefix(pathname) && !is_cpufreq_relative_candidate(pathname)) {
+        if (!pathname || (!is_vfs_candidate_prefix(pathname) && !is_cpufreq_relative_candidate(pathname))) {
             res = orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
         } else {
             res = hook_openat(dirfd, pathname, flags, mode);
         }
         int err = errno;
         uc->uc_mcontext.regs[0] = (res >= 0) ? static_cast<uint64_t>(res) : static_cast<uint64_t>(-err);
-        errno = saved_errno;
-        return;
-    }
-    if (nr == __NR_readlinkat) {
+    } else if (nr == __NR_readlinkat) {
         int dirfd = static_cast<int>(uc->uc_mcontext.regs[0]);
         const char *pathname = reinterpret_cast<const char *>(uc->uc_mcontext.regs[1]);
         char *buf = reinterpret_cast<char *>(uc->uc_mcontext.regs[2]);
@@ -944,25 +940,19 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
                           : (orig_readlinkat ? orig_readlinkat(dirfd, pathname, buf, bufsiz) : -1);
         int err = errno;
         uc->uc_mcontext.regs[0] = (res >= 0) ? static_cast<uint64_t>(res) : static_cast<uint64_t>(-err);
-        errno = saved_errno;
-        return;
-    }
-    if (nr == __NR_uname) {
+    } else if (nr == __NR_uname) {
         auto *buf = reinterpret_cast<struct utsname *>(uc->uc_mcontext.regs[0]);
         int res = hook_uname(buf);
         int err = errno;
         uc->uc_mcontext.regs[0] = (res == 0) ? 0ULL : static_cast<uint64_t>(-err);
-        errno = saved_errno;
-        return;
-    }
-    if (nr == __NR_sysinfo) {
+    } else if (nr == __NR_sysinfo) {
         auto *s_info = reinterpret_cast<struct sysinfo *>(uc->uc_mcontext.regs[0]);
         int res = hook_sysinfo(s_info);
         int err = errno;
         uc->uc_mcontext.regs[0] = (res == 0) ? 0ULL : static_cast<uint64_t>(-err);
-        errno = saved_errno;
-        return;
     }
+
+    g_tls_in_sigsys = prev_in_sigsys;
     errno = saved_errno;
 }
 #endif
@@ -985,9 +975,11 @@ inline void install_on_demand_seccomp_bpf() {
         char line[1024];
         while (std::fgets(line, sizeof(line), fp)) {
             if (std::strstr(line, "r-xp") == nullptr && std::strstr(line, "--xp") == nullptr) continue;
-            // 必须同时放行 libc.so、linker64 与 [vdso]，防止 dlopen 持有 g_dl_mutex 时触发 SIGSYS 死锁！
+            // 白名单放行系统核心运行时与本模块自身，避免持有动态链接锁或 GC 时重入 SIGSYS
             if (std::strstr(line, "/libc.so") == nullptr &&
                 std::strstr(line, "/linker64") == nullptr &&
+                std::strstr(line, "/libart.so") == nullptr &&
+                std::strstr(line, "mirage_forge") == nullptr &&
                 std::strstr(line, "[vdso]") == nullptr) {
                 continue;
             }
@@ -1007,13 +999,13 @@ inline void install_on_demand_seccomp_bpf() {
     struct sigaction sa{};
     sa.sa_sigaction = sigsys_seccomp_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    // 关键修复：绝对不要对 SIGSYS 设置 SA_ONSTACK，直接在原线程大栈上运行，杜绝 sigaltstack 溢出闪退！
+    sa.sa_flags = SA_SIGINFO;
     if (sigaction(SIGSYS, &sa, &g_old_sigsys) != 0) return;
 
     std::vector<struct sock_filter> filter;
     filter.reserve(8 + allow_ranges.size() * 6);
 
-    // [0..5] 仅筛查 4 个目标系统调用，其余 300+ 系统调用直接走索引 [5] ALLOW
     filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)));
     filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     4, 0));
     filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 3, 0));
@@ -1021,7 +1013,6 @@ inline void install_on_demand_seccomp_bpf() {
     filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sysinfo,    1, 0));
     filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 
-    // 为 libc.so / linker64 / [vdso] 的每一段可执行代码生成 PC 范围放行指令 (6 条/段)
     for (const auto &r : allow_ranges) {
         filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4));
         filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, r.hi, 0, 4));
@@ -1031,7 +1022,6 @@ inline void install_on_demand_seccomp_bpf() {
         filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     }
 
-    // 不在白名单代码段内的裸 svc #0 -> 触发 SIGSYS
     filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP));
 
     struct sock_fprog prog = {

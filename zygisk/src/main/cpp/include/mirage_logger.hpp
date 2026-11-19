@@ -108,7 +108,7 @@ inline void write_direct_log_line(int prio, const std::string &line) {
 }
 
 inline void emit_probe(const char *domain, const std::string &key, const std::string &val) {
-    if (__builtin_expect(!g_cfg.probe.enabled, 1)) return;
+    if (__builtin_expect(!g_cfg.probe.enabled || g_tls_in_sigsys, 1)) return;
     ErrnoRestorer errno_guard;
 
     uint64_t h = hash_str(std::string(domain) + ":" + key);
