@@ -381,6 +381,10 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
             uint64_t cached_kb = (total_kb * 28ULL) / 100ULL;
             uint64_t active_kb = (total_kb * 36ULL) / 100ULL;
             uint64_t inactive_kb = (total_kb * 22ULL) / 100ULL;
+            uint64_t sreclaim_kb = (total_kb * 4ULL) / 100ULL;
+            uint64_t sunreclaim_kb = (total_kb * 3ULL) / 100ULL;
+            uint64_t mapped_kb = (total_kb * 8ULL) / 100ULL;
+            uint64_t shmem_kb = (total_kb * 2ULL) / 100ULL;
 
             std::ostringstream ss;
             ss << "MemTotal:       " << total_kb << " kB\n"
@@ -391,11 +395,18 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
                << "SwapCached:            0 kB\n"
                << "Active:         " << active_kb << " kB\n"
                << "Inactive:       " << inactive_kb << " kB\n"
+               << "Shmem:          " << shmem_kb << " kB\n"
+               << "KReclaimable:   " << sreclaim_kb << " kB\n"
+               << "Slab:           " << (sreclaim_kb + sunreclaim_kb) << " kB\n"
+               << "SReclaimable:   " << sreclaim_kb << " kB\n"
+               << "SUnreclaim:     " << sunreclaim_kb << " kB\n"
+               << "Mapped:         " << mapped_kb << " kB\n"
                << "SwapTotal:       8388608 kB\n"
                << "SwapFree:        8126464 kB\n";
             *out_content = ss.str();
             return true;
         }
+
         if (norm == "/proc/cpuinfo") {
             int cores = (g_cfg.vfs.cpu_cores > 0 && g_cfg.vfs.cpu_cores <= 16) ? g_cfg.vfs.cpu_cores : 8;
             std::ostringstream ss;
@@ -821,13 +832,18 @@ inline long hook_sysconf(int name) {
             if (guard) emit_probe("SYSCONF", "_SC_NPROCESSORS", std::to_string(g_cfg.vfs.cpu_cores));
             return g_cfg.vfs.cpu_cores > 0 ? g_cfg.vfs.cpu_cores : 8;
         }
-        if (name == _SC_PHYS_PAGES && g_cfg.vfs.ram_gb > 0) {
+        if ((name == _SC_PHYS_PAGES || name == _SC_AVPHYS_PAGES) && g_cfg.vfs.ram_gb > 0) {
             long page_sz = orig_sysconf ? orig_sysconf(_SC_PAGESIZE) : 4096;
             if (page_sz <= 0) page_sz = 4096;
             uint64_t total_bytes = calc_realistic_memtotal_kb(g_cfg.vfs.ram_gb) * 1024ULL;
+            uint64_t target_bytes = (name == _SC_AVPHYS_PAGES) ? ((total_bytes * 58ULL) / 100ULL) : total_bytes;
             ScopedHookGuard guard;
-            if (guard) emit_probe("SYSCONF", "_SC_PHYS_PAGES", std::to_string(g_cfg.vfs.ram_gb) + "GB");
-            return static_cast<long>(total_bytes / static_cast<uint64_t>(page_sz));
+            if (guard) {
+                emit_probe("SYSCONF",
+                           name == _SC_AVPHYS_PAGES ? "_SC_AVPHYS_PAGES" : "_SC_PHYS_PAGES",
+                           std::to_string(g_cfg.vfs.ram_gb) + "GB");
+            }
+            return static_cast<long>(target_bytes / static_cast<uint64_t>(page_sz));
         }
     }
     return orig_sysconf ? orig_sysconf(name) : sysconf(name);
@@ -901,55 +917,121 @@ inline FILE *hook_popen(const char *command, const char *type) {
 }
 
 // ============================================================================
-// 按需 Seccomp-BPF 内联 svc #0 拦截器 (仅在 postAppSpecialize 末尾按需激活)
+// 按需 Seccomp-BPF 内联 svc #0 拦截器 (全异步信号安全 + 裸汇编直通)
 // ============================================================================
 inline struct sigaction g_old_sigsys{};
 inline bool g_seccomp_installed = false;
 
 #if defined(__aarch64__)
+__attribute__((noinline))
+inline int64_t mirage_seccomp_bypass_syscall(
+    long nr, long a0, long a1, long a2, long a3, long a4, long a5) noexcept {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    __asm__ volatile(
+        "svc #0\n"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+        : "memory", "cc"
+    );
+    return static_cast<int64_t>(x0);
+}
+
 inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw) {
     if (sig != SIGSYS || !info || !ucontext_raw) return;
+
+    int nr = info->si_syscall;
+    // 若触发 SIGSYS 的系统调用不是我们拦截的 4 个（例如 Android 原生 Seccomp 策略），立即转发原处理器！
+    if (nr != __NR_openat && nr != __NR_readlinkat && nr != __NR_uname && nr != __NR_sysinfo) {
+        if ((g_old_sigsys.sa_flags & SA_SIGINFO) && g_old_sigsys.sa_sigaction) {
+            g_old_sigsys.sa_sigaction(sig, info, ucontext_raw);
+        } else if (g_old_sigsys.sa_handler != SIG_DFL && g_old_sigsys.sa_handler != SIG_IGN) {
+            g_old_sigsys.sa_handler(sig);
+        } else {
+            auto *uc = static_cast<ucontext_t *>(ucontext_raw);
+            uc->uc_mcontext.regs[0] = static_cast<uint64_t>(-ENOSYS);
+        }
+        return;
+    }
+
     int saved_errno = errno;
     bool prev_in_sigsys = g_tls_in_sigsys;
     g_tls_in_sigsys = true;
 
     auto *uc = static_cast<ucontext_t *>(ucontext_raw);
-    int nr = info->si_syscall;
+    long a0 = static_cast<long>(uc->uc_mcontext.regs[0]);
+    long a1 = static_cast<long>(uc->uc_mcontext.regs[1]);
+    long a2 = static_cast<long>(uc->uc_mcontext.regs[2]);
+    long a3 = static_cast<long>(uc->uc_mcontext.regs[3]);
 
     if (nr == __NR_openat) {
-        int dirfd = static_cast<int>(uc->uc_mcontext.regs[0]);
-        const char *pathname = reinterpret_cast<const char *>(uc->uc_mcontext.regs[1]);
-        int flags = static_cast<int>(uc->uc_mcontext.regs[2]);
-        mode_t mode = static_cast<mode_t>(uc->uc_mcontext.regs[3]);
-
-        int res = -1;
-        if (!pathname || (!is_vfs_candidate_prefix(pathname) && !is_cpufreq_relative_candidate(pathname))) {
-            res = orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
+        const char *pathname = reinterpret_cast<const char *>(a1);
+        int64_t raw_ret = -1;
+        // 仅对绝对路径的 /proc/ 或 /sys/ 才尝试虚拟化，其余 99.9% 路径零堆分配直通裸 svc #0
+        if (pathname &&
+            (std::strncmp(pathname, "/proc/", 6) == 0 || std::strncmp(pathname, "/sys/", 5) == 0)) {
+            int fake_fd = open_cloaked_vfs_fd(pathname);
+            if (fake_fd >= 0) {
+                raw_ret = fake_fd;
+            } else {
+                raw_ret = mirage_seccomp_bypass_syscall(__NR_openat, a0, a1, a2, a3, 0, 0);
+            }
         } else {
-            res = hook_openat(dirfd, pathname, flags, mode);
+            raw_ret = mirage_seccomp_bypass_syscall(__NR_openat, a0, a1, a2, a3, 0, 0);
         }
-        int err = errno;
-        uc->uc_mcontext.regs[0] = (res >= 0) ? static_cast<uint64_t>(res) : static_cast<uint64_t>(-err);
+        uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     } else if (nr == __NR_readlinkat) {
-        int dirfd = static_cast<int>(uc->uc_mcontext.regs[0]);
-        const char *pathname = reinterpret_cast<const char *>(uc->uc_mcontext.regs[1]);
-        char *buf = reinterpret_cast<char *>(uc->uc_mcontext.regs[2]);
-        size_t bufsiz = static_cast<size_t>(uc->uc_mcontext.regs[3]);
-        ssize_t res = (pathname && std::strncmp(pathname, "/proc/", 6) == 0)
-                          ? hook_readlinkat(dirfd, pathname, buf, bufsiz)
-                          : (orig_readlinkat ? orig_readlinkat(dirfd, pathname, buf, bufsiz) : -1);
-        int err = errno;
-        uc->uc_mcontext.regs[0] = (res >= 0) ? static_cast<uint64_t>(res) : static_cast<uint64_t>(-err);
+        const char *pathname = reinterpret_cast<const char *>(a1);
+        char *buf = reinterpret_cast<char *>(a2);
+        size_t bufsiz = static_cast<size_t>(a3);
+        int64_t raw_ret = -1;
+        if (pathname && buf && bufsiz > 0 && std::strncmp(pathname, "/proc/", 6) == 0) {
+            std::string cloaked_path;
+            if (g_fd_cloak.resolve_proc_fd_link(pathname, &cloaked_path)) {
+                size_t copy_len = std::min(bufsiz, cloaked_path.size());
+                std::memcpy(buf, cloaked_path.data(), copy_len);
+                raw_ret = static_cast<int64_t>(copy_len);
+            } else {
+                raw_ret = mirage_seccomp_bypass_syscall(__NR_readlinkat, a0, a1, a2, a3, 0, 0);
+            }
+        } else {
+            raw_ret = mirage_seccomp_bypass_syscall(__NR_readlinkat, a0, a1, a2, a3, 0, 0);
+        }
+        uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     } else if (nr == __NR_uname) {
-        auto *buf = reinterpret_cast<struct utsname *>(uc->uc_mcontext.regs[0]);
-        int res = hook_uname(buf);
-        int err = errno;
-        uc->uc_mcontext.regs[0] = (res == 0) ? 0ULL : static_cast<uint64_t>(-err);
+        int64_t raw_ret = mirage_seccomp_bypass_syscall(__NR_uname, a0, 0, 0, 0, 0, 0);
+        auto *buf = reinterpret_cast<struct utsname *>(a0);
+        if (raw_ret == 0 && buf && g_cfg.vfs.enabled) {
+            if (!g_cfg.vfs.cpu_arch.empty()) {
+                std::strncpy(buf->machine, g_cfg.vfs.cpu_arch.c_str(), sizeof(buf->machine) - 1);
+                buf->machine[sizeof(buf->machine) - 1] = '\0';
+            }
+            if (!g_cfg.vfs.kernel_release.empty()) {
+                std::strncpy(buf->release, g_cfg.vfs.kernel_release.c_str(), sizeof(buf->release) - 1);
+                buf->release[sizeof(buf->release) - 1] = '\0';
+            }
+            if (!g_cfg.vfs.kernel_version.empty()) {
+                std::strncpy(buf->version, g_cfg.vfs.kernel_version.c_str(), sizeof(buf->version) - 1);
+                buf->version[sizeof(buf->version) - 1] = '\0';
+            }
+        }
+        uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     } else if (nr == __NR_sysinfo) {
-        auto *s_info = reinterpret_cast<struct sysinfo *>(uc->uc_mcontext.regs[0]);
-        int res = hook_sysinfo(s_info);
-        int err = errno;
-        uc->uc_mcontext.regs[0] = (res == 0) ? 0ULL : static_cast<uint64_t>(-err);
+        int64_t raw_ret = mirage_seccomp_bypass_syscall(__NR_sysinfo, a0, 0, 0, 0, 0, 0);
+        auto *s_info = reinterpret_cast<struct sysinfo *>(a0);
+        if (raw_ret == 0 && s_info && g_cfg.vfs.enabled && g_cfg.vfs.ram_gb > 0) {
+            uint64_t total_bytes = calc_realistic_memtotal_kb(g_cfg.vfs.ram_gb) * 1024ULL;
+            uint32_t unit = s_info->mem_unit > 0 ? s_info->mem_unit : 1;
+            s_info->totalram = static_cast<unsigned long>(total_bytes / unit);
+            s_info->freeram  = (s_info->totalram * 58UL) / 100UL;
+            s_info->bufferram = (s_info->totalram * 4UL) / 100UL;
+        }
+        uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     }
 
     g_tls_in_sigsys = prev_in_sigsys;
@@ -970,37 +1052,62 @@ inline void install_on_demand_seccomp_bpf() {
     };
     std::vector<ExecRange> allow_ranges;
 
+    uintptr_t self_pc = reinterpret_cast<uintptr_t>(&mirage_seccomp_bypass_syscall);
+    bool self_vma_found = false;
+
     FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
     if (fp) {
         char line[1024];
         while (std::fgets(line, sizeof(line), fp)) {
             if (std::strstr(line, "r-xp") == nullptr && std::strstr(line, "--xp") == nullptr) continue;
-            // 白名单放行系统核心运行时与本模块自身，避免持有动态链接锁或 GC 时重入 SIGSYS
-            if (std::strstr(line, "/libc.so") == nullptr &&
-                std::strstr(line, "/linker64") == nullptr &&
-                std::strstr(line, "/libart.so") == nullptr &&
-                std::strstr(line, "mirage_forge") == nullptr &&
-                std::strstr(line, "[vdso]") == nullptr) {
+
+            uintptr_t s = 0, e = 0;
+            if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) != 2 || e <= s || (s >> 32) != (e >> 32)) {
                 continue;
             }
-            uintptr_t s = 0, e = 0;
-            if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2 && e > s && (s >> 32) == (e >> 32)) {
-                allow_ranges.push_back({
-                    static_cast<uint32_t>(s >> 32),
-                    static_cast<uint32_t>(s & 0xFFFFFFFFULL),
-                    static_cast<uint32_t>(e & 0xFFFFFFFFULL),
-                });
-            }
+
+            // 1. 精确匹配本模块自身 VMA（兼容 ZygiskNext / ReZygisk 匿名或无路径映射）
+            bool is_self = (self_pc >= s && self_pc < e);
+            if (is_self) self_vma_found = true;
+
+            // 2. 放行所有系统核心分区库（/apex/、/system/、/vendor/、[vdso]），仅拦截 /data/ 应用侧第三方加固 .so 的裸 svc #0
+            bool is_trusted = is_self ||
+                              std::strstr(line, "/libc.so") != nullptr ||
+                              std::strstr(line, "/linker64") != nullptr ||
+                              std::strstr(line, "/libart.so") != nullptr ||
+                              std::strstr(line, "[vdso]") != nullptr;
+            if (!is_trusted) continue;
+
+            allow_ranges.push_back({
+                static_cast<uint32_t>(s >> 32),
+                static_cast<uint32_t>(s & 0xFFFFFFFFULL),
+                static_cast<uint32_t>(e & 0xFFFFFFFFULL),
+            });
         }
         if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
     }
+
+    // 兜底：若 maps 里找不到本模块 VMA，至少确保 bypass 汇编函数本身被放行，否则放弃安装避免自锁
+    if (!self_vma_found) {
+        if ((self_pc >> 32) != ((self_pc + 256) >> 32)) return;
+        allow_ranges.push_back({
+            static_cast<uint32_t>(self_pc >> 32),
+            static_cast<uint32_t>(self_pc & 0xFFFFFFFFULL),
+            static_cast<uint32_t>((self_pc + 256) & 0xFFFFFFFFULL),
+        });
+    }
     if (allow_ranges.empty()) return;
+
+    // 关键修复：必须带 SA_NODEFER 并显式 SIG_UNBLOCK SIGSYS，防止内核因 SIGSYS 被屏蔽而直接杀进程
+    sigset_t unblock_set;
+    sigemptyset(&unblock_set);
+    sigaddset(&unblock_set, SIGSYS);
+    sigprocmask(SIG_UNBLOCK, &unblock_set, nullptr);
 
     struct sigaction sa{};
     sa.sa_sigaction = sigsys_seccomp_handler;
     sigemptyset(&sa.sa_mask);
-    // 关键修复：绝对不要对 SIGSYS 设置 SA_ONSTACK，直接在原线程大栈上运行，杜绝 sigaltstack 溢出闪退！
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     if (sigaction(SIGSYS, &sa, &g_old_sigsys) != 0) return;
 
     std::vector<struct sock_filter> filter;
