@@ -340,21 +340,6 @@ inline int hook_hw_get_module(const char *id, const HwModuleCompat **module) {
     return ret;
 }
 
-inline int hook_hw_get_module(const char *id, const HwModuleCompat **module) {
-    int ret = orig_hw_get_module ? orig_hw_get_module(id, module) : -1;
-    if (ret == 0 && g_cfg.gl.enabled && id && std::strcmp(id, "vulkan") == 0 &&
-        module && *module && (*module)->methods && (*module)->methods->open) {
-        orig_hwvulkan_module = *module;
-        orig_hwvulkan_open = (*module)->methods->open;
-        g_wrapped_hwvulkan_module = **module;
-        g_wrapped_hwvulkan_methods = *((*module)->methods);
-        g_wrapped_hwvulkan_methods.open = hook_hwvulkan_open;
-        g_wrapped_hwvulkan_module.methods = &g_wrapped_hwvulkan_methods;
-        *module = &g_wrapped_hwvulkan_module;
-    }
-    return ret;
-}
-
 // ============================================================================
 // 2. 应用侧 Vulkan / EGL / MediaDrm 拦截层
 // ============================================================================
