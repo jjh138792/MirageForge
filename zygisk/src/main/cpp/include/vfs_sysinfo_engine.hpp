@@ -1011,43 +1011,107 @@ inline int32_t hook_BpBinder_transact(void *self, uint32_t code, const void *dat
 
 inline void install_binder_meminfo_hook() {
     if (g_binder_meminfo_hooked || !g_cfg.vfs.enabled || g_cfg.vfs.ram_gb <= 0) return;
-    if (g_am_get_memory_info_code == 0) return;
     g_binder_meminfo_hooked = true;
 
-    ErrnoRestorer errno_guard;
-    void *binder_h = dlopen("libbinder.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!binder_h) binder_h = RTLD_DEFAULT;
-
-    orig_BpBinder_transact = reinterpret_cast<PFN_BpBinder_transact>(
-        dlsym(binder_h, "_ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j"));
-    orig_Parcel_data = reinterpret_cast<PFN_Parcel_data>(
-        dlsym(binder_h, "_ZNK7android6Parcel4dataEv"));
-    orig_Parcel_dataSize = reinterpret_cast<PFN_Parcel_dataSize>(
-        dlsym(binder_h, "_ZNK7android6Parcel8dataSizeEv"));
-    auto **vtable = reinterpret_cast<void **>(
-        dlsym(binder_h, "_ZTVN7android8BpBinderE"));
-
-    if (!orig_BpBinder_transact || !orig_Parcel_data || !orig_Parcel_dataSize || !vtable) {
+    if (g_am_get_memory_info_code == 0) {
+        emit_probe("BINDER_MEMINFO", "INIT_FAIL", "tx_code=0 (HiddenAPI or Stub lookup failed)");
         return;
     }
 
-    // 动态扫描 vtable 定位 transact 槽位，0 硬编码偏移，支持 Android 10–17 与 16KB 页大小
+    ErrnoRestorer errno_guard;
+
+    // 1. 从 /proc/self/maps 获取系统命名空间内的合法调用地址 (libandroid_runtime.so) 与 libbinder.so 完整路径
+    const void *sys_caller = nullptr;
+    std::string binder_path = "libbinder.so";
+    FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
+    if (fp) {
+        char line[1024];
+        while (std::fgets(line, sizeof(line), fp)) {
+            uintptr_t s = 0, e = 0;
+            char perms[8] = {0};
+            int path_pos = 0;
+            if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %*s %*s %*s %n", &s, &e, perms, &path_pos) < 3) {
+                continue;
+            }
+            if (perms[2] != 'x') continue;
+            char *p = line + path_pos;
+            while (*p == ' ' || *p == '\t') ++p;
+            size_t len = std::strlen(p);
+            while (len > 0 && (p[len - 1] == '\n' || p[len - 1] == '\r')) p[--len] = '\0';
+
+            if (!sys_caller && std::strstr(p, "/libandroid_runtime.so") != nullptr) {
+                sys_caller = reinterpret_cast<const void *>(s);
+            }
+            if (std::strstr(p, "/libbinder.so") != nullptr) {
+                binder_path = p;
+                if (!sys_caller) sys_caller = reinterpret_cast<const void *>(s);
+            }
+        }
+        if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
+    }
+
+    using PFN_ld_dlopen = void *(*)(const char *, int, const void *);
+    using PFN_ld_dlsym = void *(*)(void *, const char *, const void *);
+    auto fn_ld_dlopen = reinterpret_cast<PFN_ld_dlopen>(dlsym(RTLD_DEFAULT, "__loader_dlopen"));
+    auto fn_ld_dlsym = reinterpret_cast<PFN_ld_dlsym>(dlsym(RTLD_DEFAULT, "__loader_dlsym"));
+
+    void *binder_h = nullptr;
+    if (fn_ld_dlopen && sys_caller) {
+        binder_h = fn_ld_dlopen(binder_path.c_str(), RTLD_NOW | RTLD_NOLOAD, sys_caller);
+    }
+    if (!binder_h) {
+        binder_h = dlopen(binder_path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+    }
+    if (!binder_h) {
+        emit_probe("BINDER_MEMINFO", "INIT_FAIL", "dlopen_failed path=" + binder_path);
+        return;
+    }
+
+    auto sym_lookup = [&](const char *sym) -> void * {
+        if (fn_ld_dlsym && sys_caller) return fn_ld_dlsym(binder_h, sym, sys_caller);
+        return dlsym(binder_h, sym);
+    };
+
+    orig_BpBinder_transact = reinterpret_cast<PFN_BpBinder_transact>(
+        sym_lookup("_ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j"));
+    orig_Parcel_data = reinterpret_cast<PFN_Parcel_data>(
+        sym_lookup("_ZNK7android6Parcel4dataEv"));
+    orig_Parcel_dataSize = reinterpret_cast<PFN_Parcel_dataSize>(
+        sym_lookup("_ZNK7android6Parcel8dataSizeEv"));
+    auto **vtable = reinterpret_cast<void **>(
+        sym_lookup("_ZTVN7android8BpBinderE"));
+
+    if (!orig_BpBinder_transact || !orig_Parcel_data || !orig_Parcel_dataSize || !vtable) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "sym_missing tx_fn=%d data=%d sz=%d vtbl=%d",
+                      orig_BpBinder_transact != nullptr,
+                      orig_Parcel_data != nullptr,
+                      orig_Parcel_dataSize != nullptr,
+                      vtable != nullptr);
+        emit_probe("BINDER_MEMINFO", "INIT_FAIL", buf);
+        return;
+    }
+
     long page_sz = sysconf(_SC_PAGESIZE);
     if (page_sz <= 0) page_sz = 4096;
     uintptr_t page_mask = ~static_cast<uintptr_t>(page_sz - 1);
 
-    for (size_t i = 0; i < 20; ++i) {
+    for (size_t i = 0; i < 64; ++i) {
         if (vtable[i] == reinterpret_cast<void *>(orig_BpBinder_transact)) {
             void *page_start = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(&vtable[i]) & page_mask);
             if (mprotect(page_start, static_cast<size_t>(page_sz), PROT_READ | PROT_WRITE) == 0) {
                 vtable[i] = reinterpret_cast<void *>(hook_BpBinder_transact);
                 mprotect(page_start, static_cast<size_t>(page_sz), PROT_READ);
                 emit_probe("BINDER_MEMINFO", "BpBinder::transact",
-                           "Hooked (tx=" + std::to_string(g_am_get_memory_info_code) + ")");
+                           "Hooked (tx=" + std::to_string(g_am_get_memory_info_code) +
+                           ", slot=" + std::to_string(i) + ")");
+            } else {
+                emit_probe("BINDER_MEMINFO", "INIT_FAIL", "mprotect_errno=" + std::to_string(errno));
             }
-            break;
+            return;
         }
     }
+    emit_probe("BINDER_MEMINFO", "INIT_FAIL", "vtable_slot_not_found_in_0..63");
 }
 
 // ============================================================================
@@ -1140,6 +1204,23 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
     if (sig != SIGSYS || !info || !ucontext_raw) return;
 
     int nr = info->si_syscall;
+    static std::atomic<int> s_seccomp_trace_cnt{0};
+    if (g_cfg.probe.enabled && s_seccomp_trace_cnt.fetch_add(1, std::memory_order_relaxed) < 10) {
+        auto *uc_dbg = static_cast<ucontext_t *>(ucontext_raw);
+        char tr_buf[160];
+        int tr_len = std::snprintf(
+            tr_buf, sizeof(tr_buf),
+            "[PROBE][%s][SECCOMP_TRAP] nr=%d pc=0x%zx a0=0x%zx\n",
+            g_cfg.pkg_name.c_str(), nr,
+            static_cast<size_t>(uc_dbg->uc_mcontext.pc),
+            static_cast<size_t>(uc_dbg->uc_mcontext.regs[0])
+        );
+        if (tr_len > 0) {
+            write_direct_log_raw(ANDROID_LOG_WARN, tr_buf,
+                                 std::min(static_cast<size_t>(tr_len), sizeof(tr_buf) - 1));
+        }
+    }
+    
     if (nr != __NR_openat && nr != __NR_readlinkat && nr != __NR_uname && nr != __NR_sysinfo) {
         if ((g_old_sigsys.sa_flags & SA_SIGINFO) && g_old_sigsys.sa_sigaction) {
             g_old_sigsys.sa_sigaction(sig, info, ucontext_raw);
