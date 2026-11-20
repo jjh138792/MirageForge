@@ -158,6 +158,9 @@ public:
             dlopen("libhardware.so", RTLD_NOW);
             dlopen("libvulkan.so", RTLD_NOW);
         }
+        if (g_cfg.vfs.enabled) {
+            dlopen("libmeminfo.so", RTLD_NOW);
+        }
         scan_and_commit_plt_hooks();
         // 仅在进程完全切换至 App 沙箱域且所有 PLT 挂载完成后，再按需安装 Seccomp-BPF
         if (g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {

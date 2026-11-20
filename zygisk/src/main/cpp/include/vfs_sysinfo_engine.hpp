@@ -917,10 +917,12 @@ inline FILE *hook_popen(const char *command, const char *type) {
 }
 
 // ============================================================================
-// 按需 Seccomp-BPF 内联 svc #0 拦截器 (全异步信号安全 + 裸汇编直通)
+// 按需 Seccomp-BPF 内联 svc #0 拦截器 (内核态路径可读性校验 + 重入熔断 + 全系统分区白名单)
 // ============================================================================
 inline struct sigaction g_old_sigsys{};
 inline bool g_seccomp_installed = false;
+inline int g_seccomp_probe_pipe[2] = {-1, -1};
+inline std::atomic_flag g_seccomp_pipe_lock = ATOMIC_FLAG_INIT;
 
 #if defined(__aarch64__)
 __attribute__((noinline))
@@ -942,11 +944,69 @@ inline int64_t mirage_seccomp_bypass_syscall(
     return static_cast<int64_t>(x0);
 }
 
+// 零崩溃校验并拷贝用户态路径：由 Linux 内核 pipe_write 的 copy_from_user 检查指针可读性，
+// 遇到 PROT_NONE 陷阱页 (如 0x7048126000) 安全返回 false 而不触发 SIGSEGV，且仅对 /proc/ 或 /sys/ 返回 true
+inline bool safe_copy_user_proc_or_sys_path(const char *user_ptr, char *out_buf, size_t out_cap) noexcept {
+    if (!user_ptr || !out_buf || out_cap < 8) return false;
+    if (g_seccomp_probe_pipe[0] < 0 || g_seccomp_probe_pipe[1] < 0) return false;
+    if (g_seccomp_pipe_lock.test_and_set(std::memory_order_acquire)) return false;
+
+    size_t copied = 0;
+    bool nul_found = false;
+    bool valid_prefix = true;
+
+    while (copied + 1 < out_cap) {
+        uintptr_t cur = reinterpret_cast<uintptr_t>(user_ptr) + copied;
+        size_t to_page_end = 4096U - (cur & 4095U);
+        size_t remain = (out_cap - 1) - copied;
+        size_t chunk = (to_page_end < remain) ? to_page_end : remain;
+        if (chunk > 64U) chunk = 64U;
+
+        int64_t wr = mirage_seccomp_bypass_syscall(
+            __NR_write, g_seccomp_probe_pipe[1],
+            static_cast<long>(cur), static_cast<long>(chunk), 0, 0, 0);
+        if (wr <= 0) {
+            valid_prefix = false;
+            break;
+        }
+        int64_t rd = mirage_seccomp_bypass_syscall(
+            __NR_read, g_seccomp_probe_pipe[0],
+            reinterpret_cast<long>(out_buf + copied), static_cast<long>(wr), 0, 0, 0);
+        if (rd <= 0) {
+            valid_prefix = false;
+            break;
+        }
+
+        for (int64_t i = 0; i < rd; ++i) {
+            if (out_buf[copied + static_cast<size_t>(i)] == '\0') {
+                nul_found = true;
+                break;
+            }
+        }
+        copied += static_cast<size_t>(rd);
+
+        if (copied >= 1 && out_buf[0] != '/') {
+            valid_prefix = false;
+            break;
+        }
+        if (copied >= 6) {
+            if (std::strncmp(out_buf, "/proc/", 6) != 0 && std::strncmp(out_buf, "/sys/", 5) != 0) {
+                valid_prefix = false;
+                break;
+            }
+        }
+        if (nul_found) break;
+    }
+
+    g_seccomp_pipe_lock.clear(std::memory_order_release);
+    if (!valid_prefix || !nul_found || copied < 6) return false;
+    return std::strncmp(out_buf, "/proc/", 6) == 0 || std::strncmp(out_buf, "/sys/", 5) == 0;
+}
+
 inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw) {
     if (sig != SIGSYS || !info || !ucontext_raw) return;
 
     int nr = info->si_syscall;
-    // 若触发 SIGSYS 的系统调用不是我们拦截的 4 个（例如 Android 原生 Seccomp 策略），立即转发原处理器！
     if (nr != __NR_openat && nr != __NR_readlinkat && nr != __NR_uname && nr != __NR_sysinfo) {
         if ((g_old_sigsys.sa_flags & SA_SIGINFO) && g_old_sigsys.sa_sigaction) {
             g_old_sigsys.sa_sigaction(sig, info, ucontext_raw);
@@ -959,40 +1019,42 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
         return;
     }
 
-    int saved_errno = errno;
-    bool prev_in_sigsys = g_tls_in_sigsys;
-    g_tls_in_sigsys = true;
-
     auto *uc = static_cast<ucontext_t *>(ucontext_raw);
     long a0 = static_cast<long>(uc->uc_mcontext.regs[0]);
     long a1 = static_cast<long>(uc->uc_mcontext.regs[1]);
     long a2 = static_cast<long>(uc->uc_mcontext.regs[2]);
     long a3 = static_cast<long>(uc->uc_mcontext.regs[3]);
 
+    // 关键保护：严防任何形式的同线程 SIGSYS 递归爆栈
+    if (__builtin_expect(g_tls_in_sigsys, 0)) {
+        uc->uc_mcontext.regs[0] = static_cast<uint64_t>(
+            mirage_seccomp_bypass_syscall(nr, a0, a1, a2, a3, 0, 0));
+        return;
+    }
+
+    int saved_errno = errno;
+    g_tls_in_sigsys = true;
+
     if (nr == __NR_openat) {
-        const char *pathname = reinterpret_cast<const char *>(a1);
+        char safe_path[256];
         int64_t raw_ret = -1;
-        // 仅对绝对路径的 /proc/ 或 /sys/ 才尝试虚拟化，其余 99.9% 路径零堆分配直通裸 svc #0
-        if (pathname &&
-            (std::strncmp(pathname, "/proc/", 6) == 0 || std::strncmp(pathname, "/sys/", 5) == 0)) {
-            int fake_fd = open_cloaked_vfs_fd(pathname);
-            if (fake_fd >= 0) {
-                raw_ret = fake_fd;
-            } else {
-                raw_ret = mirage_seccomp_bypass_syscall(__NR_openat, a0, a1, a2, a3, 0, 0);
-            }
+        if (safe_copy_user_proc_or_sys_path(reinterpret_cast<const char *>(a1), safe_path, sizeof(safe_path))) {
+            int fake_fd = open_cloaked_vfs_fd(safe_path);
+            raw_ret = (fake_fd >= 0) ? fake_fd : mirage_seccomp_bypass_syscall(__NR_openat, a0, a1, a2, a3, 0, 0);
         } else {
             raw_ret = mirage_seccomp_bypass_syscall(__NR_openat, a0, a1, a2, a3, 0, 0);
         }
         uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     } else if (nr == __NR_readlinkat) {
-        const char *pathname = reinterpret_cast<const char *>(a1);
+        char safe_path[256];
         char *buf = reinterpret_cast<char *>(a2);
         size_t bufsiz = static_cast<size_t>(a3);
         int64_t raw_ret = -1;
-        if (pathname && buf && bufsiz > 0 && std::strncmp(pathname, "/proc/", 6) == 0) {
+        if (buf && bufsiz > 0 &&
+            safe_copy_user_proc_or_sys_path(reinterpret_cast<const char *>(a1), safe_path, sizeof(safe_path)) &&
+            std::strncmp(safe_path, "/proc/", 6) == 0) {
             std::string cloaked_path;
-            if (g_fd_cloak.resolve_proc_fd_link(pathname, &cloaked_path)) {
+            if (g_fd_cloak.resolve_proc_fd_link(safe_path, &cloaked_path)) {
                 size_t copy_len = std::min(bufsiz, cloaked_path.size());
                 std::memcpy(buf, cloaked_path.data(), copy_len);
                 raw_ret = static_cast<int64_t>(copy_len);
@@ -1034,7 +1096,7 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
         uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     }
 
-    g_tls_in_sigsys = prev_in_sigsys;
+    g_tls_in_sigsys = false;
     errno = saved_errno;
 }
 #endif
@@ -1045,13 +1107,17 @@ inline void install_on_demand_seccomp_bpf() {
 
 #if defined(__aarch64__)
     ErrnoRestorer errno_guard;
+    if (pipe2(g_seccomp_probe_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+        g_seccomp_probe_pipe[0] = -1;
+        g_seccomp_probe_pipe[1] = -1;
+    }
+
     struct ExecRange {
         uint32_t hi;
         uint32_t lo_start;
         uint32_t lo_end;
     };
     std::vector<ExecRange> allow_ranges;
-
     uintptr_t self_pc = reinterpret_cast<uintptr_t>(&mirage_seccomp_bypass_syscall);
     bool self_vma_found = false;
 
@@ -1059,38 +1125,44 @@ inline void install_on_demand_seccomp_bpf() {
     if (fp) {
         char line[1024];
         while (std::fgets(line, sizeof(line), fp)) {
-            if (std::strstr(line, "r-xp") == nullptr && std::strstr(line, "--xp") == nullptr) continue;
-
             uintptr_t s = 0, e = 0;
-            if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) != 2 || e <= s || (s >> 32) != (e >> 32)) {
+            char perms[8] = {0};
+            int path_pos = 0;
+            if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %*s %*s %*s %n", &s, &e, perms, &path_pos) < 3) {
                 continue;
             }
+            if (perms[2] != 'x' || e <= s || (s >> 32) != (e >> 32)) continue;
 
-            // 1. 精确匹配本模块自身 VMA（兼容 ZygiskNext / ReZygisk 匿名或无路径映射）
+            const char *path = line + path_pos;
+            while (*path == ' ' || *path == '\t') ++path;
+
             bool is_self = (self_pc >= s && self_pc < e);
-            if (is_self) self_vma_found = true;
+            bool is_sys = std::strncmp(path, "/apex/", 6) == 0 ||
+                          std::strncmp(path, "/system/", 8) == 0 ||
+                          std::strncmp(path, "/vendor/", 8) == 0 ||
+                          std::strncmp(path, "/system_ext/", 12) == 0 ||
+                          std::strncmp(path, "/product/", 9) == 0 ||
+                          std::strncmp(path, "[vdso]", 6) == 0;
+            if (!is_self && !is_sys) continue;
 
-            // 2. 放行所有系统核心分区库（/apex/、/system/、/vendor/、[vdso]），仅拦截 /data/ 应用侧第三方加固 .so 的裸 svc #0
-            bool is_trusted = is_self ||
-                              std::strstr(line, "/libc.so") != nullptr ||
-                              std::strstr(line, "/linker64") != nullptr ||
-                              std::strstr(line, "/libart.so") != nullptr ||
-                              std::strstr(line, "[vdso]") != nullptr;
-            if (!is_trusted) continue;
-
-            allow_ranges.push_back({
+            ExecRange r{
                 static_cast<uint32_t>(s >> 32),
                 static_cast<uint32_t>(s & 0xFFFFFFFFULL),
                 static_cast<uint32_t>(e & 0xFFFFFFFFULL),
-            });
+            };
+            if (is_self) {
+                self_vma_found = true;
+                allow_ranges.insert(allow_ranges.begin(), r);
+            } else if (allow_ranges.size() < 300) {
+                allow_ranges.push_back(r);
+            }
         }
         if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
     }
 
-    // 兜底：若 maps 里找不到本模块 VMA，至少确保 bypass 汇编函数本身被放行，否则放弃安装避免自锁
     if (!self_vma_found) {
         if ((self_pc >> 32) != ((self_pc + 256) >> 32)) return;
-        allow_ranges.push_back({
+        allow_ranges.insert(allow_ranges.begin(), {
             static_cast<uint32_t>(self_pc >> 32),
             static_cast<uint32_t>(self_pc & 0xFFFFFFFFULL),
             static_cast<uint32_t>((self_pc + 256) & 0xFFFFFFFFULL),
@@ -1098,7 +1170,6 @@ inline void install_on_demand_seccomp_bpf() {
     }
     if (allow_ranges.empty()) return;
 
-    // 关键修复：必须带 SA_NODEFER 并显式 SIG_UNBLOCK SIGSYS，防止内核因 SIGSYS 被屏蔽而直接杀进程
     sigset_t unblock_set;
     sigemptyset(&unblock_set);
     sigaddset(&unblock_set, SIGSYS);

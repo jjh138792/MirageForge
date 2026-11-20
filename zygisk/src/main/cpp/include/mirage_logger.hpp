@@ -148,7 +148,6 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
     _Unwind_Backtrace(unwind_callback, &state);
     size_t count = static_cast<size_t>(state.current - frames);
 
-    // 过滤 ART 虚拟机的正常隐式空指针异常与 Stack Check (避免刷屏假崩溃与干扰 libsigchain)
     if (sig == SIGSEGV && fault_addr < 0x1000) {
         for (size_t i = 0; i < count && i < 4; ++i) {
             Dl_info dli{};
@@ -169,6 +168,31 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
                            (sig == SIGABRT) ? "SIGABRT" :
                            (sig == SIGBUS)  ? "SIGBUS"  : "SIGILL";
 
+    char reg_buf[256];
+    reg_buf[0] = '\0';
+#if defined(__aarch64__)
+    if (ucontext) {
+        auto *uc = static_cast<ucontext_t *>(ucontext);
+        uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+        uintptr_t sp = static_cast<uintptr_t>(uc->uc_mcontext.sp);
+        uintptr_t lr = static_cast<uintptr_t>(uc->uc_mcontext.regs[30]);
+        Dl_info pc_dli{};
+        if (dladdr(reinterpret_cast<void *>(pc), &pc_dli) && pc_dli.dli_fname) {
+            const char *sl = std::strrchr(pc_dli.dli_fname, '/');
+            const char *pc_lib = sl ? (sl + 1) : pc_dli.dli_fname;
+            uintptr_t pc_off = pc - reinterpret_cast<uintptr_t>(pc_dli.dli_fbase);
+            std::snprintf(reg_buf, sizeof(reg_buf), "pc=%s+0x%zx sp=0x%zx lr=0x%zx sigsys=%d",
+                          pc_lib, static_cast<size_t>(pc_off),
+                          static_cast<size_t>(sp), static_cast<size_t>(lr),
+                          g_tls_in_sigsys ? 1 : 0);
+        } else {
+            std::snprintf(reg_buf, sizeof(reg_buf), "pc=0x%zx sp=0x%zx lr=0x%zx sigsys=%d",
+                          static_cast<size_t>(pc), static_cast<size_t>(sp),
+                          static_cast<size_t>(lr), g_tls_in_sigsys ? 1 : 0);
+        }
+    }
+#endif
+
     char stack_buf[512];
     size_t s_pos = 0;
     stack_buf[0] = '\0';
@@ -177,10 +201,9 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
         Dl_info dli{};
         uintptr_t addr = reinterpret_cast<uintptr_t>(frames[i]);
         if (dladdr(frames[i], &dli) && dli.dli_fname) {
-            if (std::strstr(dli.dli_fname, "mirage_forge") != nullptr) continue;
             const char *slash = std::strrchr(dli.dli_fname, '/');
             const char *lib_name = slash ? (slash + 1) : dli.dli_fname;
-            uintptr_t rel_pc = addr - reinterpret_cast<uintptr_t>(dli.dli_fbase);
+            uintptr_t rel_pc = addr - reinterpret_cast<uintptr_t>(info ? dli.dli_fbase : dli.dli_fbase);
 
             if (s_pos > 0) {
                 int w = std::snprintf(stack_buf + s_pos, sizeof(stack_buf) - s_pos, " <- ");
@@ -199,13 +222,14 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
         }
     }
 
-    char crash_buf[768];
+    char crash_buf[960];
     int total_len = std::snprintf(
         crash_buf, sizeof(crash_buf),
-        "[CRASH][%s][%s] code=%d fault_addr=%p | Stack: %s\n",
+        "[CRASH][%s][%s] code=%d fault_addr=%p %s | Stack: %s\n",
         g_crash_pkg_name, sig_name,
         info ? info->si_code : 0,
         info ? info->si_addr : nullptr,
+        reg_buf,
         s_pos > 0 ? stack_buf : "unknown"
     );
     if (total_len > 0) {
