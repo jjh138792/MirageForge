@@ -119,6 +119,7 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
         "libmediandk.so",
         "libgui.so",
         "libhwui.so"
+        "libandroidio.so"
     };
 
     for (const char *bridge : kSystemBridgeLibs) {
@@ -340,6 +341,7 @@ inline void scan_and_commit_plt_hooks() {
             reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo));
             reg("sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf));
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
+            reg("__open64_2", reinterpret_cast<void *>(hook_open_2), reinterpret_cast<void **>(&orig_open_2));
         }
 
         if (g_cfg.gl.enabled) {

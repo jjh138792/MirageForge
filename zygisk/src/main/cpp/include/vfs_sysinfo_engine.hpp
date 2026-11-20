@@ -952,75 +952,89 @@ inline bool parcel_contains_iam_token(const uint8_t *buf, size_t sz) noexcept {
 inline int32_t hook_BpBinder_transact(void *self, uint32_t code, const void *data, void *reply, uint32_t flags) {
     int32_t ret = orig_BpBinder_transact ? orig_BpBinder_transact(self, code, data, reply, flags) : -1;
     if (__builtin_expect(
-            ret != 0 || !g_cfg.vfs.enabled || g_cfg.vfs.ram_gb <= 0 ||
-            !data || !reply || g_am_get_memory_info_code == 0 ||
-            code != g_am_get_memory_info_code,
-            1)) {
+            ret != 0 || !g_cfg.vfs.enabled || g_cfg.vfs.ram_gb <= 0 || !data || !reply, 1)) {
+        return ret;
+    }
+
+    // 若已解析出精确 tx_code 则 O(1) 过滤；若因 HiddenAPI 未能解析 (0) 则放行到下方结构特征校验
+    if (g_am_get_memory_info_code != 0 && code != g_am_get_memory_info_code) {
         return ret;
     }
 
     if (!orig_Parcel_data || !orig_Parcel_dataSize) return ret;
 
+    auto *rep_buf = const_cast<uint8_t *>(orig_Parcel_data(reply));
+    size_t rep_sz = orig_Parcel_dataSize(reply);
+    // Android <=13 为 68 字节，Android 14-17 (含 advertisedMem) 为 76 字节
+    if (!rep_buf || rep_sz < 68U || rep_sz > 96U) return ret;
+
     const uint8_t *req_buf = orig_Parcel_data(data);
     size_t req_sz = orig_Parcel_dataSize(data);
-    if (!parcel_contains_iam_token(req_buf, req_sz)) {
+    // getMemoryInfo 请求体仅含 interfaceToken ("android.app.IActivityManager")，无额外入参
+    if (req_sz > 128U || !parcel_contains_iam_token(req_buf, req_sz)) {
         return ret;
     }
 
-    auto *rep_buf = const_cast<uint8_t *>(orig_Parcel_data(reply));
-    size_t rep_sz = orig_Parcel_dataSize(reply);
-    // Reply Parcel 布局: [0..3] exception(0), [4..7] nonNull(1), [8..15] availMem, [16..23] totalMem, [24..31] threshold, [32..35] lowMemory
-    if (!rep_buf || rep_sz < 36U) return ret;
-
-    int32_t exc = -1, non_null = 0;
+    int32_t exc = -1, non_null = 0, real_low = -1;
     std::memcpy(&exc, rep_buf, sizeof(exc));
     std::memcpy(&non_null, rep_buf + 4, sizeof(non_null));
-    if (exc != 0 || non_null != 1) return ret;
+    std::memcpy(&real_low, rep_buf + 32, sizeof(real_low));
+    if (exc != 0 || non_null != 1 || (real_low != 0 && real_low != 1)) return ret;
 
-    int64_t real_avail = 0, real_total = 0;
+    int64_t real_avail = 0, real_total = 0, real_threshold = 0;
     std::memcpy(&real_avail, rep_buf + 8, sizeof(real_avail));
     std::memcpy(&real_total, rep_buf + 16, sizeof(real_total));
+    std::memcpy(&real_threshold, rep_buf + 24, sizeof(real_threshold));
 
-    // 二次合法性校验：确认真机值在合理物理内存范围内 (512MB ~ 128GB)
     constexpr int64_t kMinRam = 512LL * 1024LL * 1024LL;
     constexpr int64_t kMaxRam = 128LL * 1024LL * 1024LL * 1024LL;
-    if (real_total < kMinRam || real_total > kMaxRam || real_avail < 0 || real_avail > real_total) {
+    if (real_total < kMinRam || real_total > kMaxRam ||
+        real_avail <= 0 || real_avail > real_total ||
+        real_threshold < 0 || real_threshold >= real_total) {
         return ret;
+    }
+
+    // 自动学习并锁存真实的 tx_code，后续调用走 O(1) 快速路径
+    if (g_am_get_memory_info_code == 0) {
+        g_am_get_memory_info_code = code;
     }
 
     int64_t fake_total = static_cast<int64_t>(calc_realistic_memtotal_kb(g_cfg.vfs.ram_gb) * 1024ULL);
-    // 按真机当前空闲比例同比缩放可用内存（若比例过低则保底 45%，保证观感自然且会随系统实时波动）
-    double free_ratio = static_cast<double>(real_avail) / static_cast<double>(real_total);
-    if (free_ratio < 0.20) free_ratio = 0.45;
-    if (free_ratio > 0.85) free_ratio = 0.72;
-    int64_t fake_avail = static_cast<int64_t>(static_cast<double>(fake_total) * free_ratio);
+    int64_t fake_avail = (fake_total * 58LL) / 100LL;
     int32_t fake_low_mem = 0;
 
     std::memcpy(rep_buf + 8, &fake_avail, sizeof(fake_avail));
     std::memcpy(rep_buf + 16, &fake_total, sizeof(fake_total));
     std::memcpy(rep_buf + 32, &fake_low_mem, sizeof(fake_low_mem));
 
+    // Android 14-17 新增 advertisedMem (位于偏移 +68)
+    if (rep_sz >= 76U) {
+        int64_t fake_adv = static_cast<int64_t>(g_cfg.vfs.ram_gb) * 1024LL * 1024LL * 1024LL;
+        std::memcpy(rep_buf + 68, &fake_adv, sizeof(fake_adv));
+    }
+
     ScopedHookGuard guard;
     if (guard) {
         emit_probe("BINDER_MEMINFO", "ActivityManager.getMemoryInfo",
-                   "avail=" + std::to_string(fake_avail / (1024LL * 1024LL)) +
-                   "MB / total=" + std::to_string(fake_total / (1024LL * 1024LL)) + "MB");
+                   "tx=" + std::to_string(code) +
+                   " avail=" + std::to_string(fake_avail / (1024LL * 1024LL)) +
+                   "MB / total=" + std::to_string(fake_total / (1024LL * 1024LL)) +
+                   "MB (rep_sz=" + std::to_string(rep_sz) + ")");
     }
     return ret;
 }
 
 inline void install_binder_meminfo_hook() {
-    if (g_binder_meminfo_hooked || !g_cfg.vfs.enabled || g_cfg.vfs.ram_gb <= 0) return;
+    if (g_binder_meminfo_hooked || !g_cfg.vfs.enabled) return;
     g_binder_meminfo_hooked = true;
 
-    if (g_am_get_memory_info_code == 0) {
-        emit_probe("BINDER_MEMINFO", "INIT_FAIL", "tx_code=0 (HiddenAPI or Stub lookup failed)");
+    if (g_cfg.vfs.ram_gb <= 0) {
+        emit_probe("BINDER_MEMINFO", "INIT_FAIL", "ram_gb<=0");
         return;
     }
 
     ErrnoRestorer errno_guard;
 
-    // 1. 从 /proc/self/maps 获取系统命名空间内的合法调用地址 (libandroid_runtime.so) 与 libbinder.so 完整路径
     const void *sys_caller = nullptr;
     std::string binder_path = "libbinder.so";
     FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
@@ -1068,8 +1082,8 @@ inline void install_binder_meminfo_hook() {
     }
 
     auto sym_lookup = [&](const char *sym) -> void * {
-        if (fn_ld_dlsym && sys_caller) return fn_ld_dlsym(binder_h, sym, sys_caller);
-        return dlsym(binder_h, sym);
+        void *r = (fn_ld_dlsym && sys_caller) ? fn_ld_dlsym(binder_h, sym, sys_caller) : nullptr;
+        return r ? r : dlsym(binder_h, sym);
     };
 
     orig_BpBinder_transact = reinterpret_cast<PFN_BpBinder_transact>(
@@ -1113,7 +1127,6 @@ inline void install_binder_meminfo_hook() {
     }
     emit_probe("BINDER_MEMINFO", "INIT_FAIL", "vtable_slot_not_found_in_0..63");
 }
-
 // ============================================================================
 // 按需 Seccomp-BPF 内联 svc #0 拦截器
 // 关键修复：绝对优先放行本模块、libc.so、linker64、libart.so、[vdso]，绝不被上限截断！
@@ -1197,6 +1210,11 @@ inline bool safe_copy_user_proc_or_sys_path(const char *user_ptr, char *out_buf,
 
     g_seccomp_pipe_lock.clear(std::memory_order_release);
     if (!valid_prefix || !nul_found || copied < 6) return false;
+    // 在 SIGSYS 中放行所有 /proc/self/* 与 /proc/thread-self/*，避免触发 PairIP (libpairipcore.so) 自毁
+    if (std::strncmp(out_buf, "/proc/self/", 11) == 0 ||
+        std::strncmp(out_buf, "/proc/thread-self/", 18) == 0) {
+        return false;
+    }
     return std::strncmp(out_buf, "/proc/", 6) == 0 || std::strncmp(out_buf, "/sys/", 5) == 0;
 }
 

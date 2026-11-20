@@ -158,8 +158,9 @@ public:
             dlopen("libvulkan.so", RTLD_NOW);
         }
         if (g_cfg.vfs.enabled) {
-            init_vfs_clusters_lightweight();
+            dlopen("libmeminfo.so", RTLD_NOW);
             resolve_am_get_memory_info_code(env);
+            install_binder_meminfo_hook();
         }
         scan_and_commit_plt_hooks();
         if (g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {
