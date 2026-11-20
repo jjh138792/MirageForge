@@ -18,9 +18,13 @@
 #include <linux/memfd.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <sys/mman.h>
+#include <linux/audit.h>
+#include <ucontext.h>
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
 #include "fd_cloak_tracker.hpp"
+#include "jvm_art_engine.hpp"
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
@@ -917,7 +921,138 @@ inline FILE *hook_popen(const char *command, const char *type) {
 }
 
 // ============================================================================
-// 按需 Seccomp-BPF 内联 svc #0 拦截器 (内核态路径可读性校验 + 重入熔断 + 全系统分区白名单)
+// Binder IPC 内存伪装引擎：拦截 ActivityManager.getMemoryInfo(MemoryInfo)
+// 彻底解决 Android 14–17 全软件通过 Binder 向 system_server 查询可用内存导致 VFS 失效的问题
+// ============================================================================
+using PFN_BpBinder_transact = int32_t (*)(void *self, uint32_t code, const void *data, void *reply, uint32_t flags);
+using PFN_Parcel_data = const uint8_t *(*)(const void *parcel);
+using PFN_Parcel_dataSize = size_t (*)(const void *parcel);
+
+inline PFN_BpBinder_transact orig_BpBinder_transact = nullptr;
+inline PFN_Parcel_data orig_Parcel_data = nullptr;
+inline PFN_Parcel_dataSize orig_Parcel_dataSize = nullptr;
+inline bool g_binder_meminfo_hooked = false;
+
+inline bool parcel_contains_iam_token(const uint8_t *buf, size_t sz) noexcept {
+    // Parcel 中 UTF-16LE 编码的 "android.app.IActivityManager" 关键子串 "IActivityManager"
+    static constexpr uint8_t kNeedle[] = {
+        'I',0,'A',0,'c',0,'t',0,'i',0,'v',0,'i',0,'t',0,
+        'y',0,'M',0,'a',0,'n',0,'a',0,'g',0,'e',0,'r',0
+    };
+    if (!buf || sz < sizeof(kNeedle)) return false;
+    size_t limit = (sz < 128U) ? sz : 128U;
+    for (size_t i = 0; i + sizeof(kNeedle) <= limit; i += 2) {
+        if (std::memcmp(buf + i, kNeedle, sizeof(kNeedle)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline int32_t hook_BpBinder_transact(void *self, uint32_t code, const void *data, void *reply, uint32_t flags) {
+    int32_t ret = orig_BpBinder_transact ? orig_BpBinder_transact(self, code, data, reply, flags) : -1;
+    if (__builtin_expect(
+            ret != 0 || !g_cfg.vfs.enabled || g_cfg.vfs.ram_gb <= 0 ||
+            !data || !reply || g_am_get_memory_info_code == 0 ||
+            code != g_am_get_memory_info_code,
+            1)) {
+        return ret;
+    }
+
+    if (!orig_Parcel_data || !orig_Parcel_dataSize) return ret;
+
+    const uint8_t *req_buf = orig_Parcel_data(data);
+    size_t req_sz = orig_Parcel_dataSize(data);
+    if (!parcel_contains_iam_token(req_buf, req_sz)) {
+        return ret;
+    }
+
+    auto *rep_buf = const_cast<uint8_t *>(orig_Parcel_data(reply));
+    size_t rep_sz = orig_Parcel_dataSize(reply);
+    // Reply Parcel 布局: [0..3] exception(0), [4..7] nonNull(1), [8..15] availMem, [16..23] totalMem, [24..31] threshold, [32..35] lowMemory
+    if (!rep_buf || rep_sz < 36U) return ret;
+
+    int32_t exc = -1, non_null = 0;
+    std::memcpy(&exc, rep_buf, sizeof(exc));
+    std::memcpy(&non_null, rep_buf + 4, sizeof(non_null));
+    if (exc != 0 || non_null != 1) return ret;
+
+    int64_t real_avail = 0, real_total = 0;
+    std::memcpy(&real_avail, rep_buf + 8, sizeof(real_avail));
+    std::memcpy(&real_total, rep_buf + 16, sizeof(real_total));
+
+    // 二次合法性校验：确认真机值在合理物理内存范围内 (512MB ~ 128GB)
+    constexpr int64_t kMinRam = 512LL * 1024LL * 1024LL;
+    constexpr int64_t kMaxRam = 128LL * 1024LL * 1024LL * 1024LL;
+    if (real_total < kMinRam || real_total > kMaxRam || real_avail < 0 || real_avail > real_total) {
+        return ret;
+    }
+
+    int64_t fake_total = static_cast<int64_t>(calc_realistic_memtotal_kb(g_cfg.vfs.ram_gb) * 1024ULL);
+    // 按真机当前空闲比例同比缩放可用内存（若比例过低则保底 45%，保证观感自然且会随系统实时波动）
+    double free_ratio = static_cast<double>(real_avail) / static_cast<double>(real_total);
+    if (free_ratio < 0.20) free_ratio = 0.45;
+    if (free_ratio > 0.85) free_ratio = 0.72;
+    int64_t fake_avail = static_cast<int64_t>(static_cast<double>(fake_total) * free_ratio);
+    int32_t fake_low_mem = 0;
+
+    std::memcpy(rep_buf + 8, &fake_avail, sizeof(fake_avail));
+    std::memcpy(rep_buf + 16, &fake_total, sizeof(fake_total));
+    std::memcpy(rep_buf + 32, &fake_low_mem, sizeof(fake_low_mem));
+
+    ScopedHookGuard guard;
+    if (guard) {
+        emit_probe("BINDER_MEMINFO", "ActivityManager.getMemoryInfo",
+                   "avail=" + std::to_string(fake_avail / (1024LL * 1024LL)) +
+                   "MB / total=" + std::to_string(fake_total / (1024LL * 1024LL)) + "MB");
+    }
+    return ret;
+}
+
+inline void install_binder_meminfo_hook() {
+    if (g_binder_meminfo_hooked || !g_cfg.vfs.enabled || g_cfg.vfs.ram_gb <= 0) return;
+    if (g_am_get_memory_info_code == 0) return;
+    g_binder_meminfo_hooked = true;
+
+    ErrnoRestorer errno_guard;
+    void *binder_h = dlopen("libbinder.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!binder_h) binder_h = RTLD_DEFAULT;
+
+    orig_BpBinder_transact = reinterpret_cast<PFN_BpBinder_transact>(
+        dlsym(binder_h, "_ZN7android8BpBinder8transactEjRKNS_6ParcelEPS1_j"));
+    orig_Parcel_data = reinterpret_cast<PFN_Parcel_data>(
+        dlsym(binder_h, "_ZNK7android6Parcel4dataEv"));
+    orig_Parcel_dataSize = reinterpret_cast<PFN_Parcel_dataSize>(
+        dlsym(binder_h, "_ZNK7android6Parcel8dataSizeEv"));
+    auto **vtable = reinterpret_cast<void **>(
+        dlsym(binder_h, "_ZTVN7android8BpBinderE"));
+
+    if (!orig_BpBinder_transact || !orig_Parcel_data || !orig_Parcel_dataSize || !vtable) {
+        return;
+    }
+
+    // 动态扫描 vtable 定位 transact 槽位，0 硬编码偏移，支持 Android 10–17 与 16KB 页大小
+    long page_sz = sysconf(_SC_PAGESIZE);
+    if (page_sz <= 0) page_sz = 4096;
+    uintptr_t page_mask = ~static_cast<uintptr_t>(page_sz - 1);
+
+    for (size_t i = 0; i < 20; ++i) {
+        if (vtable[i] == reinterpret_cast<void *>(orig_BpBinder_transact)) {
+            void *page_start = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(&vtable[i]) & page_mask);
+            if (mprotect(page_start, static_cast<size_t>(page_sz), PROT_READ | PROT_WRITE) == 0) {
+                vtable[i] = reinterpret_cast<void *>(hook_BpBinder_transact);
+                mprotect(page_start, static_cast<size_t>(page_sz), PROT_READ);
+                emit_probe("BINDER_MEMINFO", "BpBinder::transact",
+                           "Hooked (tx=" + std::to_string(g_am_get_memory_info_code) + ")");
+            }
+            break;
+        }
+    }
+}
+
+// ============================================================================
+// 按需 Seccomp-BPF 内联 svc #0 拦截器
+// 关键修复：绝对优先放行本模块、libc.so、linker64、libart.so、[vdso]，绝不被上限截断！
 // ============================================================================
 inline struct sigaction g_old_sigsys{};
 inline bool g_seccomp_installed = false;
@@ -944,8 +1079,6 @@ inline int64_t mirage_seccomp_bypass_syscall(
     return static_cast<int64_t>(x0);
 }
 
-// 零崩溃校验并拷贝用户态路径：由 Linux 内核 pipe_write 的 copy_from_user 检查指针可读性，
-// 遇到 PROT_NONE 陷阱页 (如 0x7048126000) 安全返回 false 而不触发 SIGSEGV，且仅对 /proc/ 或 /sys/ 返回 true
 inline bool safe_copy_user_proc_or_sys_path(const char *user_ptr, char *out_buf, size_t out_cap) noexcept {
     if (!user_ptr || !out_buf || out_cap < 8) return false;
     if (g_seccomp_probe_pipe[0] < 0 || g_seccomp_probe_pipe[1] < 0) return false;
@@ -1025,8 +1158,8 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
     long a2 = static_cast<long>(uc->uc_mcontext.regs[2]);
     long a3 = static_cast<long>(uc->uc_mcontext.regs[3]);
 
-    // 关键保护：严防任何形式的同线程 SIGSYS 递归爆栈
-    if (__builtin_expect(g_tls_in_sigsys, 0)) {
+    // 若同线程正在执行 Hook 或重入 SIGSYS，零堆分配直接直通裸 svc #0
+    if (__builtin_expect(g_tls_in_sigsys || g_tls_in_hook, 0)) {
         uc->uc_mcontext.regs[0] = static_cast<uint64_t>(
             mirage_seccomp_bypass_syscall(nr, a0, a1, a2, a3, 0, 0));
         return;
@@ -1120,6 +1253,7 @@ inline void install_on_demand_seccomp_bpf() {
     std::vector<ExecRange> allow_ranges;
     uintptr_t self_pc = reinterpret_cast<uintptr_t>(&mirage_seccomp_bypass_syscall);
     bool self_vma_found = false;
+    bool libc_found = false;
 
     FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
     if (fp) {
@@ -1136,30 +1270,30 @@ inline void install_on_demand_seccomp_bpf() {
             const char *path = line + path_pos;
             while (*path == ' ' || *path == '\t') ++path;
 
-            bool is_self = (self_pc >= s && self_pc < e);
-            bool is_sys = std::strncmp(path, "/apex/", 6) == 0 ||
-                          std::strncmp(path, "/system/", 8) == 0 ||
-                          std::strncmp(path, "/vendor/", 8) == 0 ||
-                          std::strncmp(path, "/system_ext/", 12) == 0 ||
-                          std::strncmp(path, "/product/", 9) == 0 ||
-                          std::strncmp(path, "[vdso]", 6) == 0;
-            if (!is_self && !is_sys) continue;
+            bool is_self   = (self_pc >= s && self_pc < e);
+            bool is_libc   = (std::strstr(path, "/libc.so") != nullptr);
+            bool is_linker = (std::strstr(path, "/linker64") != nullptr);
+            bool is_art    = (std::strstr(path, "/libart.so") != nullptr ||
+                              std::strstr(path, "/libartbase.so") != nullptr);
+            bool is_vdso   = (std::strncmp(path, "[vdso]", 6) == 0);
 
-            ExecRange r{
+            // 只放行真正会执行合法系统调用的 5 类核心运行时代码段（通常仅 6~10 段，永不被截断！）
+            if (!is_self && !is_libc && !is_linker && !is_art && !is_vdso) continue;
+
+            if (is_self) self_vma_found = true;
+            if (is_libc) libc_found = true;
+
+            allow_ranges.push_back({
                 static_cast<uint32_t>(s >> 32),
                 static_cast<uint32_t>(s & 0xFFFFFFFFULL),
                 static_cast<uint32_t>(e & 0xFFFFFFFFULL),
-            };
-            if (is_self) {
-                self_vma_found = true;
-                allow_ranges.insert(allow_ranges.begin(), r);
-            } else if (allow_ranges.size() < 300) {
-                allow_ranges.push_back(r);
-            }
+            });
         }
         if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
     }
 
+    // 安全守卫：若未能定位到 libc.so 或本模块自身代码段，绝不安装 BPF，防止误杀！
+    if (!libc_found) return;
     if (!self_vma_found) {
         if ((self_pc >> 32) != ((self_pc + 256) >> 32)) return;
         allow_ranges.insert(allow_ranges.begin(), {
@@ -1168,7 +1302,6 @@ inline void install_on_demand_seccomp_bpf() {
             static_cast<uint32_t>((self_pc + 256) & 0xFFFFFFFFULL),
         });
     }
-    if (allow_ranges.empty()) return;
 
     sigset_t unblock_set;
     sigemptyset(&unblock_set);
@@ -1182,8 +1315,13 @@ inline void install_on_demand_seccomp_bpf() {
     if (sigaction(SIGSYS, &sa, &g_old_sigsys) != 0) return;
 
     std::vector<struct sock_filter> filter;
-    filter.reserve(8 + allow_ranges.size() * 6);
+    filter.reserve(10 + allow_ranges.size() * 6);
 
+    // [0..1] 严格校验架构为 AUDIT_ARCH_AARCH64，非 AArch64 直接放行
+    filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 5));
+
+    // [2..7] 仅检查 4 个目标系统调用，其余系统调用立即 ALLOW
     filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)));
     filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     4, 0));
     filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 3, 0));
@@ -1209,7 +1347,7 @@ inline void install_on_demand_seccomp_bpf() {
 
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) == 0) {
-        emit_probe("SECCOMP_SVC", "BPF_Filter_Active", "AllowRanges=" + std::to_string(allow_ranges.size()));
+        emit_probe("SECCOMP_SVC", "BPF_Filter_Active", "CoreRanges=" + std::to_string(allow_ranges.size()));
     }
 #endif
 }

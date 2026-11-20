@@ -257,7 +257,7 @@ inline void install_crash_signal_logger(const std::string &pkg) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 
-    sigaction(SIGSEGV, &sa, &g_old_sigsegv);
+    // 不再拦截 SIGSEGV，避免把 ART 的 CheckSuspend / GC 屏障 / 隐式 NPE 误报为崩溃
     sigaction(SIGABRT, &sa, &g_old_sigabrt);
     sigaction(SIGBUS,  &sa, &g_old_sigbus);
     sigaction(SIGILL,  &sa, &g_old_sigill);

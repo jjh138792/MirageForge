@@ -153,16 +153,16 @@ public:
             reflect_java_build_fields(env);
             g_cfg.build.wipe_volatile_reflection_maps();
         }
-        // 按需预加载 libhardware.so 与 libvulkan.so，确保在 App 加载 Vulkan JNI 库前即完成底层 HAL PLT 挂载
         if (g_cfg.gl.enabled) {
             dlopen("libhardware.so", RTLD_NOW);
             dlopen("libvulkan.so", RTLD_NOW);
         }
         if (g_cfg.vfs.enabled) {
             dlopen("libmeminfo.so", RTLD_NOW);
+            resolve_am_get_memory_info_code(env);
+            install_binder_meminfo_hook();
         }
         scan_and_commit_plt_hooks();
-        // 仅在进程完全切换至 App 沙箱域且所有 PLT 挂载完成后，再按需安装 Seccomp-BPF
         if (g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {
             install_on_demand_seccomp_bpf();
         }
