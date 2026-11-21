@@ -168,11 +168,12 @@ jobs:
 
       - name: Publish GitHub Pre-Release (Canary)
         if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.meta.outputs.canary_version }}
-          name: "MirageForge ${{ steps.meta.outputs.canary_version }}"
-          body_path: canary_notes.md
-          files: ${{ steps.meta.outputs.zip_name }}
-          draft: false
-          prerelease: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.meta.outputs.canary_version }}" \
+            "${{ steps.meta.outputs.zip_name }}" \
+            --target "${{ github.sha }}" \
+            --title "MirageForge ${{ steps.meta.outputs.canary_version }}" \
+            --notes-file canary_notes.md \
+            --prerelease
