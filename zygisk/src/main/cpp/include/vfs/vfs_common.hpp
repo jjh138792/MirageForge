@@ -174,4 +174,30 @@ inline std::string resolve_dirfd_path_fast(int dirfd, const char *pathname) {
     return normalize_vfs_path(combined.c_str());
 }
 
+// 零堆分配判定是否为当前进程/线程的 /proc/*/status（供 PLT 与 SIGSYS 双通道共用）
+inline bool is_proc_status_path_raw(const char *p) noexcept {
+    if (!p || std::strncmp(p, "/proc/", 6) != 0) return false;
+    const char *s = p + 6;
+    if (std::strcmp(s, "self/status") == 0 || std::strcmp(s, "thread-self/status") == 0) {
+        return true;
+    }
+    if (std::strncmp(s, "self/task/", 10) == 0) {
+        const char *t = s + 10;
+        if (*t < '0' || *t > '9') return false;
+        while (*t >= '0' && *t <= '9') ++t;
+        return std::strcmp(t, "/status") == 0;
+    }
+    if (*s >= '0' && *s <= '9') {
+        while (*s >= '0' && *s <= '9') ++s;
+        if (std::strcmp(s, "/status") == 0) return true;
+        if (std::strncmp(s, "/task/", 6) == 0) {
+            const char *t = s + 6;
+            if (*t < '0' || *t > '9') return false;
+            while (*t >= '0' && *t <= '9') ++t;
+            return std::strcmp(t, "/status") == 0;
+        }
+    }
+    return false;
+}
+
 } // namespace mirage

@@ -63,6 +63,8 @@ async function toggleModuleSwitch(
   };
   if (field === 'seccomp' && next.seccomp) {
     next.vfs = true;
+  } else if (field === 'vfs' && !next.vfs) {
+    next.seccomp = false;
   }
   await updateAppRouteViaCli(pkg, next, false);
 }

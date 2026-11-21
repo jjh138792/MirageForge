@@ -18,6 +18,10 @@
 #include <linux/audit.h>
 #include "vfs/io_hooks.hpp"
 
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
+
 namespace mirage {
 
 struct PrebakedVfsEntry {
@@ -38,8 +42,6 @@ inline KernelSigactionAArch64 g_old_k_sigsys{};
 inline int g_seccomp_probe_pipe[2] = {-1, -1};
 inline std::atomic_flag g_seccomp_pipe_lock = ATOMIC_FLAG_INIT;
 
-// 预烘焙只读静态 VFS 缓存：仅在安装 BPF 前的单线程阶段构造，安装后永不修改，
-// 从而在 SIGSYS 信号处理函数内实现 0 malloc、0 锁、100% 异步信号安全！
 inline std::vector<PrebakedVfsEntry> g_seccomp_vfs_cache;
 inline std::atomic<bool> g_seccomp_cache_ready{false};
 
@@ -134,7 +136,6 @@ inline void drain_probe_pipe(size_t bytes) noexcept {
     }
 }
 
-// 通过内核 pipe copy_from_user 安全读取任意用户态内存，遇到 PROT_NONE 陷阱页绝不 SIGSEGV
 inline bool safe_read_user_bytes(const void *user_src, void *dst, size_t len) noexcept {
     if (!user_src || !dst || len == 0 || len > 512) return false;
     if (g_seccomp_probe_pipe[0] < 0 || g_seccomp_probe_pipe[1] < 0) return false;
@@ -157,7 +158,6 @@ inline bool safe_read_user_bytes(const void *user_src, void *dst, size_t len) no
     return ok;
 }
 
-// 通过内核 pipe copy_to_user 安全写入任意用户态内存，遇到只读/无效页绝不 SIGSEGV
 inline bool safe_write_user_bytes(void *user_dst, const void *src, size_t len) noexcept {
     if (!user_dst || !src || len == 0 || len > 512) return false;
     if (g_seccomp_probe_pipe[0] < 0 || g_seccomp_probe_pipe[1] < 0) return false;
@@ -180,8 +180,9 @@ inline bool safe_write_user_bytes(void *user_dst, const void *src, size_t len) n
     return ok;
 }
 
+// 按 16 字节 MTE 粒度安全拷贝路径，绝不跨 Scudo 堆块 tag 边界或 4KB 页边界
 inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t out_cap) noexcept {
-    if (!user_ptr || !out_buf || out_cap < 8) return false;
+    if (!user_ptr || !out_buf || out_cap < 16) return false;
     if (g_seccomp_probe_pipe[0] < 0 || g_seccomp_probe_pipe[1] < 0) return false;
     if (g_seccomp_pipe_lock.test_and_set(std::memory_order_acquire)) return false;
 
@@ -191,10 +192,9 @@ inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t 
 
     while (copied + 1 < out_cap) {
         uintptr_t cur = reinterpret_cast<uintptr_t>(user_ptr) + copied;
-        size_t to_page_end = 4096U - (cur & 4095U);
+        size_t to_granule_end = 16U - (cur & 15U);
         size_t remain = (out_cap - 1) - copied;
-        size_t chunk = (to_page_end < remain) ? to_page_end : remain;
-        if (chunk > 64U) chunk = 64U;
+        size_t chunk = (to_granule_end < remain) ? to_granule_end : remain;
 
         int64_t wr = mirage_seccomp_bypass_syscall(
             __NR_write, g_seccomp_probe_pipe[1],
@@ -218,9 +218,10 @@ inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t 
             }
         }
         copied += static_cast<size_t>(rd);
+        out_buf[copied] = '\0';
 
         if (copied >= 1 && out_buf[0] != '/') { valid = false; break; }
-        if (copied >= 6) {
+        if (copied >= 9) {
             if (std::strncmp(out_buf, "/proc/", 6) != 0 &&
                 std::strncmp(out_buf, "/sys/", 5) != 0 &&
                 std::strncmp(out_buf, "/system/", 8) != 0 &&
@@ -235,10 +236,15 @@ inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t 
     }
 
     g_seccomp_pipe_lock.clear(std::memory_order_release);
-    return valid && nul_found && copied >= 6;
+    if (!valid || !nul_found || copied < 6) return false;
+    return std::strncmp(out_buf, "/proc/", 6) == 0 ||
+           std::strncmp(out_buf, "/sys/", 5) == 0 ||
+           std::strncmp(out_buf, "/system/", 8) == 0 ||
+           std::strncmp(out_buf, "/vendor/", 8) == 0 ||
+           std::strncmp(out_buf, "/product/", 9) == 0 ||
+           std::strncmp(out_buf, "/odm/", 5) == 0;
 }
 
-// 零 malloc、零锁，通过裸 svc #0 创建只读 memfd 并填入静态数据
 inline int create_raw_memfd_from_buffer(const char *data, size_t len, const char *static_path) noexcept {
     int64_t fd = mirage_seccomp_bypass_syscall(
         __NR_memfd_create, reinterpret_cast<long>(""), MFD_CLOEXEC, 0, 0, 0, 0);
@@ -257,51 +263,91 @@ inline int create_raw_memfd_from_buffer(const char *data, size_t len, const char
     return static_cast<int>(fd);
 }
 
-// 零 malloc 隐匿 /proc/self/status 中的 Seccomp_filters: 2 -> 1
+// 低栈占用（< 1KB）流式逐行隐匿 /proc/*/status 中的 Seccomp_filters: 2 -> 1
 inline int cloak_proc_status_signal_safe(long dirfd, long raw_path_ptr, long flags, long mode) noexcept {
     int64_t real_fd = mirage_seccomp_bypass_syscall(__NR_openat, dirfd, raw_path_ptr, flags, mode, 0, 0);
     if (real_fd < 0) return static_cast<int>(real_fd);
 
-    char buf[4096];
-    size_t total = 0;
-    while (total + 1 < sizeof(buf)) {
+    int64_t mfd = mirage_seccomp_bypass_syscall(
+        __NR_memfd_create, reinterpret_cast<long>(""), MFD_CLOEXEC, 0, 0, 0, 0);
+    if (mfd < 0) return static_cast<int>(real_fd);
+
+    char in_buf[256];
+    char line_buf[256];
+    size_t line_len = 0;
+
+    auto flush_line = [&]() noexcept {
+        if (line_len == 0) return;
+        line_buf[line_len] = '\0';
+        if (line_len >= 17 && std::strncmp(line_buf, "Seccomp_filters:", 16) == 0) {
+            char *d = line_buf + 16;
+            while (*d == ' ' || *d == '\t') ++d;
+            if (*d >= '2' && *d <= '9' && (d[1] == '\n' || d[1] == '\r' || d[1] == '\0')) {
+                *d = static_cast<char>(*d - 1);
+            }
+        }
+        size_t w = 0;
+        while (w < line_len) {
+            int64_t n = mirage_seccomp_bypass_syscall(
+                __NR_write, static_cast<long>(mfd),
+                reinterpret_cast<long>(line_buf + w), static_cast<long>(line_len - w), 0, 0, 0);
+            if (n <= 0) break;
+            w += static_cast<size_t>(n);
+        }
+        line_len = 0;
+    };
+
+    while (true) {
         int64_t n = mirage_seccomp_bypass_syscall(
             __NR_read, static_cast<long>(real_fd),
-            reinterpret_cast<long>(buf + total), static_cast<long>(sizeof(buf) - 1 - total), 0, 0, 0);
+            reinterpret_cast<long>(in_buf), static_cast<long>(sizeof(in_buf)), 0, 0, 0);
         if (n <= 0) break;
-        total += static_cast<size_t>(n);
-    }
-    mirage_seccomp_bypass_syscall(__NR_close, static_cast<long>(real_fd), 0, 0, 0, 0, 0);
-    buf[total] = '\0';
-
-    char *pos = std::strstr(buf, "Seccomp_filters:");
-    if (pos) {
-        char *d = pos + 16;
-        while (*d == ' ' || *d == '\t') ++d;
-        if (*d >= '2' && *d <= '9' && (d[1] == '\n' || d[1] == '\r' || d[1] == '\0')) {
-            *d = static_cast<char>(*d - 1);
+        for (int64_t i = 0; i < n; ++i) {
+            char c = in_buf[i];
+            if (line_len + 1 >= sizeof(line_buf)) {
+                flush_line();
+            }
+            line_buf[line_len++] = c;
+            if (c == '\n') {
+                flush_line();
+            }
         }
     }
+    flush_line();
 
-    int fake_fd = create_raw_memfd_from_buffer(buf, total, "/proc/self/status");
-    return (fake_fd >= 0) ? fake_fd : static_cast<int>(
-        mirage_seccomp_bypass_syscall(__NR_openat, dirfd, raw_path_ptr, flags, mode, 0, 0));
+    mirage_seccomp_bypass_syscall(__NR_close, static_cast<long>(real_fd), 0, 0, 0, 0, 0);
+    mirage_seccomp_bypass_syscall(__NR_lseek, static_cast<long>(mfd), 0, SEEK_SET, 0, 0, 0);
+    set_seccomp_fd_path(static_cast<int>(mfd), "/proc/self/status");
+    return static_cast<int>(mfd);
+}
+
+inline void forward_to_old_sigsys(int sig, siginfo_t *info, void *ucontext_raw) noexcept {
+    uintptr_t h = g_old_k_sigsys.k_sa_handler;
+    if (h != 0 && h != 1) {
+        if (g_old_k_sigsys.k_sa_flags & SA_SIGINFO) {
+            reinterpret_cast<void (*)(int, siginfo_t *, void *)>(h)(sig, info, ucontext_raw);
+        } else {
+            reinterpret_cast<void (*)(int)>(h)(sig);
+        }
+    } else if (ucontext_raw) {
+        auto *uc = static_cast<ucontext_t *>(ucontext_raw);
+        uc->uc_mcontext.regs[0] = static_cast<uint64_t>(-ENOSYS);
+    }
 }
 
 inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw) {
     if (sig != SIGSYS || !info || !ucontext_raw) return;
 
+    // 若非内核 SECCOMP 触发（例如应用自发 tgkill(SIGSYS) 探针），直接转发给原处理器
+    if (info->si_code != SYS_SECCOMP) {
+        forward_to_old_sigsys(sig, info, ucontext_raw);
+        return;
+    }
+
     int nr = info->si_syscall;
     if (nr != __NR_openat && nr != __NR_readlinkat && nr != __NR_uname &&
         nr != __NR_sysinfo && nr != __NR_rt_sigaction) {
-        if ((g_old_sigsys.sa_flags & SA_SIGINFO) && g_old_sigsys.sa_sigaction) {
-            g_old_sigsys.sa_sigaction(sig, info, ucontext_raw);
-        } else if (g_old_sigsys.sa_handler != SIG_DFL && g_old_sigsys.sa_handler != SIG_IGN) {
-            g_old_sigsys.sa_handler(sig);
-        } else {
-            auto *uc = static_cast<ucontext_t *>(ucontext_raw);
-            uc->uc_mcontext.regs[0] = static_cast<uint64_t>(-ENOSYS);
-        }
+        forward_to_old_sigsys(sig, info, ucontext_raw);
         return;
     }
 
@@ -349,15 +395,15 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
         return;
     }
 
-    // 2. 零堆分配 openat 拦截：仅匹配 /proc/self/status 与预烘焙只读缓存表
+    // 2. 零堆分配 openat 拦截：放行写/目录打开，仅处理 /proc/*/status 与预烘焙硬件只读节点
     if (nr == __NR_openat) {
         char safe_path[256];
         int64_t raw_ret = -1;
         bool handled = false;
+        bool is_ro_file = ((a2 & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_DIRECTORY)) == 0);
 
-        if (safe_copy_user_vfs_path(reinterpret_cast<const char *>(a1), safe_path, sizeof(safe_path))) {
-            if (std::strcmp(safe_path, "/proc/self/status") == 0 ||
-                std::strcmp(safe_path, "/proc/thread-self/status") == 0) {
+        if (is_ro_file && safe_copy_user_vfs_path(reinterpret_cast<const char *>(a1), safe_path, sizeof(safe_path))) {
+            if (is_proc_status_path_raw(safe_path)) {
                 raw_ret = cloak_proc_status_signal_safe(a0, a1, a2, a3);
                 handled = true;
             } else if (g_seccomp_cache_ready.load(std::memory_order_acquire)) {
@@ -448,7 +494,7 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
 }
 #endif
 
-// PLT 级 sigaction 隐匿：当目标应用通过 libc 查询/修改 SIGSYS 时，隐身返回原处理器
+// PLT 级 sigaction 隐匿
 inline int hook_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
     if (signum == SIGSYS && g_seccomp_active.load(std::memory_order_acquire)) {
         if (oldact) {
@@ -536,43 +582,44 @@ inline void install_on_demand_seccomp_bpf() {
         });
     }
 
-    // 提前读取原始内核态 SIGSYS 处理器用于隐匿响应
+    // 显式解除当前线程 SIGSYS 屏蔽
+    uint64_t unblock_mask = 1ULL << (SIGSYS - 1);
     mirage_seccomp_bypass_syscall(
-        __NR_rt_sigaction, SIGSYS, 0, reinterpret_cast<long>(&g_old_k_sigsys), 8, 0, 0);
+        __NR_rt_sigprocmask, SIG_UNBLOCK, reinterpret_cast<long>(&unblock_mask), 0, 8, 0, 0);
 
-    sigset_t unblock_set;
-    sigemptyset(&unblock_set);
-    sigaddset(&unblock_set, SIGSYS);
-    sigprocmask(SIG_UNBLOCK, &unblock_set, nullptr);
+    // 关键修复：直接通过裸 rt_sigaction 向内核注册 SIGSYS，彻底绕过 libsigchain.so 与 SA_ONSTACK 信号栈溢出！
+    KernelSigactionAArch64 new_k_sa{};
+    new_k_sa.k_sa_handler = reinterpret_cast<uintptr_t>(&sigsys_seccomp_handler);
+    new_k_sa.k_sa_flags   = static_cast<uint64_t>(SA_SIGINFO | SA_NODEFER);
+    new_k_sa.k_sa_restorer = 0;
+    new_k_sa.k_sa_mask     = 0;
 
-    struct sigaction sa{};
-    sa.sa_sigaction = sigsys_seccomp_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    int sa_ret = orig_sigaction ? orig_sigaction(SIGSYS, &sa, &g_old_sigsys) : sigaction(SIGSYS, &sa, &g_old_sigsys);
-    if (sa_ret != 0) return;
+    if (mirage_seccomp_bypass_syscall(
+            __NR_rt_sigaction, SIGSYS,
+            reinterpret_cast<long>(&new_k_sa),
+            reinterpret_cast<long>(&g_old_k_sigsys), 8, 0, 0) != 0) {
+        return;
+    }
+    g_old_sigsys.sa_handler = reinterpret_cast<void (*)(int)>(g_old_k_sigsys.k_sa_handler);
+    g_old_sigsys.sa_flags   = static_cast<int>(g_old_k_sigsys.k_sa_flags);
 
     std::vector<struct sock_filter> filter;
     filter.reserve(12 + allow_ranges.size() * 6);
 
-    // [0..1] 严格校验架构为 AUDIT_ARCH_AARCH64，否则跳至 [10] ALLOW
     filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)));
     filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 8));
 
-    // [2..9] 仅匹配 4 个硬件/文件调用 + rt_sigaction(SIGSYS)，其余全部跳至 [10] ALLOW
     filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)));
-    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,       7, 0)); // -> [11]
-    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat,   6, 0)); // -> [11]
-    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_uname,        5, 0)); // -> [11]
-    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sysinfo,      4, 0)); // -> [11]
-    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigaction, 0, 2)); // true->[8], false->[10]
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,       7, 0));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat,   6, 0));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_uname,        5, 0));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sysinfo,      4, 0));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigaction, 0, 2));
     filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])));
-    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIGSYS,            1, 0)); // true->[11], false->[10]
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIGSYS,            1, 0));
 
-    // [10] 快速放行出口
     filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 
-    // [11..] 白名单核心运行时 PC 范围放行（6 条/段）
     for (const auto &r : allow_ranges) {
         filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4));
         filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, r.hi, 0, 4));
@@ -582,7 +629,6 @@ inline void install_on_demand_seccomp_bpf() {
         filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     }
 
-    // 外部应用/加固库直接发起的裸 svc #0 -> 触发 SIGSYS
     filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP));
 
     struct sock_fprog prog = {

@@ -28,6 +28,7 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
                       norm_path == "/proc/self/mounts" ||
                       norm_path == "/proc/mounts");
     bool is_status = g_seccomp_active.load(std::memory_order_acquire) &&
+                     is_proc_status_path_raw(norm_path.c_str());
                      (norm_path == "/proc/self/status" ||
                       norm_path == "/proc/thread-self/status");
 
