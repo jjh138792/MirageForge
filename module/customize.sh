@@ -7,8 +7,7 @@ MOD_VER=$(grep_prop version "$MODPATH/module.prop")
 MOD_CODE=$(grep_prop versionCode "$MODPATH/module.prop")
 
 ui_print "========================================================"
-ui_print "   蜃楼工坊 · MirageForge $MOD_VER (Build $MOD_CODE)     "
-ui_print "   Volatile Arena | Zero-Fork WebUI | Per-App DPI       "
+ui_print "   蜃楼工坊 · MirageForge $MOD_VER (Build $MOD_CODE)     " 
 ui_print "========================================================"
 ui_print "- 设备架构: $ARCH ($ABI) | Android API: $API"
 
