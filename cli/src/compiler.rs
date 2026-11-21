@@ -121,9 +121,9 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         // Java android.os.Build$VERSION 反射字段
         push_kv(&mut lines, "VERSION:INCREMENTAL", incremental);
         push_kv(&mut lines, "VERSION:SECURITY_PATCH", &tpl.security_patch);
-        push_kv(&mut lines, "VERSION:CODENAME", "REL");
-        push_kv(&mut lines, "VERSION:PREVIEW_SDK_INT", "0");
         if route.sdk_spoof {
+            push_kv(&mut lines, "VERSION:CODENAME", "REL");
+            push_kv(&mut lines, "VERSION:PREVIEW_SDK_INT", "0");
             push_kv(&mut lines, "VERSION:RELEASE", &tpl.release);
             push_kv(&mut lines, "VERSION:SDK_INT", &tpl.sdk_int);
             push_kv(&mut lines, "VERSION:DEVICE_INITIAL_SDK_INT", &tpl.sdk_int);

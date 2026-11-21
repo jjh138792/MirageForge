@@ -119,8 +119,9 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
+// 严格 0 改动隔离：仅当 build 开关明确开启时，才分配只读属性区并注入受限属性
 inline void freeze_bionic_prop_arena() {
-    if (!g_cfg.build.enabled && !g_cfg.gl.enabled) return;
+    if (!g_cfg.build.enabled) return;
 
     auto set_default_restricted = [&](const char *k, const std::string &v) {
         if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
@@ -128,29 +129,27 @@ inline void freeze_bionic_prop_arena() {
         }
     };
 
-    if (g_cfg.build.enabled) {
-        set_default_restricted("ro.boot.vbmeta.device_state", "locked");
-        set_default_restricted("ro.boot.vbmeta.avb_version", "1.2");
-        set_default_restricted("ro.boot.vbmeta.hash_alg", "sha256");
-        set_default_restricted("ro.boot.verifiedbootstate", "green");
-        set_default_restricted("ro.boot.veritymode", "enforcing");
-        set_default_restricted("ro.boot.flash.locked", "1");
-        set_default_restricted("ro.boot.warranty_bit", "0");
-        set_default_restricted("ro.warranty_bit", "0");
-        set_default_restricted("ro.build.selinux", "1");
-        set_default_restricted("ro.debuggable", "0");
-        set_default_restricted("ro.secure", "1");
-        set_default_restricted("ro.adb.secure", "1");
-        set_default_restricted("sys.oem_unlock_allowed", "0");
-        set_default_restricted("sys.usb.state", "none");
-        set_default_restricted("sys.usb.config", "none");
-        set_default_restricted("init.svc.adbd", "stopped");
-        set_default_restricted("ro.sys.cloud.magisk", "0");
-        set_default_restricted("persist.sys.cloud.root.global", "0");
-        set_default_restricted("ro.sys.cloud.root.global", "0");
-    }
+    set_default_restricted("ro.boot.vbmeta.device_state", "locked");
+    set_default_restricted("ro.boot.vbmeta.avb_version", "1.2");
+    set_default_restricted("ro.boot.vbmeta.hash_alg", "sha256");
+    set_default_restricted("ro.boot.verifiedbootstate", "green");
+    set_default_restricted("ro.boot.veritymode", "enforcing");
+    set_default_restricted("ro.boot.flash.locked", "1");
+    set_default_restricted("ro.boot.warranty_bit", "0");
+    set_default_restricted("ro.warranty_bit", "0");
+    set_default_restricted("ro.build.selinux", "1");
+    set_default_restricted("ro.debuggable", "0");
+    set_default_restricted("ro.secure", "1");
+    set_default_restricted("ro.adb.secure", "1");
+    set_default_restricted("sys.oem_unlock_allowed", "0");
+    set_default_restricted("sys.usb.state", "none");
+    set_default_restricted("sys.usb.config", "none");
+    set_default_restricted("init.svc.adbd", "stopped");
+    set_default_restricted("ro.sys.cloud.magisk", "0");
+    set_default_restricted("persist.sys.cloud.root.global", "0");
+    set_default_restricted("ro.sys.cloud.root.global", "0");
 
-    // 使用独立的 Vulkan / OpenGL 参数同步覆写系统图形属性
+    // 仅当 build 与 gl 双开关同时开启时，才同步注入图形辅助属性
     if (g_cfg.gl.enabled) {
         const std::string &vk_name = g_cfg.gl.effective_vk_device_name();
         if (!vk_name.empty()) {
@@ -165,7 +164,6 @@ inline void freeze_bionic_prop_arena() {
         if (g_cfg.gl.vk_driver_version_packed != 0) {
             g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_driverversion"] = std::to_string(g_cfg.gl.vk_driver_version_packed);
         }
-
         if (!g_cfg.gl.gl_renderer.empty()) {
             g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
             g_cfg.build.prop_map["persist.sys.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
@@ -178,21 +176,23 @@ inline void freeze_bionic_prop_arena() {
             g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_version"] = g_cfg.gl.gl_version;
             g_cfg.build.prop_map["persist.sys.gpu.gl_version"] = g_cfg.gl.gl_version;
         }
-    }
-
-    if (g_cfg.gl.enabled && g_cfg.gl.max_refresh_rate >= 90) {
-        std::string fps_s = std::to_string(g_cfg.gl.max_refresh_rate);
-        set_default_restricted("ro.vendor.display.default_fps", fps_s);
-        set_default_restricted("persist.vendor.dfps.level", fps_s);
-        set_default_restricted("persist.sys.peak_refresh_rate", fps_s);
-        set_default_restricted("persist.sys.min_refresh_rate", fps_s);
+        if (g_cfg.gl.max_refresh_rate >= 90) {
+            std::string fps_s = std::to_string(g_cfg.gl.max_refresh_rate);
+            set_default_restricted("ro.vendor.display.default_fps", fps_s);
+            set_default_restricted("persist.vendor.dfps.level", fps_s);
+            set_default_restricted("persist.sys.peak_refresh_rate", fps_s);
+            set_default_restricted("persist.sys.min_refresh_rate", fps_s);
+        }
     }
 
     if (!g_cfg.build.force_spoof_sdk) {
         for (auto it = g_cfg.build.prop_map.begin(); it != g_cfg.build.prop_map.end(); ) {
             const std::string &k = it->first;
             if (k.find("build.version.sdk") != std::string::npos ||
-                k.find("build.version.release") != std::string::npos) {
+                k.find("build.version.release") != std::string::npos ||
+                k.find("first_api_level") != std::string::npos ||
+                k.find("preview_sdk") != std::string::npos ||
+                k.find("version.codename") != std::string::npos) {
                 it = g_cfg.build.prop_map.erase(it);
             } else {
                 ++it;
@@ -219,7 +219,7 @@ inline bool is_interesting_unmapped_prop(const char *name) noexcept {
 
 inline const prop_info *hook_system_property_find(const char *name) {
     if (name) {
-        if (g_cfg.build.enabled || g_cfg.gl.enabled) {
+        if (g_cfg.build.enabled) {
             const std::string *syn_val = nullptr;
             if (const prop_info *syn = g_prop_arena.find_lockfree(name, &syn_val)) {
                 if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -249,7 +249,7 @@ inline void internal_read_cb_bridge(void *cookie, const char *name, const char *
     if (!ctx || !ctx->user_cb) return;
 
     if (name) {
-        if (g_cfg.build.enabled || g_cfg.gl.enabled) {
+        if (g_cfg.build.enabled) {
             auto it = g_cfg.build.prop_map.find(name);
             if (it != g_cfg.build.prop_map.end()) {
                 if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -273,7 +273,7 @@ inline void internal_read_cb_bridge(void *cookie, const char *name, const char *
 inline void hook_system_property_read_callback(const prop_info *pi, T_PropCallback callback, void *cookie) {
     if (!pi || !callback) return;
 
-    if (g_cfg.build.enabled || g_cfg.gl.enabled) {
+    if (g_cfg.build.enabled) {
         const char *syn_name = nullptr;
         const std::string *syn_val = nullptr;
         if (g_prop_arena.is_synthetic_lockfree(pi, &syn_name, &syn_val) && syn_name && syn_val) {
@@ -295,7 +295,7 @@ inline void hook_system_property_read_callback(const prop_info *pi, T_PropCallba
 inline int hook_system_property_read(const prop_info *pi, char *name, char *value) {
     if (!pi) return 0;
 
-    if (g_cfg.build.enabled || g_cfg.gl.enabled) {
+    if (g_cfg.build.enabled) {
         const char *syn_name = nullptr;
         const std::string *syn_val = nullptr;
         if (g_prop_arena.is_synthetic_lockfree(pi, &syn_name, &syn_val) && syn_name && syn_val) {
@@ -318,7 +318,7 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 
     if (!orig_system_property_read) return 0;
     int ret = orig_system_property_read(pi, name, value);
-    if (name && value && (g_cfg.build.enabled || g_cfg.gl.enabled)) {
+    if (name && value && g_cfg.build.enabled) {
         auto it = g_cfg.build.prop_map.find(name);
         if (it != g_cfg.build.prop_map.end()) {
             if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -335,15 +335,7 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 
 inline int hook_system_property_get(const char *name, char *value) {
     if (name && value) {
-        if (g_cfg.gl.enabled && g_on_vulkan_prop_hit &&
-            std::strncmp(name, "persist.sys.cloud.gpu.vk_", 25) == 0) {
-            static std::atomic<bool> s_vk_rescanned{false};
-            if (!s_vk_rescanned.exchange(true, std::memory_order_acq_rel)) {
-                ScopedHookGuard guard;
-                if (guard) g_on_vulkan_prop_hit();
-            }
-        }
-        if (g_cfg.build.enabled || g_cfg.gl.enabled) {
+        if (g_cfg.build.enabled) {
             auto it = g_cfg.build.prop_map.find(name);
             if (it != g_cfg.build.prop_map.end()) {
                 if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -377,7 +369,7 @@ inline void internal_foreach_cb(const prop_info *pi, void *cookie) {
     auto *ctx = static_cast<ForeachBridgeCtx *>(cookie);
     if (!ctx || !ctx->user_fn || !pi) return;
 
-    if ((g_cfg.build.enabled || g_cfg.gl.enabled) && orig_system_property_read_callback) {
+    if (g_cfg.build.enabled && orig_system_property_read_callback) {
         std::string key;
         auto key_extractor = [](void *c, const char *name, const char *, uint32_t) {
             if (name) *static_cast<std::string *>(c) = name;
@@ -396,7 +388,7 @@ inline void internal_foreach_cb(const prop_info *pi, void *cookie) {
 
 inline int hook_system_property_foreach(T_ForeachCallback propfn, void *cookie) {
     if (!propfn) return -1;
-    if ((!g_cfg.build.enabled && !g_cfg.gl.enabled) || !orig_system_property_foreach) {
+    if (!g_cfg.build.enabled || !orig_system_property_foreach) {
         return orig_system_property_foreach ? orig_system_property_foreach(propfn, cookie) : -1;
     }
 
@@ -419,7 +411,7 @@ inline int hook_system_property_foreach(T_ForeachCallback propfn, void *cookie) 
 
 inline const prop_info *hook_system_property_find_nth(unsigned n) {
     const prop_info *real_pi = orig_system_property_find_nth ? orig_system_property_find_nth(n) : nullptr;
-    if (real_pi && (g_cfg.build.enabled || g_cfg.gl.enabled) && orig_system_property_read_callback) {
+    if (real_pi && g_cfg.build.enabled && orig_system_property_read_callback) {
         std::string key;
         auto key_extractor = [](void *c, const char *name, const char *, uint32_t) {
             if (name) *static_cast<std::string *>(c) = name;

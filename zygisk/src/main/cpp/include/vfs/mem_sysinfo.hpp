@@ -9,14 +9,14 @@
 namespace mirage {
 
 inline uint64_t calc_realistic_memtotal_kb(int ram_gb) noexcept {
-    uint64_t phys_kb = static_cast<uint64_t>(ram_gb > 0 ? ram_gb : 16) * 1024ULL * 1024ULL;
+    uint64_t phys_kb = static_cast<uint64_t>(ram_gb) * 1024ULL * 1024ULL;
     return (phys_kb * 935ULL) / 1000ULL;
 }
 
 inline bool synthesize_mem_soc_vfs_node(const std::string &norm, std::string *out_content) {
     if (norm == "/proc/meminfo") {
-        int ram_gb = g_cfg.vfs.ram_gb > 0 ? g_cfg.vfs.ram_gb : 16;
-        uint64_t total_kb = calc_realistic_memtotal_kb(ram_gb);
+        if (g_cfg.vfs.ram_gb <= 0) return false;
+        uint64_t total_kb = calc_realistic_memtotal_kb(g_cfg.vfs.ram_gb);
         uint64_t free_kb  = (total_kb * 24ULL) / 100ULL;
         uint64_t avail_kb = (total_kb * 58ULL) / 100ULL;
         uint64_t cached_kb = (total_kb * 28ULL) / 100ULL;
@@ -49,33 +49,49 @@ inline bool synthesize_mem_soc_vfs_node(const std::string &norm, std::string *ou
     }
 
     if (norm == "/proc/ddr_info" || norm == "/sys/devices/system/chip-info/ddr_info") {
+        if (g_cfg.vfs.ram_gb <= 0) return false;
         *out_content = std::to_string(g_cfg.vfs.ram_gb) + "GB " + g_cfg.vfs.ddr_type + " (" + g_cfg.vfs.ddr_vendor + ")\n";
         return true;
     }
     if (norm == "/proc/version") {
+        if (g_cfg.vfs.kernel_release.empty()) return false;
         *out_content = "Linux version " + g_cfg.vfs.kernel_release + " (kleaf@build-host) " + g_cfg.vfs.kernel_version + "\n";
         return true;
     }
     if (norm == "/proc/sys/kernel/osrelease") {
+        if (g_cfg.vfs.kernel_release.empty()) return false;
         *out_content = g_cfg.vfs.kernel_release + "\n";
         return true;
     }
+    // 严格 0 改动：关闭 GL 开关时绝不触碰 GPU sysfs 节点
     if (norm == "/sys/class/kgsl/kgsl-3d0/gpu_model") {
-        const std::string &gpu = g_cfg.gl.enabled && !g_cfg.gl.effective_vk_device_name().empty()
-                                     ? g_cfg.gl.effective_vk_device_name()
-                                     : "Adreno (TM) 830";
-        *out_content = gpu + "\n";
+        if (!g_cfg.gl.enabled || g_cfg.gl.effective_vk_device_name().empty()) return false;
+        *out_content = g_cfg.gl.effective_vk_device_name() + "\n";
         return true;
     }
-    if (norm == "/sys/devices/soc0/soc_id") { *out_content = g_cfg.vfs.soc_id + "\n"; return true; }
-    if (norm == "/sys/devices/soc0/family") { *out_content = g_cfg.vfs.soc_family + "\n"; return true; }
-    if (norm == "/sys/devices/soc0/machine") { *out_content = g_cfg.vfs.soc_machine + "\n"; return true; }
+    if (norm == "/sys/devices/soc0/soc_id") {
+        if (g_cfg.vfs.soc_id.empty()) return false;
+        *out_content = g_cfg.vfs.soc_id + "\n";
+        return true;
+    }
+    if (norm == "/sys/devices/soc0/family") {
+        if (g_cfg.vfs.soc_family.empty()) return false;
+        *out_content = g_cfg.vfs.soc_family + "\n";
+        return true;
+    }
+    if (norm == "/sys/devices/soc0/machine") {
+        if (g_cfg.vfs.soc_machine.empty()) return false;
+        *out_content = g_cfg.vfs.soc_machine + "\n";
+        return true;
+    }
     if (norm == "/sys/devices/system/chip-info/ddr_type" ||
         norm == "/sys/firmware/devicetree/base/memory/ddr_device_type") {
+        if (g_cfg.vfs.ddr_type.empty()) return false;
         *out_content = g_cfg.vfs.ddr_type + "\n";
         return true;
     }
     if (norm == "/sys/devices/system/chip-info/ddr_size") {
+        if (g_cfg.vfs.ram_gb <= 0) return false;
         *out_content = std::to_string(g_cfg.vfs.ram_gb) + "GB\n";
         return true;
     }
@@ -98,10 +114,10 @@ inline int hook_sysinfo(struct sysinfo *info) {
 
 inline long hook_sysconf(int name) {
     if (g_cfg.vfs.enabled) {
-        if (name == _SC_NPROCESSORS_CONF || name == _SC_NPROCESSORS_ONLN) {
+        if ((name == _SC_NPROCESSORS_CONF || name == _SC_NPROCESSORS_ONLN) && g_cfg.vfs.cpu_cores > 0) {
             ScopedHookGuard guard;
             if (guard) emit_probe("SYSCONF", "_SC_NPROCESSORS", std::to_string(g_cfg.vfs.cpu_cores));
-            return g_cfg.vfs.cpu_cores > 0 ? g_cfg.vfs.cpu_cores : 8;
+            return g_cfg.vfs.cpu_cores;
         }
         if ((name == _SC_PHYS_PAGES || name == _SC_AVPHYS_PAGES) && g_cfg.vfs.ram_gb > 0) {
             long page_sz = orig_sysconf ? orig_sysconf(_SC_PAGESIZE) : 4096;

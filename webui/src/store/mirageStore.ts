@@ -841,9 +841,9 @@ function compileModularConfInTs(rawTpl: DeviceTemplate, route: AppRoute): string
 
     push('VERSION:INCREMENTAL', incremental);
     push('VERSION:SECURITY_PATCH', tpl.SECURITY_PATCH);
-    push('VERSION:CODENAME', 'REL');
-    push('VERSION:PREVIEW_SDK_INT', '0');
     if (route.sdkSpoof) {
+      push('VERSION:CODENAME', 'REL');
+      push('VERSION:PREVIEW_SDK_INT', '0');
       push('VERSION:RELEASE', tpl.RELEASE);
       push('VERSION:SDK_INT', tpl.SDK_INT);
       push('VERSION:DEVICE_INITIAL_SDK_INT', tpl.SDK_INT);

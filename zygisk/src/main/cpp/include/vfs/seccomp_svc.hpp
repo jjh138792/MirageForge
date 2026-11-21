@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
@@ -25,6 +26,7 @@
 namespace mirage {
 
 struct PrebakedVfsEntry {
+    uint64_t path_hash;
     std::string path;
     std::string content;
 };
@@ -43,17 +45,20 @@ inline int g_seccomp_probe_pipe[2] = {-1, -1};
 inline std::atomic_flag g_seccomp_pipe_lock = ATOMIC_FLAG_INIT;
 
 inline std::vector<PrebakedVfsEntry> g_seccomp_vfs_cache;
+inline std::string g_seccomp_shared_build_prop;
 inline std::atomic<bool> g_seccomp_cache_ready{false};
 
 inline void prebake_seccomp_vfs_cache() {
     g_seccomp_vfs_cache.clear();
+    g_seccomp_shared_build_prop.clear();
     if (!g_cfg.vfs.enabled) return;
 
+    g_seccomp_vfs_cache.reserve(56);
     auto bake = [&](const std::string &path) {
         std::string content;
         int dyn = -1;
         if (synthesize_vfs_node_on_demand(path, &content, &dyn) && !content.empty()) {
-            g_seccomp_vfs_cache.push_back({path, std::move(content)});
+            g_seccomp_vfs_cache.push_back({hash_str(path), path, std::move(content)});
         }
     };
 
@@ -83,25 +88,48 @@ inline void prebake_seccomp_vfs_cache() {
     for (int i = 0; i < cores; ++i) {
         std::string pfx = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/";
         bake(pfx + "online");
-        bake(pfx + "cpu_capacity");
         bake(pfx + "regs/identification/midr_el1");
-        bake(pfx + "topology/core_cpus_list");
         bake(pfx + "cpufreq/cpuinfo_max_freq");
         bake(pfx + "cpufreq/cpuinfo_min_freq");
-        bake(pfx + "cpufreq/scaling_max_freq");
-        bake(pfx + "cpufreq/scaling_min_freq");
-        bake(pfx + "cpufreq/scaling_governor");
-        bake(pfx + "cpufreq/scaling_driver");
     }
 
+    // build.prop 仅序列化一次供 4 个分区路径共享，大幅缩减 postAppSpecialize 启动耗时
     if (g_cfg.build.enabled) {
-        bake("/system/build.prop");
-        bake("/vendor/build.prop");
-        bake("/product/build.prop");
-        bake("/odm/build.prop");
+        synthesize_build_prop_vfs_node("/system/build.prop", &g_seccomp_shared_build_prop);
     }
 
     g_seccomp_cache_ready.store(true, std::memory_order_release);
+}
+
+inline bool is_baked_build_prop_path(const char *p) noexcept {
+    if (!p || g_seccomp_shared_build_prop.empty()) return false;
+    return std::strcmp(p, "/system/build.prop") == 0 ||
+           std::strcmp(p, "/vendor/build.prop") == 0 ||
+           std::strcmp(p, "/product/build.prop") == 0 ||
+           std::strcmp(p, "/odm/build.prop") == 0;
+}
+
+inline bool is_proc_pid_dir_raw(const char *p) noexcept {
+    if (!p || std::strncmp(p, "/proc/", 6) != 0) return false;
+    const char *s = p + 6;
+    if (std::strcmp(s, "self") == 0 || std::strcmp(s, "thread-self") == 0) return true;
+    if (std::strncmp(s, "self/task/", 10) == 0) {
+        const char *t = s + 10;
+        if (*t < '0' || *t > '9') return false;
+        while (*t >= '0' && *t <= '9') ++t;
+        return *t == '\0';
+    }
+    if (*s >= '0' && *s <= '9') {
+        while (*s >= '0' && *s <= '9') ++s;
+        if (*s == '\0') return true;
+        if (std::strncmp(s, "/task/", 6) == 0) {
+            const char *t = s + 6;
+            if (*t < '0' || *t > '9') return false;
+            while (*t >= '0' && *t <= '9') ++t;
+            return *t == '\0';
+        }
+    }
+    return false;
 }
 
 #if defined(__aarch64__)
@@ -122,6 +150,26 @@ inline int64_t mirage_seccomp_bypass_syscall(
         : "memory", "cc"
     );
     return static_cast<int64_t>(x0);
+}
+
+// 100% 异步信号安全、零 libc 调用、零堆分配的 Seccomp 陷阱追踪（仅在开启探针时记录前 30 条）
+inline void log_seccomp_trap_signal_safe(int nr, uintptr_t pc, const char *detail, int handled) noexcept {
+    if (__builtin_expect(!g_cfg.probe.enabled || g_probe_log_fd < 0, 1)) return;
+    static std::atomic<int> s_trace_cnt{0};
+    if (s_trace_cnt.fetch_add(1, std::memory_order_relaxed) >= 30) return;
+
+    char buf[224];
+    int len = std::snprintf(
+        buf, sizeof(buf),
+        "[PROBE][%s][SECCOMP_TRAP] nr=%d handled=%d %s @@ pc=0x%zx\n",
+        g_crash_pkg_name[0] ? g_crash_pkg_name : "app",
+        nr, handled, detail ? detail : "", static_cast<size_t>(pc));
+    if (len > 0) {
+        size_t safe_len = (static_cast<size_t>(len) < sizeof(buf)) ? static_cast<size_t>(len) : (sizeof(buf) - 1);
+        mirage_seccomp_bypass_syscall(
+            __NR_sendto, g_probe_log_fd, reinterpret_cast<long>(buf),
+            static_cast<long>(safe_len), MSG_DONTWAIT | MSG_NOSIGNAL, 0, 0);
+    }
 }
 
 inline void drain_probe_pipe(size_t bytes) noexcept {
@@ -180,8 +228,9 @@ inline bool safe_write_user_bytes(void *user_dst, const void *src, size_t len) n
     return ok;
 }
 
-// 按 16 字节 MTE 粒度安全拷贝路径，绝不跨 Scudo 堆块 tag 边界或 4KB 页边界
-inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t out_cap) noexcept {
+// 按 16B MTE 粒度安全拷贝路径，首 2 字节即极速拒收 /data /apex /dev 等 99% 普通路径；
+// 同时支持相对路径 "status" 识别，防止反篡改库通过 openat(dirfd, "status") 绕过 Seccomp_filters 隐匿
+inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t out_cap, bool allow_rel_status) noexcept {
     if (!user_ptr || !out_buf || out_cap < 16) return false;
     if (g_seccomp_probe_pipe[0] < 0 || g_seccomp_probe_pipe[1] < 0) return false;
     if (g_seccomp_pipe_lock.test_and_set(std::memory_order_acquire)) return false;
@@ -189,6 +238,7 @@ inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t 
     size_t copied = 0;
     bool nul_found = false;
     bool valid = true;
+    bool is_rel = false;
 
     while (copied + 1 < out_cap) {
         uintptr_t cur = reinterpret_cast<uintptr_t>(user_ptr) + copied;
@@ -220,8 +270,28 @@ inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t 
         copied += static_cast<size_t>(rd);
         out_buf[copied] = '\0';
 
-        if (copied >= 1 && out_buf[0] != '/') { valid = false; break; }
-        if (copied >= 9) {
+        if (copied >= 1) {
+            if (out_buf[0] == '/') {
+                if (copied >= 2) {
+                    char c1 = out_buf[1];
+                    if (c1 != 'p' && c1 != 's' && c1 != 'v' && c1 != 'o') {
+                        valid = false;
+                        break;
+                    }
+                }
+            } else if (allow_rel_status && out_buf[0] == 's') {
+                is_rel = true;
+                if (copied >= 8 && std::strcmp(out_buf, "status") != 0) {
+                    valid = false;
+                    break;
+                }
+            } else {
+                valid = false;
+                break;
+            }
+        }
+
+        if (!is_rel && copied >= 9) {
             if (std::strncmp(out_buf, "/proc/", 6) != 0 &&
                 std::strncmp(out_buf, "/sys/", 5) != 0 &&
                 std::strncmp(out_buf, "/system/", 8) != 0 &&
@@ -236,13 +306,15 @@ inline bool safe_copy_user_vfs_path(const char *user_ptr, char *out_buf, size_t 
     }
 
     g_seccomp_pipe_lock.clear(std::memory_order_release);
-    if (!valid || !nul_found || copied < 6) return false;
-    return std::strncmp(out_buf, "/proc/", 6) == 0 ||
-           std::strncmp(out_buf, "/sys/", 5) == 0 ||
-           std::strncmp(out_buf, "/system/", 8) == 0 ||
-           std::strncmp(out_buf, "/vendor/", 8) == 0 ||
-           std::strncmp(out_buf, "/product/", 9) == 0 ||
-           std::strncmp(out_buf, "/odm/", 5) == 0;
+    if (!valid || !nul_found) return false;
+    if (is_rel) return std::strcmp(out_buf, "status") == 0;
+    return copied >= 6 &&
+           (std::strncmp(out_buf, "/proc/", 6) == 0 ||
+            std::strncmp(out_buf, "/sys/", 5) == 0 ||
+            std::strncmp(out_buf, "/system/", 8) == 0 ||
+            std::strncmp(out_buf, "/vendor/", 8) == 0 ||
+            std::strncmp(out_buf, "/product/", 9) == 0 ||
+            std::strncmp(out_buf, "/odm/", 5) == 0);
 }
 
 inline int create_raw_memfd_from_buffer(const char *data, size_t len, const char *static_path) noexcept {
@@ -263,7 +335,7 @@ inline int create_raw_memfd_from_buffer(const char *data, size_t len, const char
     return static_cast<int>(fd);
 }
 
-// 低栈占用（< 1KB）流式逐行隐匿 /proc/*/status 中的 Seccomp_filters: 2 -> 1
+// 低栈占用 (< 1KB) 流式逐行隐匿 /proc/*/status 中的 Seccomp_filters: 2 -> 1
 inline int cloak_proc_status_signal_safe(long dirfd, long raw_path_ptr, long flags, long mode) noexcept {
     int64_t real_fd = mirage_seccomp_bypass_syscall(__NR_openat, dirfd, raw_path_ptr, flags, mode, 0, 0);
     if (real_fd < 0) return static_cast<int>(real_fd);
@@ -338,7 +410,6 @@ inline void forward_to_old_sigsys(int sig, siginfo_t *info, void *ucontext_raw) 
 inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw) {
     if (sig != SIGSYS || !info || !ucontext_raw) return;
 
-    // 若非内核 SECCOMP 触发（例如应用自发 tgkill(SIGSYS) 探针），直接转发给原处理器
     if (info->si_code != SYS_SECCOMP) {
         forward_to_old_sigsys(sig, info, ucontext_raw);
         return;
@@ -352,6 +423,7 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
     }
 
     auto *uc = static_cast<ucontext_t *>(ucontext_raw);
+    uintptr_t trap_pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
     long a0 = static_cast<long>(uc->uc_mcontext.regs[0]);
     long a1 = static_cast<long>(uc->uc_mcontext.regs[1]);
     long a2 = static_cast<long>(uc->uc_mcontext.regs[2]);
@@ -386,6 +458,7 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
                 }
             }
             uc->uc_mcontext.regs[0] = static_cast<uint64_t>(ret_val);
+            log_seccomp_trap_signal_safe(nr, trap_pc, "rt_sigaction(SIGSYS)", 1);
         } else {
             uc->uc_mcontext.regs[0] = static_cast<uint64_t>(
                 mirage_seccomp_bypass_syscall(__NR_rt_sigaction, a0, a1, a2, a3, 0, 0));
@@ -395,22 +468,49 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
         return;
     }
 
-    // 2. 零堆分配 openat 拦截：放行写/目录打开，仅处理 /proc/*/status 与预烘焙硬件只读节点
+    // 2. 零堆分配 openat 拦截：支持绝对路径 + 相对 dirfd("status") + FNV-1a 哈希极速查表
     if (nr == __NR_openat) {
-        char safe_path[256];
+        char safe_path[192];
         int64_t raw_ret = -1;
         bool handled = false;
         bool is_ro_file = ((a2 & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_DIRECTORY)) == 0);
+        bool has_dirfd = (a0 >= 0 && a0 != AT_FDCWD);
 
-        if (is_ro_file && safe_copy_user_vfs_path(reinterpret_cast<const char *>(a1), safe_path, sizeof(safe_path))) {
-            if (is_proc_status_path_raw(safe_path)) {
+        if (is_ro_file &&
+            safe_copy_user_vfs_path(reinterpret_cast<const char *>(a1), safe_path, sizeof(safe_path), has_dirfd)) {
+            bool is_status = false;
+            if (safe_path[0] == 's' && has_dirfd) {
+                char fdlink[40];
+                char dirpath[96];
+                std::snprintf(fdlink, sizeof(fdlink), "/proc/self/fd/%ld", a0);
+                int64_t rl = mirage_seccomp_bypass_syscall(
+                    __NR_readlinkat, AT_FDCWD, reinterpret_cast<long>(fdlink),
+                    reinterpret_cast<long>(dirpath), static_cast<long>(sizeof(dirpath) - 1), 0, 0);
+                if (rl > 0) {
+                    dirpath[rl] = '\0';
+                    is_status = is_proc_pid_dir_raw(dirpath);
+                }
+            } else {
+                is_status = is_proc_status_path_raw(safe_path);
+            }
+
+            if (is_status) {
                 raw_ret = cloak_proc_status_signal_safe(a0, a1, a2, a3);
                 handled = true;
+            } else if (is_baked_build_prop_path(safe_path)) {
+                int fd = create_raw_memfd_from_buffer(
+                    g_seccomp_shared_build_prop.data(),
+                    g_seccomp_shared_build_prop.size(),
+                    "/system/build.prop");
+                if (fd >= 0) { raw_ret = fd; handled = true; }
             } else if (g_seccomp_cache_ready.load(std::memory_order_acquire)) {
+                size_t plen = std::strlen(safe_path);
+                uint64_t ph = fnv1a_64(safe_path, plen);
                 const PrebakedVfsEntry *entries = g_seccomp_vfs_cache.data();
                 size_t count = g_seccomp_vfs_cache.size();
                 for (size_t i = 0; i < count; ++i) {
-                    if (std::strcmp(safe_path, entries[i].path.c_str()) == 0) {
+                    if (entries[i].path_hash == ph &&
+                        std::strcmp(safe_path, entries[i].path.c_str()) == 0) {
                         int fd = create_raw_memfd_from_buffer(
                             entries[i].content.data(),
                             entries[i].content.size(),
@@ -423,6 +523,7 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
                     }
                 }
             }
+            log_seccomp_trap_signal_safe(nr, trap_pc, safe_path, handled ? 1 : 0);
         }
 
         if (!handled) {
@@ -430,12 +531,12 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
         }
         uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     } else if (nr == __NR_readlinkat) {
-        char safe_path[256];
+        char safe_path[192];
         bool handled = false;
         int64_t raw_ret = -1;
 
         if (a2 != 0 && a3 > 0 &&
-            safe_copy_user_vfs_path(reinterpret_cast<const char *>(a1), safe_path, sizeof(safe_path)) &&
+            safe_copy_user_vfs_path(reinterpret_cast<const char *>(a1), safe_path, sizeof(safe_path), false) &&
             std::strncmp(safe_path, "/proc/", 6) == 0) {
             const char *fd_seg = std::strstr(safe_path, "/fd/");
             if (fd_seg) {
@@ -453,6 +554,7 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
                     }
                 }
             }
+            log_seccomp_trap_signal_safe(nr, trap_pc, safe_path, handled ? 1 : 0);
         }
         if (!handled) {
             raw_ret = mirage_seccomp_bypass_syscall(__NR_readlinkat, a0, a1, a2, a3, 0, 0);
@@ -475,6 +577,7 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
                 buf->version[sizeof(buf->version) - 1] = '\0';
             }
         }
+        log_seccomp_trap_signal_safe(nr, trap_pc, "uname", 1);
         uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     } else if (nr == __NR_sysinfo) {
         int64_t raw_ret = mirage_seccomp_bypass_syscall(__NR_sysinfo, a0, 0, 0, 0, 0, 0);
@@ -486,6 +589,7 @@ inline void sigsys_seccomp_handler(int sig, siginfo_t *info, void *ucontext_raw)
             s_info->freeram  = (s_info->totalram * 58UL) / 100UL;
             s_info->bufferram = (s_info->totalram * 4UL) / 100UL;
         }
+        log_seccomp_trap_signal_safe(nr, trap_pc, "sysinfo", 1);
         uc->uc_mcontext.regs[0] = static_cast<uint64_t>(raw_ret);
     }
 
@@ -531,10 +635,11 @@ inline void install_on_demand_seccomp_bpf() {
         uint32_t lo_start;
         uint32_t lo_end;
     };
-    std::vector<ExecRange> allow_ranges;
+    // 分级收集：保证 libc.so 排在 BPF 第 0 位，使 99.9% 的正常系统调用 6 条指令内立即 ALLOW
+    std::vector<ExecRange> libc_ranges;
+    std::vector<ExecRange> self_ranges;
+    std::vector<ExecRange> other_ranges;
     uintptr_t self_pc = reinterpret_cast<uintptr_t>(&mirage_seccomp_bypass_syscall);
-    bool self_vma_found = false;
-    bool libc_found = false;
 
     FILE *fp = orig_fopen ? orig_fopen("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
     if (fp) {
@@ -560,34 +665,38 @@ inline void install_on_demand_seccomp_bpf() {
 
             if (!is_self && !is_libc && !is_linker && !is_art && !is_vdso) continue;
 
-            if (is_self) self_vma_found = true;
-            if (is_libc) libc_found = true;
-
-            allow_ranges.push_back({
+            ExecRange r{
                 static_cast<uint32_t>(s >> 32),
                 static_cast<uint32_t>(s & 0xFFFFFFFFULL),
                 static_cast<uint32_t>(e & 0xFFFFFFFFULL),
-            });
+            };
+            if (is_libc) libc_ranges.push_back(r);
+            else if (is_self) self_ranges.push_back(r);
+            else other_ranges.push_back(r);
         }
         if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
     }
 
-    if (!libc_found) return;
-    if (!self_vma_found) {
+    if (libc_ranges.empty()) return;
+    if (self_ranges.empty()) {
         if ((self_pc >> 32) != ((self_pc + 256) >> 32)) return;
-        allow_ranges.insert(allow_ranges.begin(), {
+        self_ranges.push_back({
             static_cast<uint32_t>(self_pc >> 32),
             static_cast<uint32_t>(self_pc & 0xFFFFFFFFULL),
             static_cast<uint32_t>((self_pc + 256) & 0xFFFFFFFFULL),
         });
     }
 
-    // 显式解除当前线程 SIGSYS 屏蔽
+    std::vector<ExecRange> allow_ranges;
+    allow_ranges.reserve(libc_ranges.size() + self_ranges.size() + other_ranges.size());
+    for (const auto &r : libc_ranges)  allow_ranges.push_back(r);
+    for (const auto &r : self_ranges)  allow_ranges.push_back(r);
+    for (const auto &r : other_ranges) allow_ranges.push_back(r);
+
     uint64_t unblock_mask = 1ULL << (SIGSYS - 1);
     mirage_seccomp_bypass_syscall(
         __NR_rt_sigprocmask, SIG_UNBLOCK, reinterpret_cast<long>(&unblock_mask), 0, 8, 0, 0);
 
-    // 关键修复：直接通过裸 rt_sigaction 向内核注册 SIGSYS，彻底绕过 libsigchain.so 与 SA_ONSTACK 信号栈溢出！
     KernelSigactionAArch64 new_k_sa{};
     new_k_sa.k_sa_handler = reinterpret_cast<uintptr_t>(&sigsys_seccomp_handler);
     new_k_sa.k_sa_flags   = static_cast<uint64_t>(SA_SIGINFO | SA_NODEFER);

@@ -182,13 +182,14 @@ inline void reflect_java_build_fields(JNIEnv *env) {
             if (kv.first == "SDK_INT" || kv.first == "DEVICE_INITIAL_SDK_INT" || kv.first == "PREVIEW_SDK_INT") {
                 if (g_cfg.build.force_spoof_sdk) {
                     int sdk = std::atoi(kv.second.c_str());
-                    if (sdk > 0) set_int(ver_cls, kv.first.c_str(), sdk);
+                    if (sdk >= 0) set_int(ver_cls, kv.first.c_str(), sdk);
                 }
             } else if (kv.first == "SECURITY_PATCH" ||
                        kv.first == "INCREMENTAL" ||
-                       kv.first == "CODENAME" ||
                        kv.first == "BASE_OS") {
                 set_str(ver_cls, kv.first.c_str(), kv.second);
+            } else if (kv.first == "CODENAME" && g_cfg.build.force_spoof_sdk) {
+                set_str(ver_cls, "CODENAME", kv.second);
             } else if (kv.first == "RELEASE" && g_cfg.build.force_spoof_sdk) {
                 set_str(ver_cls, "RELEASE", kv.second);
                 set_str(ver_cls, "RELEASE_OR_CODENAME", kv.second);

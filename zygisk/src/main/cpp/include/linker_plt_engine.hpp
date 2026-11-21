@@ -302,16 +302,13 @@ inline void scan_and_commit_plt_hooks() {
             reg("dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym));
         }
 
-        if (g_cfg.build.enabled || g_cfg.gl.enabled || g_cfg.probe.enabled) {
+        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
             reg("__system_property_find", reinterpret_cast<void *>(hook_system_property_find), reinterpret_cast<void **>(&orig_system_property_find));
             reg("__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read_callback), reinterpret_cast<void **>(&orig_system_property_read_callback));
             reg("__system_property_read", reinterpret_cast<void *>(hook_system_property_read), reinterpret_cast<void **>(&orig_system_property_read));
             reg("__system_property_get", reinterpret_cast<void *>(hook_system_property_get), reinterpret_cast<void **>(&orig_system_property_get));
             reg("__system_property_foreach", reinterpret_cast<void *>(hook_system_property_foreach), reinterpret_cast<void **>(&orig_system_property_foreach));
             reg("__system_property_find_nth", reinterpret_cast<void *>(hook_system_property_find_nth), reinterpret_cast<void **>(&orig_system_property_find_nth));
-        }
-        if (g_cfg.build.enabled) {
-            reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
         }
 
         if (g_cfg.vfs.enabled) {

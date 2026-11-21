@@ -120,16 +120,17 @@ public:
         }
 
         init_linker_symbols();
-        if (g_cfg.build.enabled || g_cfg.gl.enabled || g_cfg.probe.enabled) {
+
+        // 严格子模块 0 改动隔离：
+        // 仅当 build 或 probe 开启时才解析 Bionic 属性符号；仅当 build 开启时才构建属性区与执行反射
+        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
             init_bionic_prop_symbols();
         }
-        if (g_cfg.build.enabled || g_cfg.gl.enabled) {
-            freeze_bionic_prop_arena();
-        }
         if (g_cfg.build.enabled) {
+            freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
         }
-        if (g_cfg.vfs.enabled || g_cfg.build.enabled || g_cfg.probe.enabled) {
+        if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
             init_vfs_symbols();
         }
         if (g_cfg.vfs.enabled) {
@@ -156,9 +157,6 @@ public:
         if (g_cfg.gl.enabled) {
             dlopen("libhardware.so", RTLD_NOW);
             dlopen("libvulkan.so", RTLD_NOW);
-        }
-        if (g_cfg.vfs.enabled) {
-            dlopen("libmeminfo.so", RTLD_NOW);
         }
         scan_and_commit_plt_hooks();
         if (g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {
@@ -256,15 +254,19 @@ private:
                 }
             } else if (k.rfind("VERSION:", 0) == 0) {
                 std::string v_field = k.substr(8);
-                if ((v_field == "SDK_INT" || v_field == "DEVICE_INITIAL_SDK_INT" || v_field == "RELEASE") &&
-                    !g_cfg.build.force_spoof_sdk) {
+                if (!g_cfg.build.force_spoof_sdk &&
+                    (v_field == "SDK_INT" || v_field == "DEVICE_INITIAL_SDK_INT" ||
+                     v_field == "RELEASE" || v_field == "CODENAME" || v_field == "PREVIEW_SDK_INT")) {
                     continue;
                 }
                 g_cfg.build.version_map[v_field] = v;
             } else {
                 if (!g_cfg.build.force_spoof_sdk &&
-                    (k == "ro.build.version.sdk" || k == "ro.product.build.version.sdk" ||
-                     k == "ro.system.build.version.sdk" || k == "ro.build.version.release")) {
+                    (k.find("build.version.sdk") != std::string::npos ||
+                     k.find("build.version.release") != std::string::npos ||
+                     k.find("first_api_level") != std::string::npos ||
+                     k.find("preview_sdk") != std::string::npos ||
+                     k.find("version.codename") != std::string::npos)) {
                     continue;
                 }
                 g_cfg.build.prop_map[k] = v;
@@ -278,7 +280,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程
+// Root Companion 守护进程（含真实死亡核验崩溃日志落盘）
 // ============================================================================
 static std::mutex g_file_write_mtx;
 
@@ -296,7 +298,34 @@ static void append_line_as_root(const char *path, const std::string &line) {
 static void *companion_log_sink_thread(void *arg) {
     int sock_fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
     std::string pending;
+    std::string pending_crash_line;
+    std::time_t pending_crash_ts = 0;
     char buf[1024];
+
+    auto process_line = [&](const std::string &line) {
+        if (line.empty()) return;
+        std::time_t now = std::time(nullptr);
+
+        if (line.rfind("[PENDING_CRASH]", 0) == 0) {
+            // 暂存待核验崩溃信号；若同一死亡窗口内已捕获首个致命信号则保留第一现场
+            if (pending_crash_line.empty() || (now - pending_crash_ts) > 8) {
+                pending_crash_line = "[CRASH]" + line.substr(15);
+                pending_crash_ts = now;
+            }
+            return;
+        }
+        if (line.rfind("[CRASH]", 0) == 0) {
+            append_line_as_root(CRASH_LOG_PATH, line);
+            return;
+        }
+
+        // 收到后续正常探针且距离上次信号已超过 1 秒 -> 证明进程安然存活，自动作废该非致命信号
+        if (!pending_crash_line.empty() && (now - pending_crash_ts) >= 2) {
+            pending_crash_line.clear();
+            pending_crash_ts = 0;
+        }
+        append_line_as_root(PROBE_LOG_PATH, line);
+    };
 
     while (true) {
         ssize_t n;
@@ -312,23 +341,23 @@ static void *companion_log_sink_thread(void *arg) {
             std::string line = pending.substr(0, nl_pos);
             pending.erase(0, nl_pos + 1);
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) continue;
-
-            if (line.rfind("[CRASH]", 0) == 0) {
-                append_line_as_root(CRASH_LOG_PATH, line);
-            } else {
-                append_line_as_root(PROBE_LOG_PATH, line);
-            }
+            process_line(line);
         }
     }
 
     if (!pending.empty()) {
-        if (pending.rfind("[CRASH]", 0) == 0) {
-            append_line_as_root(CRASH_LOG_PATH, pending);
-        } else {
-            append_line_as_root(PROBE_LOG_PATH, pending);
+        if (pending.back() == '\r') pending.pop_back();
+        process_line(pending);
+    }
+
+    // Socket 断开 (EOF)：仅当进程在捕获致命信号后的 8 秒窗口内真正退出，才确认为真实崩溃并落盘！
+    if (!pending_crash_line.empty()) {
+        std::time_t now = std::time(nullptr);
+        if (now >= pending_crash_ts && (now - pending_crash_ts) <= 8) {
+            append_line_as_root(CRASH_LOG_PATH, pending_crash_line);
         }
     }
+
     close(sock_fd);
     return nullptr;
 }

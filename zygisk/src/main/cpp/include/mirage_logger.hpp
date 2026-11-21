@@ -89,9 +89,11 @@ inline std::string capture_caller_chain(size_t skip_frames = 2, size_t max_frame
     return res.empty() ? "app_runtime" : res;
 }
 
-inline void write_direct_log_raw(int prio, const char *buf, size_t len) noexcept {
+inline void write_direct_log_raw(int prio, const char *buf, size_t len, bool mirror_logcat = true) noexcept {
     ErrnoRestorer errno_guard;
-    __android_log_print(prio, LOG_TAG, "%.*s", static_cast<int>(len), buf);
+    if (mirror_logcat) {
+        __android_log_print(prio, LOG_TAG, "%.*s", static_cast<int>(len), buf);
+    }
     int sock = g_probe_log_fd;
     if (sock >= 0 && len > 0) {
         ssize_t sent = send(sock, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -105,7 +107,7 @@ inline void write_direct_log_raw(int prio, const char *buf, size_t len) noexcept
 inline void write_direct_log_line(int prio, const std::string &line) {
     ErrnoRestorer errno_guard;
     std::string with_nl = line + "\n";
-    write_direct_log_raw(prio, with_nl.data(), with_nl.size());
+    write_direct_log_raw(prio, with_nl.data(), with_nl.size(), true);
 }
 
 inline void emit_probe(const char *domain, const std::string &key, const std::string &val) {
@@ -126,24 +128,62 @@ inline void emit_probe(const char *domain, const std::string &key, const std::st
     write_direct_log_line(ANDROID_LOG_WARN, ss.str());
 }
 
+inline struct sigaction g_old_sigsegv{};
 inline struct sigaction g_old_sigabrt{};
 inline struct sigaction g_old_sigbus{};
 inline struct sigaction g_old_sigill{};
+inline struct sigaction g_old_sigfpe{};
+inline bool g_crash_via_sigchain = false;
 inline char g_crash_pkg_name[128] = {0};
 
+inline struct sigaction *get_old_crash_sa(int sig) noexcept {
+    switch (sig) {
+        case SIGSEGV: return &g_old_sigsegv;
+        case SIGABRT: return &g_old_sigabrt;
+        case SIGBUS:  return &g_old_sigbus;
+        case SIGILL:  return &g_old_sigill;
+        case SIGFPE:  return &g_old_sigfpe;
+        default:      return nullptr;
+    }
+}
+
+inline const char *crash_sig_name(int sig) noexcept {
+    switch (sig) {
+        case SIGSEGV: return "SIGSEGV";
+        case SIGABRT: return "SIGABRT";
+        case SIGBUS:  return "SIGBUS";
+        case SIGILL:  return "SIGILL";
+        case SIGFPE:  return "SIGFPE";
+        default:      return "SIGNAL";
+    }
+}
+
+inline void forward_crash_signal(int sig, siginfo_t *info, void *ucontext, struct sigaction *prev) noexcept {
+    if (prev && (prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction) {
+        prev->sa_sigaction(sig, info, ucontext);
+    } else if (prev && prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        prev->sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+// 双层防误报崩溃捕获器（覆盖 SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE）：
+// 1. 优先通过 libsigchain.so 注册，排在 ART FaultManager 之后，不截获 CheckSuspend / 隐式 NPE
+// 2. 发送 [PENDING_CRASH] 给 Root Companion，仅当进程随后真正死亡 (socket EOF) 时才落盘为真实崩溃
 inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext) {
     int saved_errno = errno;
+    struct sigaction *prev = get_old_crash_sa(sig);
+    uintptr_t fault_addr = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
 
-    struct sigaction *prev = (sig == SIGABRT) ? &g_old_sigabrt :
-                             (sig == SIGBUS)  ? &g_old_sigbus  : &g_old_sigill;
-
-    void *frames[10];
-    BacktraceState state{frames, frames + 10};
-    _Unwind_Backtrace(unwind_callback, &state);
-    size_t count = static_cast<size_t>(state.current - frames);
-
-    const char *sig_name = (sig == SIGABRT) ? "SIGABRT" :
-                           (sig == SIGBUS)  ? "SIGBUS"  : "SIGILL";
+    // 兜底快路径：若未能挂载进 libsigchain，直接跳过 ART 的页对齐 CheckSuspend / 隐式 NPE
+    if (!g_crash_via_sigchain && sig == SIGSEGV && info &&
+        (fault_addr < 0x1000 || (info->si_code == SEGV_ACCERR && (fault_addr & 0xFFFU) == 0))) {
+        errno = saved_errno;
+        forward_crash_signal(sig, info, ucontext, prev);
+        return;
+    }
 
     char reg_buf[256];
     reg_buf[0] = '\0';
@@ -169,6 +209,11 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
         }
     }
 #endif
+
+    void *frames[10];
+    BacktraceState state{frames, frames + 10};
+    _Unwind_Backtrace(unwind_callback, &state);
+    size_t count = static_cast<size_t>(state.current - frames);
 
     char stack_buf[512];
     size_t s_pos = 0;
@@ -202,8 +247,8 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
     char crash_buf[960];
     int total_len = std::snprintf(
         crash_buf, sizeof(crash_buf),
-        "[CRASH][%s][%s] code=%d fault_addr=%p %s | Stack: %s\n",
-        g_crash_pkg_name, sig_name,
+        "[PENDING_CRASH][%s][%s] code=%d fault_addr=%p %s | Stack: %s\n",
+        g_crash_pkg_name, crash_sig_name(sig),
         info ? info->si_code : 0,
         info ? info->si_addr : nullptr,
         reg_buf,
@@ -211,33 +256,34 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
     );
     if (total_len > 0) {
         size_t safe_len = std::min(static_cast<size_t>(total_len), sizeof(crash_buf) - 1);
-        write_direct_log_raw(ANDROID_LOG_ERROR, crash_buf, safe_len);
+        // 仅送往 Root Companion 待死亡核验，不提前刷屏 logcat ERROR
+        write_direct_log_raw(ANDROID_LOG_DEBUG, crash_buf, safe_len, false);
     }
 
     errno = saved_errno;
-    if (prev && (prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction) {
-        prev->sa_sigaction(sig, info, ucontext);
-    } else if (prev && prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
-        prev->sa_handler(sig);
-    } else {
-        signal(sig, SIG_DFL);
-        raise(sig);
-    }
+    forward_crash_signal(sig, info, ucontext, prev);
 }
 
 inline void install_crash_signal_logger(const std::string &pkg) {
     std::strncpy(g_crash_pkg_name, pkg.c_str(), sizeof(g_crash_pkg_name) - 1);
     g_crash_pkg_name[sizeof(g_crash_pkg_name) - 1] = '\0';
 
+    using PFN_sa = int (*)(int, const struct sigaction *, struct sigaction *);
+    void *sc_h = dlopen("libsigchain.so", RTLD_NOW | RTLD_NOLOAD);
+    PFN_sa fn_sa = sc_h ? reinterpret_cast<PFN_sa>(dlsym(sc_h, "sigaction")) : nullptr;
+    g_crash_via_sigchain = (fn_sa != nullptr);
+    if (!fn_sa) fn_sa = &sigaction;
+
     struct sigaction sa{};
     sa.sa_sigaction = mirage_crash_signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 
-    // 不拦截 SIGSEGV，避免干扰 ART CheckSuspend / GC 屏障 / 隐式 NPE
-    sigaction(SIGABRT, &sa, &g_old_sigabrt);
-    sigaction(SIGBUS,  &sa, &g_old_sigbus);
-    sigaction(SIGILL,  &sa, &g_old_sigill);
+    fn_sa(SIGSEGV, &sa, &g_old_sigsegv);
+    fn_sa(SIGABRT, &sa, &g_old_sigabrt);
+    fn_sa(SIGBUS,  &sa, &g_old_sigbus);
+    fn_sa(SIGILL,  &sa, &g_old_sigill);
+    fn_sa(SIGFPE,  &sa, &g_old_sigfpe);
 }
 
 } // namespace mirage
