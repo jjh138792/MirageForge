@@ -145,12 +145,30 @@ pub struct DeviceTemplate {
     #[serde(rename = "FINGERPRINT", default)]
     pub fingerprint: String,
 
+    // OpenGL ES 渲染层参数
     #[serde(rename = "GL_VENDOR", default = "default_gl_vendor")]
     pub gl_vendor: String,
     #[serde(rename = "GL_RENDERER", default = "default_gl_renderer")]
     pub gl_renderer: String,
     #[serde(rename = "GL_VERSION", default = "default_gl_version")]
     pub gl_version: String,
+
+    // Vulkan 独立渲染层参数（与 OpenGL ES 彻底解耦）
+    #[serde(rename = "VK_DEVICE_NAME", default)]
+    pub vk_device_name: String,
+    #[serde(rename = "VK_VENDOR_ID", default)]
+    pub vk_vendor_id: String,
+    #[serde(rename = "VK_DEVICE_ID", default)]
+    pub vk_device_id: String,
+    #[serde(rename = "VK_API_VERSION", default)]
+    pub vk_api_version: String,
+    #[serde(rename = "VK_DRIVER_VERSION", default)]
+    pub vk_driver_version: String,
+    #[serde(rename = "VK_DRIVER_NAME", default)]
+    pub vk_driver_name: String,
+    #[serde(rename = "VK_DRIVER_INFO", default)]
+    pub vk_driver_info: String,
+
     #[serde(rename = "MAX_REFRESH_RATE", default = "default_refresh_rate", deserialize_with = "de_i32_flex")]
     pub max_refresh_rate: i32,
 
@@ -181,6 +199,90 @@ pub struct DeviceTemplate {
     pub custom_props: String,
 }
 
+impl DeviceTemplate {
+    /// 智能补齐缺失的独立 Vulkan 字段，兼容旧版模板并杜绝厂商/驱动名串台
+    pub fn normalize_vulkan_fields(&mut self) {
+        if self.vk_device_name.trim().is_empty() {
+            self.vk_device_name = self.gl_renderer.clone();
+        }
+        let token = format!(
+            "{} {} {}",
+            self.gl_vendor, self.gl_renderer, self.vk_device_name
+        )
+        .to_ascii_lowercase();
+
+        let is_arm = self.vk_vendor_id.eq_ignore_ascii_case("0x13b5")
+            || token.contains("arm")
+            || token.contains("mali")
+            || token.contains("immortalis");
+        let is_samsung = self.vk_vendor_id.eq_ignore_ascii_case("0x144d")
+            || token.contains("xclipse");
+
+        if self.vk_vendor_id.trim().is_empty() {
+            self.vk_vendor_id = if is_arm {
+                "0x13B5".into()
+            } else if is_samsung {
+                "0x144D".into()
+            } else {
+                "0x5143".into()
+            };
+        }
+        if self.vk_device_id.trim().is_empty() {
+            self.vk_device_id = if is_arm {
+                if token.contains("g925") {
+                    "0x12870000".into()
+                } else {
+                    "0x10860000".into()
+                }
+            } else if is_samsung {
+                "0x73A00000".into()
+            } else if token.contains("830") {
+                "0x43050A01".into()
+            } else if token.contains("750") {
+                "0x43050000".into()
+            } else if token.contains("740") {
+                "0x43030000".into()
+            } else {
+                "0x43050A01".into()
+            };
+        }
+        if self.vk_api_version.trim().is_empty() {
+            self.vk_api_version = "1.3.295".into();
+        }
+        if self.vk_driver_version.trim().is_empty() {
+            self.vk_driver_version = if is_arm {
+                "49.0.0".into()
+            } else if is_samsung {
+                "24.1.0".into()
+            } else if token.contains("750") || token.contains("740") {
+                "512.762.0".into()
+            } else {
+                "512.800.0".into()
+            };
+        }
+        if self.vk_driver_name.trim().is_empty() {
+            self.vk_driver_name = if is_arm {
+                "ARM".into()
+            } else if is_samsung {
+                "Samsung Electronics".into()
+            } else {
+                "Qualcomm Technologies Inc. Adreno Vulkan Driver".into()
+            };
+        }
+        if self.vk_driver_info.trim().is_empty() {
+            self.vk_driver_info = if is_arm {
+                "r49p0-01eac0".into()
+            } else if is_samsung {
+                "Xclipse Vulkan Driver 1.3".into()
+            } else if token.contains("750") || token.contains("740") {
+                "Driver Build: 0762.0".into()
+            } else {
+                "Driver Build: 0800.0".into()
+            };
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppRoute {
     #[serde(skip_deserializing, skip_serializing_if = "String::is_empty")]
@@ -198,9 +300,9 @@ pub struct AppRoute {
     #[serde(rename = "sdkSpoof", default)]
     pub sdk_spoof: bool,
     #[serde(rename = "refreshRate", default, deserialize_with = "de_i32_flex")]
-    pub refresh_rate: i32, // 0 = 不改刷新率 (0改动), 90/120/144/165/240 = 开启高刷欺骗
+    pub refresh_rate: i32,
     #[serde(default)]
-    pub seccomp: bool,     // false = 0改动, true = 开启按需 Seccomp-BPF 拦截裸 svc #0
+    pub seccomp: bool,
 }
 
 impl AppRoute {
@@ -285,16 +387,19 @@ pub fn encode_template_share_code(tpl: &DeviceTemplate) -> String {
 
 pub fn decode_template_share_code(raw_code: &str) -> Option<DeviceTemplate> {
     let trimmed = raw_code.trim();
-    if trimmed.starts_with('{') {
-        return serde_json::from_str::<DeviceTemplate>(trimmed).ok();
-    }
-    let payload = trimmed
-        .strip_prefix("mf://")
-        .or_else(|| trimmed.strip_prefix("MF://"))
-        .unwrap_or(trimmed);
-    let bytes = base64_url_decode(payload)?;
-    let json_str = String::from_utf8(bytes).ok()?;
-    serde_json::from_str::<DeviceTemplate>(&json_str).ok()
+    let mut tpl = if trimmed.starts_with('{') {
+        serde_json::from_str::<DeviceTemplate>(trimmed).ok()?
+    } else {
+        let payload = trimmed
+            .strip_prefix("mf://")
+            .or_else(|| trimmed.strip_prefix("MF://"))
+            .unwrap_or(trimmed);
+        let bytes = base64_url_decode(payload)?;
+        let json_str = String::from_utf8(bytes).ok()?;
+        serde_json::from_str::<DeviceTemplate>(&json_str).ok()?
+    };
+    tpl.normalize_vulkan_fields();
+    Some(tpl)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

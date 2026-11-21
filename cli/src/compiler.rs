@@ -1,7 +1,11 @@
 use crate::models::{sanitize_refresh_rate, AppRoute, DeviceTemplate};
 
 pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
-    let mut lines: Vec<String> = Vec::with_capacity(128);
+    let mut normalized = tpl.clone();
+    normalized.normalize_vulkan_fields();
+    let tpl = &normalized;
+
+    let mut lines: Vec<String> = Vec::with_capacity(140);
 
     let push_kv = |out: &mut Vec<String>, k: &str, v: &str| {
         if !k.is_empty() && !v.is_empty() {
@@ -23,7 +27,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "META:REFRESH_RATE", &effective_fps.to_string());
     }
 
-    // 2. 图形与高刷模块 (仅在开启 GL 开关时输出)
+    // 2. OpenGL ES 与独立 Vulkan 渲染模块 (仅在开启 GL 开关时输出)
     if route.gl {
         push_kv(&mut lines, "GLES:VENDOR", &tpl.gl_vendor);
         push_kv(&mut lines, "GLES:RENDERER", &tpl.gl_renderer);
@@ -31,6 +35,14 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         if effective_fps >= 90 {
             push_kv(&mut lines, "GLES:REFRESH_RATE", &effective_fps.to_string());
         }
+
+        push_kv(&mut lines, "VULKAN:DEVICE_NAME", &tpl.vk_device_name);
+        push_kv(&mut lines, "VULKAN:VENDOR_ID", &tpl.vk_vendor_id);
+        push_kv(&mut lines, "VULKAN:DEVICE_ID", &tpl.vk_device_id);
+        push_kv(&mut lines, "VULKAN:API_VERSION", &tpl.vk_api_version);
+        push_kv(&mut lines, "VULKAN:DRIVER_VERSION", &tpl.vk_driver_version);
+        push_kv(&mut lines, "VULKAN:DRIVER_NAME", &tpl.vk_driver_name);
+        push_kv(&mut lines, "VULKAN:DRIVER_INFO", &tpl.vk_driver_info);
     }
 
     // 3. VFS 与硬件拓扑模块 (仅在开启 VFS 开关时输出)
@@ -196,10 +208,14 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         }
 
         // 严格子模块隔离：仅当 GL 开关也开启时，才注入底层 Vulkan/GLES 辅助属性
-        if route.gl && !tpl.gl_renderer.is_empty() {
-            push_kv(&mut lines, "persist.sys.cloud.gpu.vk_devicename", &tpl.gl_renderer);
-            push_kv(&mut lines, "persist.sys.cloud.gpu.gl_renderer", &tpl.gl_renderer);
-            push_kv(&mut lines, "persist.sys.gpu.gl_renderer", &tpl.gl_renderer);
+        if route.gl {
+            if !tpl.vk_device_name.is_empty() {
+                push_kv(&mut lines, "persist.sys.cloud.gpu.vk_devicename", &tpl.vk_device_name);
+            }
+            if !tpl.gl_renderer.is_empty() {
+                push_kv(&mut lines, "persist.sys.cloud.gpu.gl_renderer", &tpl.gl_renderer);
+                push_kv(&mut lines, "persist.sys.gpu.gl_renderer", &tpl.gl_renderer);
+            }
             if !tpl.gl_vendor.is_empty() {
                 push_kv(&mut lines, "persist.sys.cloud.gpu.gl_vendor", &tpl.gl_vendor);
                 push_kv(&mut lines, "persist.sys.gpu.gl_vendor", &tpl.gl_vendor);

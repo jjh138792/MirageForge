@@ -118,7 +118,7 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
         "libvulkan.so",
         "libmediandk.so",
         "libgui.so",
-        "libhwui.so"
+        "libhwui.so",
         "libandroidio.so"
     };
 
@@ -144,7 +144,6 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
     }
 
     if (g_cfg.gl.enabled) {
-        // 拦截 libhardware.so 加载 vulkan.*.so 时查找的 HAL 模块入口结构体 "HMI"
         if (std::strcmp(symbol, "HMI") == 0) {
             const auto *wrapped = wrap_hwvulkan_module_if_needed(static_cast<const HwModuleCompat *>(real_sym));
             return const_cast<HwModuleCompat *>(wrapped);
@@ -190,6 +189,10 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
         if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
         if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
         if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
+        if (g_cfg.vfs.enable_seccomp &&
+            (std::strcmp(symbol, "sigaction") == 0 || std::strcmp(symbol, "sigaction64") == 0)) {
+            return reinterpret_cast<void *>(hook_sigaction);
+        }
     }
 
     return real_sym;
@@ -315,6 +318,7 @@ inline void scan_and_commit_plt_hooks() {
             reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
             reg("open64", reinterpret_cast<void *>(hook_open64), reinterpret_cast<void **>(&orig_open64));
             reg("__open_2", reinterpret_cast<void *>(hook_open_2), reinterpret_cast<void **>(&orig_open_2));
+            reg("__open64_2", reinterpret_cast<void *>(hook_open_2), reinterpret_cast<void **>(&orig_open_2));
             reg("openat", reinterpret_cast<void *>(hook_openat), reinterpret_cast<void **>(&orig_openat));
             reg("openat64", reinterpret_cast<void *>(hook_openat64), reinterpret_cast<void **>(&orig_openat64));
             reg("__openat_2", reinterpret_cast<void *>(hook_openat_2), reinterpret_cast<void **>(&orig_openat_2));
@@ -341,7 +345,13 @@ inline void scan_and_commit_plt_hooks() {
             reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo));
             reg("sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf));
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
-            reg("__open64_2", reinterpret_cast<void *>(hook_open_2), reinterpret_cast<void **>(&orig_open_2));
+
+            if (g_cfg.vfs.enable_seccomp) {
+                reg("sigaction", reinterpret_cast<void *>(hook_sigaction), reinterpret_cast<void **>(&orig_sigaction));
+#if defined(__aarch64__)
+                reg("sigaction64", reinterpret_cast<void *>(hook_sigaction), reinterpret_cast<void **>(&orig_sigaction));
+#endif
+            }
         }
 
         if (g_cfg.gl.enabled) {

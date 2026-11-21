@@ -13,6 +13,8 @@ import {
   Share2,
   CloudDownload,
   ClipboardPaste,
+  RefreshCw,
+  Globe,
 } from 'lucide-vue-next';
 import { useI18n } from '../i18n';
 import { execRootShell, showToast, triggerHaptic } from '../bridge/ksu-io';
@@ -25,6 +27,8 @@ import {
   encodeTemplateShareCode,
   decodeTemplateShareCode,
   fetchOnlineTemplateHub,
+  saveCustomHubUrl,
+  normalizeTemplateVulkanFields,
   type DeviceTemplate,
 } from '../store/mirageStore';
 
@@ -42,6 +46,7 @@ const isEditing = ref(false);
 const showShareImportModal = ref(false);
 const shareCodeInput = ref('');
 const showOnlineHubModal = ref(false);
+const customHubInput = ref(mirageStore.hubStatus.customUrl);
 
 const emptyTemplate = (): DeviceTemplate => ({
   id: `tpl_${Date.now()}`,
@@ -70,6 +75,13 @@ const emptyTemplate = (): DeviceTemplate => ({
   GL_VENDOR: 'Qualcomm',
   GL_RENDERER: 'Adreno (TM) 830',
   GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
+  VK_DEVICE_NAME: 'Adreno (TM) 830',
+  VK_VENDOR_ID: '0x5143',
+  VK_DEVICE_ID: '0x43050A01',
+  VK_API_VERSION: '1.3.295',
+  VK_DRIVER_VERSION: '512.800.0',
+  VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
+  VK_DRIVER_INFO: 'Driver Build: 0800.0',
   MAX_REFRESH_RATE: 120,
   CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
   CPU_CORES: 8,
@@ -91,7 +103,7 @@ watch(
   () => props.incomingTemplate,
   (tpl) => {
     if (tpl) {
-      form.value = { ...emptyTemplate(), ...tpl };
+      form.value = normalizeTemplateVulkanFields({ ...emptyTemplate(), ...tpl });
       isEditing.value = false;
       showModal.value = true;
       emit('clear-incoming');
@@ -109,7 +121,7 @@ function openNewModal() {
 
 function openEditModal(tpl: DeviceTemplate) {
   triggerHaptic('light');
-  form.value = { ...emptyTemplate(), ...tpl };
+  form.value = normalizeTemplateVulkanFields({ ...emptyTemplate(), ...tpl });
   isEditing.value = true;
   showModal.value = true;
 }
@@ -143,35 +155,89 @@ function handleConfirmShareImport() {
   }
   showShareImportModal.value = false;
   shareCodeInput.value = '';
-  form.value = { ...emptyTemplate(), ...decoded };
+  form.value = normalizeTemplateVulkanFields({ ...emptyTemplate(), ...decoded });
   isEditing.value = false;
   showModal.value = true;
 }
 
 async function openOnlineHub() {
   triggerHaptic('light');
+  customHubInput.value = mirageStore.hubStatus.customUrl;
   showOnlineHubModal.value = true;
-  await fetchOnlineTemplateHub();
+  await fetchOnlineTemplateHub(false);
+}
+
+async function applyCustomHubSource() {
+  triggerHaptic('medium');
+  saveCustomHubUrl(customHubInput.value);
+  await fetchOnlineTemplateHub(true);
 }
 
 async function importFromHub(tpl: DeviceTemplate) {
   await saveTemplateViaCli({ ...tpl });
 }
 
+function applyVulkanPreset(kind: 'adreno830' | 'adreno750' | 'g925' | 'xclipse940') {
+  triggerHaptic('medium');
+  if (kind === 'adreno830') {
+    form.value.GL_VENDOR = 'Qualcomm';
+    form.value.GL_RENDERER = 'Adreno (TM) 830';
+    form.value.GL_VERSION = 'OpenGL ES 3.2 V@0800.0';
+    form.value.VK_DEVICE_NAME = 'Adreno (TM) 830';
+    form.value.VK_VENDOR_ID = '0x5143';
+    form.value.VK_DEVICE_ID = '0x43050A01';
+    form.value.VK_API_VERSION = '1.3.295';
+    form.value.VK_DRIVER_VERSION = '512.800.0';
+    form.value.VK_DRIVER_NAME = 'Qualcomm Technologies Inc. Adreno Vulkan Driver';
+    form.value.VK_DRIVER_INFO = 'Driver Build: 0800.0';
+  } else if (kind === 'adreno750') {
+    form.value.GL_VENDOR = 'Qualcomm';
+    form.value.GL_RENDERER = 'Adreno (TM) 750';
+    form.value.GL_VERSION = 'OpenGL ES 3.2 V@0762.0';
+    form.value.VK_DEVICE_NAME = 'Adreno (TM) 750';
+    form.value.VK_VENDOR_ID = '0x5143';
+    form.value.VK_DEVICE_ID = '0x43050000';
+    form.value.VK_API_VERSION = '1.3.279';
+    form.value.VK_DRIVER_VERSION = '512.762.0';
+    form.value.VK_DRIVER_NAME = 'Qualcomm Technologies Inc. Adreno Vulkan Driver';
+    form.value.VK_DRIVER_INFO = 'Driver Build: 0762.0';
+  } else if (kind === 'g925') {
+    form.value.GL_VENDOR = 'ARM';
+    form.value.GL_RENDERER = 'Immortalis-G925 MC12';
+    form.value.GL_VERSION = 'OpenGL ES 3.2 v1.r49p0-01eac0';
+    form.value.VK_DEVICE_NAME = 'Immortalis-G925 MC12';
+    form.value.VK_VENDOR_ID = '0x13B5';
+    form.value.VK_DEVICE_ID = '0x12870000';
+    form.value.VK_API_VERSION = '1.3.295';
+    form.value.VK_DRIVER_VERSION = '49.0.0';
+    form.value.VK_DRIVER_NAME = 'ARM';
+    form.value.VK_DRIVER_INFO = 'r49p0-01eac0';
+  } else {
+    form.value.GL_VENDOR = 'Samsung Electronics';
+    form.value.GL_RENDERER = 'Samsung Xclipse 940';
+    form.value.GL_VERSION = 'OpenGL ES 3.2 ANGLE';
+    form.value.VK_DEVICE_NAME = 'Samsung Xclipse 940';
+    form.value.VK_VENDOR_ID = '0x144D';
+    form.value.VK_DEVICE_ID = '0x73A00000';
+    form.value.VK_API_VERSION = '1.3.283';
+    form.value.VK_DRIVER_VERSION = '24.1.0';
+    form.value.VK_DRIVER_NAME = 'Samsung Electronics';
+    form.value.VK_DRIVER_INFO = 'Xclipse Vulkan Driver 1.3';
+  }
+}
+
 function applyClusterPreset(
   clusters: string,
   maxFreq: number,
   socMachine: string,
-  renderer: string,
-  vendor: string
+  gpuKind: 'adreno830' | 'adreno750' | 'g925'
 ) {
   triggerHaptic('medium');
   form.value.CPU_CLUSTERS = clusters;
   form.value.CPU_MAX_FREQ = maxFreq;
   form.value.SOC_MACHINE = socMachine;
   form.value.SOC_MODEL = socMachine;
-  form.value.GL_RENDERER = renderer;
-  form.value.GL_VENDOR = vendor;
+  applyVulkanPreset(gpuKind);
 }
 
 async function handleSave() {
@@ -230,13 +296,13 @@ async function handleExportBackup() {
               {{ tpl.BRAND }} · {{ tpl.MODEL }} ({{ tpl.BOARD }} / {{ tpl.SOC_MODEL }})
             </span>
           </div>
-          <span class="gpu-pill">{{ tpl.GL_RENDERER }}</span>
+          <span class="gpu-pill">{{ tpl.VK_DEVICE_NAME || tpl.GL_RENDERER }}</span>
         </div>
 
         <div class="spec-chips">
           <div class="spec-item">
             <Cpu :size="14" class="spec-icon" />
-            <span>{{ tpl.SOC_MACHINE || tpl.SOC_MODEL }} · {{ tpl.SECURITY_PATCH }}</span>
+            <span>VK {{ tpl.VK_API_VERSION || '1.3.295' }} · {{ tpl.VK_DRIVER_INFO || '0800.0' }}</span>
           </div>
           <div class="spec-item">
             <HardDrive :size="14" class="spec-icon" />
@@ -319,16 +385,58 @@ async function handleExportBackup() {
       </div>
     </Transition>
 
-    <!-- 2. 在线精选机型库弹窗 -->
+    <!-- 2. 在线精选机型库弹窗 (真联网多源拉取 + 实时状态 + 自定义源) -->
     <Transition name="view-morph">
       <div v-if="showOnlineHubModal" class="modal-overlay" @click.self="showOnlineHubModal = false">
         <div class="modal-sheet liquid-glass liquid-glass-elevated">
           <div class="modal-header">
             <h3>🌐 {{ t('templates.hubModalTitle') }}</h3>
-            <button class="icon-close tactile-press" @click="showOnlineHubModal = false">
-              <X :size="18" />
-            </button>
+            <div class="hub-head-actions">
+              <button
+                class="btn-liquid-ghost tactile-press"
+                :disabled="mirageStore.hubLoading"
+                @click="fetchOnlineTemplateHub(true)"
+              >
+                <RefreshCw :size="14" :class="{ spinning: mirageStore.hubLoading }" />
+                <span>{{ t('templates.hubRefreshBtn') }}</span>
+              </button>
+              <button class="icon-close tactile-press" @click="showOnlineHubModal = false">
+                <X :size="18" />
+              </button>
+            </div>
           </div>
+
+          <!-- 实时联网状态与自定义源配置条 -->
+          <div class="hub-status-bar">
+            <div class="hub-status-line">
+              <span
+                class="status-dot"
+                :class="mirageStore.hubStatus.state"
+              ></span>
+              <span v-if="mirageStore.hubStatus.state === 'loading'">
+                {{ t('templates.hubSyncing') }}
+              </span>
+              <span v-else-if="mirageStore.hubStatus.state === 'online'">
+                {{ t('templates.hubOnline', { src: mirageStore.hubStatus.source, count: mirageStore.hubStatus.remoteCount }) }}
+              </span>
+              <span v-else>
+                {{ t('templates.hubOffline', { err: mirageStore.hubStatus.error || '离线模式' }) }}
+              </span>
+            </div>
+
+            <div class="hub-custom-row">
+              <Globe :size="14" class="spec-icon" />
+              <input
+                v-model="customHubInput"
+                class="liquid-input hub-url-input"
+                :placeholder="t('templates.hubCustomPlaceholder')"
+              />
+              <button class="btn-liquid-ghost tactile-press" @click="applyCustomHubSource">
+                {{ t('templates.hubApplyUrl') }}
+              </button>
+            </div>
+          </div>
+
           <div class="modal-body hub-list">
             <div
               v-for="item in mirageStore.hubTemplates"
@@ -338,7 +446,7 @@ async function handleExportBackup() {
               <div class="hub-info">
                 <div class="hub-name">{{ item.name }}</div>
                 <div class="hub-meta">
-                  {{ item.BRAND }} {{ item.MODEL }} · {{ item.GL_RENDERER }} · {{ item.RAM_GB }}GB {{ item.DDR_TYPE }} · {{ item.MAX_REFRESH_RATE || 120 }}Hz
+                  {{ item.BRAND }} {{ item.MODEL }} · {{ item.VK_DEVICE_NAME || item.GL_RENDERER }} (VK {{ item.VK_API_VERSION || '1.3.295' }} / {{ item.VK_DRIVER_INFO }}) · {{ item.RAM_GB }}GB {{ item.DDR_TYPE }} · {{ item.MAX_REFRESH_RATE || 120 }}Hz
                 </div>
               </div>
               <button
@@ -355,7 +463,7 @@ async function handleExportBackup() {
       </div>
     </Transition>
 
-    <!-- 3. 模板铸造/编辑弹窗 -->
+    <!-- 3. 模板铸造/编辑弹窗 (含独立 Vulkan 渲染层设置面板) -->
     <Transition name="view-morph">
       <div v-if="showModal" class="modal-overlay" @click.self="showModal = false">
         <div class="modal-sheet liquid-glass liquid-glass-elevated">
@@ -445,21 +553,73 @@ async function handleExportBackup() {
 
             <div class="sec-divider">{{ t('templates.secGraphics') }}</div>
             <div class="form-grid">
+              <div class="span-2 preset-panel">
+                <div class="preset-panel-head">
+                  <span>{{ t('templates.gpuPresetTitle') }}</span>
+                  <div class="preset-pills">
+                    <button type="button" class="preset-pill tactile-press" @click="applyVulkanPreset('adreno830')">
+                      Adreno 830
+                    </button>
+                    <button type="button" class="preset-pill tactile-press" @click="applyVulkanPreset('adreno750')">
+                      Adreno 750
+                    </button>
+                    <button type="button" class="preset-pill tactile-press" @click="applyVulkanPreset('g925')">
+                      Immortalis-G925
+                    </button>
+                    <button type="button" class="preset-pill tactile-press" @click="applyVulkanPreset('xclipse940')">
+                      Xclipse 940
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               <label>
-                <span>GL_VENDOR / PCI Vendor</span>
+                <span>GL_VENDOR (OpenGL ES 厂商)</span>
                 <input v-model="form.GL_VENDOR" class="liquid-input" placeholder="Qualcomm 或 ARM" />
               </label>
               <label>
-                <span>GL_RENDERER / Vulkan DeviceName</span>
+                <span>GL_RENDERER (OpenGL ES 渲染器)</span>
                 <input v-model="form.GL_RENDERER" class="liquid-input" placeholder="Adreno (TM) 830" />
               </label>
               <label>
-                <span>GL_VERSION</span>
+                <span>GL_VERSION (OpenGL ES 版本)</span>
                 <input v-model="form.GL_VERSION" class="liquid-input" placeholder="OpenGL ES 3.2 V@0800.0" />
               </label>
               <label>
                 <span>MAX_REFRESH_RATE (屏幕最高刷新率 Hz)</span>
                 <input v-model.number="form.MAX_REFRESH_RATE" type="number" class="liquid-input" placeholder="120 / 144 / 165" />
+              </label>
+            </div>
+
+            <div class="sec-divider">{{ t('templates.secVulkan') }}</div>
+            <div class="form-grid">
+              <label>
+                <span>VK_DEVICE_NAME (Vulkan 设备名)</span>
+                <input v-model="form.VK_DEVICE_NAME" class="liquid-input" placeholder="Adreno (TM) 830" />
+              </label>
+              <label>
+                <span>VK_API_VERSION (Vulkan API 版本)</span>
+                <input v-model="form.VK_API_VERSION" class="liquid-input" placeholder="1.3.295" />
+              </label>
+              <label>
+                <span>VK_VENDOR_ID (16进制 VendorID)</span>
+                <input v-model="form.VK_VENDOR_ID" class="liquid-input" placeholder="0x5143 (高通) / 0x13B5 (ARM)" />
+              </label>
+              <label>
+                <span>VK_DEVICE_ID (16进制 DeviceID)</span>
+                <input v-model="form.VK_DEVICE_ID" class="liquid-input" placeholder="0x43050A01" />
+              </label>
+              <label>
+                <span>VK_DRIVER_VERSION (驱动版本号)</span>
+                <input v-model="form.VK_DRIVER_VERSION" class="liquid-input" placeholder="512.800.0 或 49.0.0" />
+              </label>
+              <label>
+                <span>VK_DRIVER_INFO (驱动构建信息)</span>
+                <input v-model="form.VK_DRIVER_INFO" class="liquid-input" placeholder="Driver Build: 0800.0" />
+              </label>
+              <label class="span-2">
+                <span>VK_DRIVER_NAME (VkPhysicalDeviceDriverProperties.driverName)</span>
+                <input v-model="form.VK_DRIVER_NAME" class="liquid-input" placeholder="Qualcomm Technologies Inc. Adreno Vulkan Driver" />
               </label>
             </div>
 
@@ -472,21 +632,21 @@ async function handleExportBackup() {
                     <button
                       type="button"
                       class="preset-pill tactile-press"
-                      @click="applyClusterPreset('0-5:614400:3532800;6-7:806400:4320000', 4320000, 'SM8750', 'Adreno (TM) 830', 'Qualcomm')"
+                      @click="applyClusterPreset('0-5:614400:3532800;6-7:806400:4320000', 4320000, 'SM8750', 'adreno830')"
                     >
                       骁龙8至尊版 (6+2)
                     </button>
                     <button
                       type="button"
                       class="preset-pill tactile-press"
-                      @click="applyClusterPreset('0-1:556800:2265600;2-6:691200:3148800;7-7:806400:3302400', 3302400, 'SM8650', 'Adreno (TM) 750', 'Qualcomm')"
+                      @click="applyClusterPreset('0-1:556800:2265600;2-6:691200:3148800;7-7:806400:3302400', 3302400, 'SM8650', 'adreno750')"
                     >
                       骁龙8 Gen3 (2+5+1)
                     </button>
                     <button
                       type="button"
                       class="preset-pill tactile-press"
-                      @click="applyClusterPreset('0-3:800000:2400000;4-6:1000000:3300000;7-7:1200000:3620000', 3620000, 'MT6991', 'Immortalis-G925 MC12', 'ARM')"
+                      @click="applyClusterPreset('0-3:800000:2400000;4-6:1000000:3300000;7-7:1200000:3620000', 3620000, 'MT6991', 'g925')"
                     >
                       天玑9400 (4+3+1)
                     </button>
@@ -610,6 +770,9 @@ async function handleExportBackup() {
   border-radius: 12px;
   background: var(--subcard-bg);
   border: 1px solid var(--glass-border);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .spec-icon {
@@ -703,6 +866,81 @@ async function handleExportBackup() {
   align-items: center;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--glass-border);
+  gap: 8px;
+}
+
+.hub-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hub-status-bar {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hub-status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #94a3b8;
+}
+
+.status-dot.online {
+  background: #10b981;
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.65);
+}
+
+.status-dot.offline {
+  background: #f59e0b;
+}
+
+.status-dot.loading {
+  background: var(--accent-secondary);
+  animation: pulseDot 1s infinite ease-in-out;
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.spinning {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.hub-custom-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.hub-url-input {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 11.5px;
 }
 
 .icon-close {

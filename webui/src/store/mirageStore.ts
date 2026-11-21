@@ -21,10 +21,13 @@ export const TPL_DIR_PATH = '/data/adb/mirage_forge/templates';
 export const PROBE_LOG_FILE = '/data/adb/mirage_forge/probe_events.log';
 export const CRASH_LOG_FILE = '/data/adb/mirage_forge/crash_events.log';
 export const LAUNCH_LOG_FILE = '/data/adb/mirage_forge/launch_history.log';
+
 export const UPDATE_JSON_URL =
   'https://raw.githubusercontent.com/jjh138792/MirageForge/main/update.json';
 export const ONLINE_HUB_URL =
   'https://raw.githubusercontent.com/jjh138792/MirageForge/main/templates-hub.json';
+export const ONLINE_HUB_CDN_URL =
+  'https://cdn.jsdelivr.net/gh/jjh138792/MirageForge@main/templates-hub.json';
 
 export type ThemeMode = 'auto' | 'light' | 'dark';
 
@@ -52,10 +55,20 @@ export interface DeviceTemplate {
   SDK_INT: string;
   SECURITY_PATCH: string;
   FINGERPRINT: string;
+  // OpenGL ES 参数
   GL_VENDOR: string;
   GL_RENDERER: string;
   GL_VERSION: string;
+  // Vulkan 独立参数
+  VK_DEVICE_NAME: string;
+  VK_VENDOR_ID: string;
+  VK_DEVICE_ID: string;
+  VK_API_VERSION: string;
+  VK_DRIVER_VERSION: string;
+  VK_DRIVER_NAME: string;
+  VK_DRIVER_INFO: string;
   MAX_REFRESH_RATE: number;
+  // VFS 硬件拓扑参数
   CPU_HARDWARE: string;
   CPU_CORES: number;
   CPU_MAX_FREQ: number;
@@ -77,8 +90,8 @@ export interface AppRoute {
   vfs: boolean;
   probe: boolean;
   sdkSpoof: boolean;
-  refreshRate: number; // 0 = 原生不改动, 90/120/144/165/240 = 开启高刷伪装
-  seccomp: boolean;    // false = 0改动, true = 开启按需 Seccomp-BPF 拦截内联 svc #0
+  refreshRate: number;
+  seccomp: boolean;
 }
 
 export interface ProbeEvent {
@@ -115,13 +128,80 @@ export interface UpdateInfo {
   changelog: string;
 }
 
+export interface HubSyncStatus {
+  state: 'idle' | 'loading' | 'online' | 'offline';
+  source: string;
+  remoteCount: number;
+  error: string;
+  customUrl: string;
+}
+
 export function sanitizeRefreshRate(hz: number | undefined): number {
   const n = Number(hz || 0);
   return n >= 90 && n <= 240 ? n : 0;
 }
 
+/**
+ * 自动补齐缺失的独立 Vulkan 字段，兼容旧版模板并防止驱动名与 OpenGL ES 串台
+ */
+export function normalizeTemplateVulkanFields(raw: Partial<DeviceTemplate>): DeviceTemplate {
+  const tpl = { ...raw } as DeviceTemplate;
+  if (!tpl.VK_DEVICE_NAME || !tpl.VK_DEVICE_NAME.trim()) {
+    tpl.VK_DEVICE_NAME = tpl.GL_RENDERER || 'Adreno (TM) 830';
+  }
+  const token = `${tpl.GL_VENDOR || ''} ${tpl.GL_RENDERER || ''} ${tpl.VK_DEVICE_NAME || ''}`.toLowerCase();
+  const isArm =
+    (tpl.VK_VENDOR_ID || '').toLowerCase() === '0x13b5' ||
+    token.includes('arm') ||
+    token.includes('mali') ||
+    token.includes('immortalis');
+  const isSamsung =
+    (tpl.VK_VENDOR_ID || '').toLowerCase() === '0x144d' || token.includes('xclipse');
+
+  if (!tpl.VK_VENDOR_ID || !tpl.VK_VENDOR_ID.trim()) {
+    tpl.VK_VENDOR_ID = isArm ? '0x13B5' : isSamsung ? '0x144D' : '0x5143';
+  }
+  if (!tpl.VK_DEVICE_ID || !tpl.VK_DEVICE_ID.trim()) {
+    if (isArm) {
+      tpl.VK_DEVICE_ID = token.includes('g925') ? '0x12870000' : '0x10860000';
+    } else if (isSamsung) {
+      tpl.VK_DEVICE_ID = '0x73A00000';
+    } else if (token.includes('750')) {
+      tpl.VK_DEVICE_ID = '0x43050000';
+    } else if (token.includes('740')) {
+      tpl.VK_DEVICE_ID = '0x43030000';
+    } else {
+      tpl.VK_DEVICE_ID = '0x43050A01';
+    }
+  }
+  if (!tpl.VK_API_VERSION || !tpl.VK_API_VERSION.trim()) {
+    tpl.VK_API_VERSION = '1.3.295';
+  }
+  if (!tpl.VK_DRIVER_VERSION || !tpl.VK_DRIVER_VERSION.trim()) {
+    if (isArm) tpl.VK_DRIVER_VERSION = '49.0.0';
+    else if (isSamsung) tpl.VK_DRIVER_VERSION = '24.1.0';
+    else if (token.includes('750') || token.includes('740')) tpl.VK_DRIVER_VERSION = '512.762.0';
+    else tpl.VK_DRIVER_VERSION = '512.800.0';
+  }
+  if (!tpl.VK_DRIVER_NAME || !tpl.VK_DRIVER_NAME.trim()) {
+    tpl.VK_DRIVER_NAME = isArm
+      ? 'ARM'
+      : isSamsung
+      ? 'Samsung Electronics'
+      : 'Qualcomm Technologies Inc. Adreno Vulkan Driver';
+  }
+  if (!tpl.VK_DRIVER_INFO || !tpl.VK_DRIVER_INFO.trim()) {
+    if (isArm) tpl.VK_DRIVER_INFO = 'r49p0-01eac0';
+    else if (isSamsung) tpl.VK_DRIVER_INFO = 'Xclipse Vulkan Driver 1.3';
+    else if (token.includes('750') || token.includes('740')) tpl.VK_DRIVER_INFO = 'Driver Build: 0762.0';
+    else tpl.VK_DRIVER_INFO = 'Driver Build: 0800.0';
+  }
+  tpl.MAX_REFRESH_RATE = sanitizeRefreshRate(tpl.MAX_REFRESH_RATE) || 120;
+  return tpl;
+}
+
 // ============================================================================
-// 内置精选云端机型库兜底数据 (当远程仓库未配置 templates-hub.json 或离线时立即可用)
+// 内置离线兜底精选库 (仅在断网或拉取全部失败时兜底展示)
 // ============================================================================
 export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
   {
@@ -151,6 +231,13 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     GL_VENDOR: 'Qualcomm',
     GL_RENDERER: 'Adreno (TM) 830',
     GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
+    VK_DEVICE_NAME: 'Adreno (TM) 830',
+    VK_VENDOR_ID: '0x5143',
+    VK_DEVICE_ID: '0x43050A01',
+    VK_API_VERSION: '1.3.295',
+    VK_DRIVER_VERSION: '512.800.0',
+    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
+    VK_DRIVER_INFO: 'Driver Build: 0800.0',
     MAX_REFRESH_RATE: 120,
     CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
     CPU_CORES: 8,
@@ -192,11 +279,17 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     GL_VENDOR: 'Qualcomm',
     GL_RENDERER: 'Adreno (TM) 830',
     GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
+    VK_DEVICE_NAME: 'Adreno (TM) 830',
+    VK_VENDOR_ID: '0x5143',
+    VK_DEVICE_ID: '0x43050A01',
+    VK_API_VERSION: '1.3.295',
+    VK_DRIVER_VERSION: '512.800.0',
+    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
+    VK_DRIVER_INFO: 'Driver Build: 0800.0',
     MAX_REFRESH_RATE: 144,
     CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
     CPU_CORES: 8,
     CPU_MAX_FREQ: 4320000,
-    CPU_clusters: '0-5:614400:3532800;6-7:806400:4320000',
     CPU_CLUSTERS: '0-5:614400:3532800;6-7:806400:4320000',
     RAM_GB: 16,
     DDR_TYPE: 'LPDDR5X',
@@ -234,6 +327,13 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     GL_VENDOR: 'Qualcomm',
     GL_RENDERER: 'Adreno (TM) 830',
     GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
+    VK_DEVICE_NAME: 'Adreno (TM) 830',
+    VK_VENDOR_ID: '0x5143',
+    VK_DEVICE_ID: '0x43050A01',
+    VK_API_VERSION: '1.3.295',
+    VK_DRIVER_VERSION: '512.800.0',
+    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
+    VK_DRIVER_INFO: 'Driver Build: 0800.0',
     MAX_REFRESH_RATE: 120,
     CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
     CPU_CORES: 8,
@@ -275,6 +375,13 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     GL_VENDOR: 'Qualcomm',
     GL_RENDERER: 'Adreno (TM) 750',
     GL_VERSION: 'OpenGL ES 3.2 V@0762.0',
+    VK_DEVICE_NAME: 'Adreno (TM) 750',
+    VK_VENDOR_ID: '0x5143',
+    VK_DEVICE_ID: '0x43050000',
+    VK_API_VERSION: '1.3.279',
+    VK_DRIVER_VERSION: '512.762.0',
+    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
+    VK_DRIVER_INFO: 'Driver Build: 0762.0',
     MAX_REFRESH_RATE: 165,
     CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8650',
     CPU_CORES: 8,
@@ -316,6 +423,13 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     GL_VENDOR: 'Qualcomm',
     GL_RENDERER: 'Adreno (TM) 830',
     GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
+    VK_DEVICE_NAME: 'Adreno (TM) 830',
+    VK_VENDOR_ID: '0x5143',
+    VK_DEVICE_ID: '0x43050A01',
+    VK_API_VERSION: '1.3.295',
+    VK_DRIVER_VERSION: '512.800.0',
+    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
+    VK_DRIVER_INFO: 'Driver Build: 0800.0',
     MAX_REFRESH_RATE: 120,
     CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
     CPU_CORES: 8,
@@ -347,6 +461,13 @@ export const mirageStore = reactive({
   telemetryEvents: [] as TelemetryEvent[],
   hubTemplates: [...BUILTIN_HUB_TEMPLATES] as DeviceTemplate[],
   hubLoading: false,
+  hubStatus: {
+    state: 'idle',
+    source: '',
+    remoteCount: 0,
+    error: '',
+    customUrl: localStorage.getItem('mirage_hub_url') || '',
+  } as HubSyncStatus,
   updateInfo: {
     checking: false,
     hasUpdate: false,
@@ -432,21 +553,74 @@ export async function loadVersionFromModuleProp() {
 }
 
 /**
- * 3. 在线检查更新 (拉取 GitHub update.json)
+ * 通用多通道文本拉取器：WebView fetch (6s 超时) -> Root curl 兜底
+ */
+function isSafeHttpUrl(url: string): boolean {
+  return /^https?:\/\/[^\s"'`$\\;|&<>]+$/i.test(url.trim());
+}
+
+async function fetchJsonTextWithFallback(url: string): Promise<{ text: string; via: 'fetch' | 'curl' }> {
+  const cleanUrl = url.trim();
+  if (!isSafeHttpUrl(cleanUrl)) {
+    throw new Error('URL 格式不合法');
+  }
+
+  const sep = cleanUrl.includes('?') ? '&' : '?';
+  const bustedUrl = `${cleanUrl}${sep}t=${Date.now()}`;
+
+  // 1. 优先尝试浏览器原生 fetch
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    const resp = await fetch(bustedUrl, { cache: 'no-store', signal: controller.signal });
+    clearTimeout(timer);
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const text = await resp.text();
+    if (text && text.trim().length > 2) {
+      return { text, via: 'fetch' };
+    }
+  } catch (fetchErr: any) {
+    // 2. WebView 网络受限/跨域时自动降级到 Root curl 拉取
+    const curlRes = await execRootShell(
+      `curl -fsSL --connect-timeout 6 --max-time 12 -A "MirageForge-WebUI" "${bustedUrl}"`
+    );
+    if (curlRes.errno === 0 && curlRes.stdout && curlRes.stdout.trim().length > 2) {
+      return { text: curlRes.stdout, via: 'curl' };
+    }
+    throw new Error(fetchErr?.message || `curl exit ${curlRes.errno}`);
+  }
+  throw new Error('empty response');
+}
+
+/**
+ * 3. 在线检查更新 (支持 CDN 与 curl 双兜底)
  */
 export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
   mirageStore.updateInfo.checking = true;
   triggerHaptic('light');
+  const candidates = [
+    'https://cdn.jsdelivr.net/gh/jjh138792/MirageForge@main/update.json',
+    UPDATE_JSON_URL,
+  ];
+  let parsed: any = null;
+  for (const url of candidates) {
+    try {
+      const { text } = await fetchJsonTextWithFallback(url);
+      parsed = JSON.parse(text);
+      if (parsed && parsed.version) break;
+    } catch (_) {}
+  }
+
   try {
-    const resp = await fetch(`${UPDATE_JSON_URL}?t=${Date.now()}`, { cache: 'no-store' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    const remoteCode = Number(data.versionCode || 0);
-    const remoteVer = String(data.version || '').replace(/^v/, '');
+    if (!parsed) throw new Error('all sources failed');
+    const remoteCode = Number(parsed.versionCode || 0);
+    const remoteVer = String(parsed.version || '').replace(/^v/, '');
 
     mirageStore.updateInfo.latestCode = remoteCode;
     mirageStore.updateInfo.latestVersion = remoteVer;
-    if (data.zipUrl) mirageStore.updateInfo.zipUrl = data.zipUrl;
+    if (parsed.zipUrl) mirageStore.updateInfo.zipUrl = parsed.zipUrl;
 
     if (remoteCode > mirageStore.versionCode && mirageStore.versionCode > 0) {
       mirageStore.updateInfo.hasUpdate = true;
@@ -467,7 +641,8 @@ export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
  * 4. URL-Safe Base64 模板分享码编解码器 (与 Rust CLI mf:// 格式 100% 互通)
  */
 export function encodeTemplateShareCode(tpl: DeviceTemplate): string {
-  const json = JSON.stringify(tpl);
+  const normalized = normalizeTemplateVulkanFields(tpl);
+  const json = JSON.stringify(normalized);
   const b64 = btoa(unescape(encodeURIComponent(json)))
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
@@ -481,7 +656,7 @@ export function decodeTemplateShareCode(rawCode: string): DeviceTemplate | null 
     if (!trimmed) return null;
     if (trimmed.startsWith('{')) {
       const obj = JSON.parse(trimmed);
-      return obj && obj.MODEL ? (obj as DeviceTemplate) : null;
+      return obj && obj.MODEL ? normalizeTemplateVulkanFields(obj) : null;
     }
     const payload = trimmed.replace(/^mf:\/\//i, '').replace(/-/g, '+').replace(/_/g, '/');
     const padLen = (4 - (payload.length % 4)) % 4;
@@ -490,44 +665,93 @@ export function decodeTemplateShareCode(rawCode: string): DeviceTemplate | null 
     const parsed = JSON.parse(json);
     if (parsed && parsed.MODEL) {
       if (!parsed.id) parsed.id = `tpl_${Date.now()}`;
-      parsed.MAX_REFRESH_RATE = sanitizeRefreshRate(parsed.MAX_REFRESH_RATE) || 120;
-      return parsed as DeviceTemplate;
+      return normalizeTemplateVulkanFields(parsed);
     }
   } catch (_) {}
   return null;
 }
 
-/**
- * 5. 拉取在线机型库 (支持 GitHub 远端合并 + 离线精选库兜底)
- */
-export async function fetchOnlineTemplateHub() {
-  mirageStore.hubLoading = true;
-  try {
-    const resp = await fetch(`${ONLINE_HUB_URL}?t=${Date.now()}`, { cache: 'no-store' });
-    if (resp.ok) {
-      const remoteList = await resp.json();
-      if (Array.isArray(remoteList) && remoteList.length > 0) {
-        const mergedMap = new Map<string, DeviceTemplate>();
-        for (const item of BUILTIN_HUB_TEMPLATES) mergedMap.set(item.id, item);
-        for (const item of remoteList) {
-          if (item && item.id && item.MODEL) {
-            mergedMap.set(item.id, item as DeviceTemplate);
-          }
-        }
-        mirageStore.hubTemplates = Array.from(mergedMap.values());
-      }
-    }
-  } catch (_) {
-    // 离线或远端未创建文件时，直接使用内置精选旗舰库
-  } finally {
-    mirageStore.hubLoading = false;
+export function saveCustomHubUrl(url: string) {
+  const clean = url.trim();
+  mirageStore.hubStatus.customUrl = clean;
+  if (clean) {
+    localStorage.setItem('mirage_hub_url', clean);
+  } else {
+    localStorage.removeItem('mirage_hub_url');
   }
 }
 
 /**
- * 6. TypeScript 内存级微模块 .conf 编译器 (与 Rust CLI compiler.rs 100% 同步，严格遵守 0 改动)
+ * 5. 在线机型库多通道真联网拉取 (自定义源 -> jsDelivr CDN -> GitHub Raw，含 Root curl 兜底)
  */
-function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
+export async function fetchOnlineTemplateHub(forceToast = false) {
+  mirageStore.hubLoading = true;
+  mirageStore.hubStatus.state = 'loading';
+  mirageStore.hubStatus.error = '';
+
+  const sources: Array<{ label: string; url: string }> = [];
+  if (mirageStore.hubStatus.customUrl.trim()) {
+    sources.push({ label: '自定义云端源', url: mirageStore.hubStatus.customUrl.trim() });
+  }
+  sources.push({ label: 'jsDelivr CDN', url: ONLINE_HUB_CDN_URL });
+  sources.push({ label: 'GitHub Raw', url: ONLINE_HUB_URL });
+
+  let lastErr = '网络不可用';
+
+  for (const src of sources) {
+    try {
+      const { text, via } = await fetchJsonTextWithFallback(src.url);
+      const raw = JSON.parse(text);
+      const list = Array.isArray(raw) ? raw : Array.isArray(raw?.templates) ? raw.templates : null;
+
+      if (list && list.length > 0) {
+        const mergedMap = new Map<string, DeviceTemplate>();
+        for (const item of BUILTIN_HUB_TEMPLATES) {
+          mergedMap.set(item.id, normalizeTemplateVulkanFields(item));
+        }
+        let validRemote = 0;
+        for (const item of list) {
+          if (item && item.id && item.MODEL) {
+            mergedMap.set(item.id, normalizeTemplateVulkanFields(item));
+            validRemote++;
+          }
+        }
+        if (validRemote > 0) {
+          mirageStore.hubTemplates = Array.from(mergedMap.values());
+          mirageStore.hubStatus.state = 'online';
+          mirageStore.hubStatus.source = `${src.label} (${via})`;
+          mirageStore.hubStatus.remoteCount = validRemote;
+          mirageStore.hubStatus.error = '';
+          mirageStore.hubLoading = false;
+          if (forceToast) {
+            triggerHaptic('success');
+            showToast(`已从 ${src.label} 同步 ${validRemote} 款云端机型`);
+          }
+          return;
+        }
+      }
+      lastErr = 'JSON 格式不含有效机型列表';
+    } catch (e: any) {
+      lastErr = `${src.label}: ${e?.message || '连接失败'}`;
+    }
+  }
+
+  mirageStore.hubTemplates = BUILTIN_HUB_TEMPLATES.map((t) => normalizeTemplateVulkanFields(t));
+  mirageStore.hubStatus.state = 'offline';
+  mirageStore.hubStatus.source = '本地离线精选库';
+  mirageStore.hubStatus.remoteCount = 0;
+  mirageStore.hubStatus.error = lastErr;
+  mirageStore.hubLoading = false;
+  if (forceToast) {
+    showToast(`云端拉取失败，已切换至离线精选库 (${lastErr})`);
+  }
+}
+
+/**
+ * 6. TypeScript 内存级微模块 .conf 编译器 (与 Rust CLI compiler.rs 100% 同步)
+ */
+function compileModularConfInTs(rawTpl: DeviceTemplate, route: AppRoute): string {
+  const tpl = normalizeTemplateVulkanFields(rawTpl);
   const lines: string[] = [];
   const push = (k: string, v: string | number | undefined) => {
     if (k && v !== undefined && String(v).length > 0) {
@@ -554,6 +778,14 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     if (effectiveFps >= 90) {
       push('GLES:REFRESH_RATE', effectiveFps);
     }
+
+    push('VULKAN:DEVICE_NAME', tpl.VK_DEVICE_NAME);
+    push('VULKAN:VENDOR_ID', tpl.VK_VENDOR_ID);
+    push('VULKAN:DEVICE_ID', tpl.VK_DEVICE_ID);
+    push('VULKAN:API_VERSION', tpl.VK_API_VERSION);
+    push('VULKAN:DRIVER_VERSION', tpl.VK_DRIVER_VERSION);
+    push('VULKAN:DRIVER_NAME', tpl.VK_DRIVER_NAME);
+    push('VULKAN:DRIVER_INFO', tpl.VK_DRIVER_INFO);
   }
 
   const ramGb = tpl.RAM_GB > 0 ? tpl.RAM_GB : 16;
@@ -652,7 +884,6 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.build.tags', 'release-keys');
     push('ro.build.type', 'user');
 
-    // SELinux 受限属性区与云控 Root 隐藏
     push('ro.boot.vbmeta.device_state', 'locked');
     push('ro.boot.vbmeta.avb_version', '1.2');
     push('ro.boot.vbmeta.hash_alg', 'sha256');
@@ -675,7 +906,6 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
     push('ro.boot.hardware.sku', tpl.DEVICE);
     push('ro.boot.product.hardware.sku', tpl.DEVICE);
 
-    // 严格子模块隔离：仅当 VFS 开关也开启时，才注入 DDR 物理内存属性
     if (route.vfs) {
       const ramStr = `${ramGb}GB`;
       const ddrFull = `${ramStr},${ddrVendor},${ddrType}`;
@@ -693,11 +923,14 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
       push('persist.sys.ram_size', ramStr);
     }
 
-    // 严格子模块隔离：仅当 GL 开关也开启时，才注入底层 Vulkan/GLES 辅助属性
-    if (route.gl && tpl.GL_RENDERER) {
-      push('persist.sys.cloud.gpu.vk_devicename', tpl.GL_RENDERER);
-      push('persist.sys.cloud.gpu.gl_renderer', tpl.GL_RENDERER);
-      push('persist.sys.gpu.gl_renderer', tpl.GL_RENDERER);
+    if (route.gl) {
+      if (tpl.VK_DEVICE_NAME) {
+        push('persist.sys.cloud.gpu.vk_devicename', tpl.VK_DEVICE_NAME);
+      }
+      if (tpl.GL_RENDERER) {
+        push('persist.sys.cloud.gpu.gl_renderer', tpl.GL_RENDERER);
+        push('persist.sys.gpu.gl_renderer', tpl.GL_RENDERER);
+      }
       if (tpl.GL_VENDOR) {
         push('persist.sys.cloud.gpu.gl_vendor', tpl.GL_VENDOR);
         push('persist.sys.gpu.gl_vendor', tpl.GL_VENDOR);
@@ -711,7 +944,6 @@ function compileModularConfInTs(tpl: DeviceTemplate, route: AppRoute): string {
       }
     }
 
-    // 严格过滤自定义属性：禁止残留 DPI 属性，且在未开启 sdkSpoof 时禁止任何 SDK/Release 属性混入
     for (const raw of (tpl.CUSTOM_PROPS || '').split(/\r?\n/)) {
       const tr = raw.trim();
       if (!tr || tr.startsWith('#')) continue;
@@ -769,6 +1001,16 @@ async function flushStateZeroFork() {
   );
 }
 
+function normalizeLoadedTemplates(rawMap: Record<string, any>): Record<string, DeviceTemplate> {
+  const out: Record<string, DeviceTemplate> = {};
+  for (const [id, tpl] of Object.entries(rawMap || {})) {
+    if (tpl && tpl.MODEL) {
+      out[id] = normalizeTemplateVulkanFields({ ...tpl, id });
+    }
+  }
+  return out;
+}
+
 function normalizeLoadedRoutes(rawRoutes: Record<string, any>): Record<string, AppRoute> {
   const out: Record<string, AppRoute> = {};
   for (const [pkg, r] of Object.entries(rawRoutes || {})) {
@@ -811,7 +1053,7 @@ export async function syncStateFromRustCli() {
     if (rawJson.trim()) {
       try {
         const data = JSON.parse(rawJson);
-        mirageStore.templates = data.templates || {};
+        mirageStore.templates = normalizeLoadedTemplates(data.templates);
         mirageStore.appRoutes = normalizeLoadedRoutes(data.appRoutes);
         if (!mirageStore.version || mirageStore.version === '...') {
           mirageStore.version = data.version || '1.3.0';
@@ -830,7 +1072,7 @@ export async function syncStateFromRustCli() {
         mirageStore.version = data.version || '1.3.0';
         mirageStore.versionCode = data.versionCode || 130;
       }
-      mirageStore.templates = data.templates || {};
+      mirageStore.templates = normalizeLoadedTemplates(data.templates);
       mirageStore.appRoutes = normalizeLoadedRoutes(data.appRoutes);
     } catch (_) {}
   }
@@ -849,8 +1091,8 @@ export async function reloadAppList() {
   mirageStore.loading = false;
 }
 
-export async function saveTemplateViaCli(tpl: DeviceTemplate) {
-  tpl.MAX_REFRESH_RATE = sanitizeRefreshRate(tpl.MAX_REFRESH_RATE) || 120;
+export async function saveTemplateViaCli(rawTpl: DeviceTemplate) {
+  const tpl = normalizeTemplateVulkanFields(rawTpl);
   if (hasZeroForkIo()) {
     mirageStore.templates[tpl.id] = { ...tpl };
     await writeFileZeroFork(`${TPL_DIR_PATH}/${tpl.id}.tpl`, JSON.stringify(tpl, null, 2));
@@ -885,7 +1127,7 @@ export async function parsePropTextViaCli(rawText: string): Promise<DeviceTempla
       const parsed = JSON.parse(res.stdout);
       if (parsed && parsed.MODEL) {
         triggerHaptic('success');
-        return parsed as DeviceTemplate;
+        return normalizeTemplateVulkanFields(parsed);
       }
     } catch (_) {}
   }

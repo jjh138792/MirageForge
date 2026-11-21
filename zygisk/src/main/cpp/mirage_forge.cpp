@@ -159,8 +159,6 @@ public:
         }
         if (g_cfg.vfs.enabled) {
             dlopen("libmeminfo.so", RTLD_NOW);
-            resolve_am_get_memory_info_code(env);
-            install_binder_meminfo_hook();
         }
         scan_and_commit_plt_hooks();
         if (g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {
@@ -198,13 +196,34 @@ private:
                 if (!g_cfg.gl.enabled) continue;
                 if (k == "GLES:VENDOR") {
                     g_cfg.gl.gl_vendor = v;
-                    g_cfg.gl.vulkan_vendor_id = (v.find("ARM") != std::string::npos || v.find("Mali") != std::string::npos) ? 0x13B5 : 0x5143;
                 } else if (k == "GLES:RENDERER") {
                     g_cfg.gl.gl_renderer = v;
                 } else if (k == "GLES:VERSION") {
                     g_cfg.gl.gl_version = v;
                 } else if (k == "GLES:REFRESH_RATE" && g_cfg.gl.max_refresh_rate == 0) {
                     g_cfg.gl.max_refresh_rate = std::atoi(v.c_str());
+                }
+                continue;
+            }
+
+            if (k.rfind("VULKAN:", 0) == 0) {
+                if (!g_cfg.gl.enabled) continue;
+                if (k == "VULKAN:DEVICE_NAME") {
+                    g_cfg.gl.vk_device_name = v;
+                } else if (k == "VULKAN:VENDOR_ID") {
+                    g_cfg.gl.vk_vendor_id = parse_vk_u32(v);
+                } else if (k == "VULKAN:DEVICE_ID") {
+                    g_cfg.gl.vk_device_id = parse_vk_u32(v);
+                } else if (k == "VULKAN:API_VERSION") {
+                    g_cfg.gl.vk_api_version = v;
+                    g_cfg.gl.vk_api_version_packed = pack_vk_version_str(v);
+                } else if (k == "VULKAN:DRIVER_VERSION") {
+                    g_cfg.gl.vk_driver_version = v;
+                    g_cfg.gl.vk_driver_version_packed = pack_vk_version_str(v);
+                } else if (k == "VULKAN:DRIVER_NAME") {
+                    g_cfg.gl.vk_driver_name = v;
+                } else if (k == "VULKAN:DRIVER_INFO") {
+                    g_cfg.gl.vk_driver_info = v;
                 }
                 continue;
             }
@@ -250,6 +269,10 @@ private:
                 }
                 g_cfg.build.prop_map[k] = v;
             }
+        }
+
+        if (g_cfg.gl.enabled) {
+            g_cfg.gl.finalize_vulkan_defaults();
         }
     }
 };

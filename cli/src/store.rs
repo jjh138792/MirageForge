@@ -46,8 +46,9 @@ impl StoreEngine {
                 let path = entry.path();
                 if path.extension().and_then(|s| s.to_str()) == Some("tpl") {
                     if let Ok(raw) = fs::read_to_string(&path) {
-                        if let Some(tpl) = Self::deserialize_tpl(&raw) {
+                        if let Some(mut tpl) = Self::deserialize_tpl(&raw) {
                             if is_safe_token(&tpl.id) {
+                                tpl.normalize_vulkan_fields();
                                 self.templates.insert(tpl.id.clone(), tpl);
                             }
                         }
@@ -59,7 +60,10 @@ impl StoreEngine {
         if self.templates.is_empty() {
             let cfg_raw = read_file_str(CONFIG_JSON);
             if let Ok(parsed) = serde_json::from_str::<FullStateExport>(&cfg_raw) {
-                self.templates = parsed.templates;
+                for (id, mut tpl) in parsed.templates {
+                    tpl.normalize_vulkan_fields();
+                    self.templates.insert(id, tpl);
+                }
                 for (pkg, mut r) in parsed.app_routes {
                     r.pkg_name = pkg.clone();
                     r.refresh_rate = sanitize_refresh_rate(r.refresh_rate);
@@ -173,6 +177,7 @@ impl StoreEngine {
         if sanitize_refresh_rate(tpl.max_refresh_rate) == 0 {
             tpl.max_refresh_rate = 120;
         }
+        tpl.normalize_vulkan_fields();
         self.templates.insert(tpl.id.clone(), tpl);
         self.save_all_and_compile()
     }
@@ -242,7 +247,9 @@ impl StoreEngine {
 
     fn deserialize_tpl(raw: &str) -> Option<DeviceTemplate> {
         if raw.trim_start().starts_with('{') {
-            return serde_json::from_str::<DeviceTemplate>(raw).ok();
+            let mut t = serde_json::from_str::<DeviceTemplate>(raw).ok()?;
+            t.normalize_vulkan_fields();
+            return Some(t);
         }
         let mut map = serde_json::Map::new();
         let mut custom = Vec::new();
@@ -262,7 +269,9 @@ impl StoreEngine {
             }
         }
         map.insert("CUSTOM_PROPS".into(), serde_json::Value::String(custom.join("\n")));
-        serde_json::from_value(serde_json::Value::Object(map)).ok()
+        let mut t: DeviceTemplate = serde_json::from_value(serde_json::Value::Object(map)).ok()?;
+        t.normalize_vulkan_fields();
+        Some(t)
     }
 
     fn seed_flagship_presets(&mut self) {
@@ -294,6 +303,13 @@ impl StoreEngine {
                 gl_vendor: "Qualcomm".into(),
                 gl_renderer: "Adreno (TM) 830".into(),
                 gl_version: "OpenGL ES 3.2 V@0800.0".into(),
+                vk_device_name: "Adreno (TM) 830".into(),
+                vk_vendor_id: "0x5143".into(),
+                vk_device_id: "0x43050A01".into(),
+                vk_api_version: "1.3.295".into(),
+                vk_driver_version: "512.800.0".into(),
+                vk_driver_name: "Qualcomm Technologies Inc. Adreno Vulkan Driver".into(),
+                vk_driver_info: "Driver Build: 0800.0".into(),
                 max_refresh_rate: 120,
                 cpu_hardware: "Qualcomm Technologies, Inc SM8750".into(),
                 cpu_cores: 8,
@@ -335,6 +351,13 @@ impl StoreEngine {
                 gl_vendor: "Qualcomm".into(),
                 gl_renderer: "Adreno (TM) 830".into(),
                 gl_version: "OpenGL ES 3.2 V@0800.0".into(),
+                vk_device_name: "Adreno (TM) 830".into(),
+                vk_vendor_id: "0x5143".into(),
+                vk_device_id: "0x43050A01".into(),
+                vk_api_version: "1.3.295".into(),
+                vk_driver_version: "512.800.0".into(),
+                vk_driver_name: "Qualcomm Technologies Inc. Adreno Vulkan Driver".into(),
+                vk_driver_info: "Driver Build: 0800.0".into(),
                 max_refresh_rate: 165,
                 cpu_hardware: "Qualcomm Technologies, Inc SM8750".into(),
                 cpu_cores: 8,
@@ -376,6 +399,13 @@ impl StoreEngine {
                 gl_vendor: "Qualcomm".into(),
                 gl_renderer: "Adreno (TM) 830".into(),
                 gl_version: "OpenGL ES 3.2 V@0800.0".into(),
+                vk_device_name: "Adreno (TM) 830".into(),
+                vk_vendor_id: "0x5143".into(),
+                vk_device_id: "0x43050A01".into(),
+                vk_api_version: "1.3.295".into(),
+                vk_driver_version: "512.800.0".into(),
+                vk_driver_name: "Qualcomm Technologies Inc. Adreno Vulkan Driver".into(),
+                vk_driver_info: "Driver Build: 0800.0".into(),
                 max_refresh_rate: 144,
                 cpu_hardware: "Qualcomm Technologies, Inc SM8750".into(),
                 cpu_cores: 8,
@@ -417,6 +447,13 @@ impl StoreEngine {
                 gl_vendor: "ARM".into(),
                 gl_renderer: "Immortalis-G925 MC12".into(),
                 gl_version: "OpenGL ES 3.2 v1.r49p0-01eac0".into(),
+                vk_device_name: "Immortalis-G925 MC12".into(),
+                vk_vendor_id: "0x13B5".into(),
+                vk_device_id: "0x12870000".into(),
+                vk_api_version: "1.3.295".into(),
+                vk_driver_version: "49.0.0".into(),
+                vk_driver_name: "ARM".into(),
+                vk_driver_info: "r49p0-01eac0".into(),
                 max_refresh_rate: 120,
                 cpu_hardware: "MT6991".into(),
                 cpu_cores: 8,

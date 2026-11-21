@@ -13,6 +13,7 @@
 #include <unwind.h>
 #include <dlfcn.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <android/log.h>
@@ -125,47 +126,23 @@ inline void emit_probe(const char *domain, const std::string &key, const std::st
     write_direct_log_line(ANDROID_LOG_WARN, ss.str());
 }
 
-inline struct sigaction g_old_sigsegv{};
 inline struct sigaction g_old_sigabrt{};
 inline struct sigaction g_old_sigbus{};
 inline struct sigaction g_old_sigill{};
 inline char g_crash_pkg_name[128] = {0};
 
-// 异步信号安全 (Async-Signal-Safe) 的崩溃捕获器：
-// 1. 全程使用栈缓冲区，0 次堆内存分配 (禁止 std::string / std::ostringstream / malloc)
-// 2. 自动识别并跳过 ART 虚拟机 (libart.so) 的隐式 Java NullPointerException 检查 (fault_addr < 0x1000)
 inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext) {
     int saved_errno = errno;
 
-    struct sigaction *prev = (sig == SIGSEGV) ? &g_old_sigsegv :
-                             (sig == SIGABRT) ? &g_old_sigabrt :
+    struct sigaction *prev = (sig == SIGABRT) ? &g_old_sigabrt :
                              (sig == SIGBUS)  ? &g_old_sigbus  : &g_old_sigill;
-
-    uintptr_t fault_addr = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
 
     void *frames[10];
     BacktraceState state{frames, frames + 10};
     _Unwind_Backtrace(unwind_callback, &state);
     size_t count = static_cast<size_t>(state.current - frames);
 
-    if (sig == SIGSEGV && fault_addr < 0x1000) {
-        for (size_t i = 0; i < count && i < 4; ++i) {
-            Dl_info dli{};
-            if (dladdr(frames[i], &dli) && dli.dli_fname) {
-                if (std::strstr(dli.dli_fname, "libart.so") != nullptr) {
-                    errno = saved_errno;
-                    if (prev && (prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction) {
-                        prev->sa_sigaction(sig, info, ucontext);
-                        return;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    const char *sig_name = (sig == SIGSEGV) ? "SIGSEGV" :
-                           (sig == SIGABRT) ? "SIGABRT" :
+    const char *sig_name = (sig == SIGABRT) ? "SIGABRT" :
                            (sig == SIGBUS)  ? "SIGBUS"  : "SIGILL";
 
     char reg_buf[256];
@@ -203,7 +180,7 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
         if (dladdr(frames[i], &dli) && dli.dli_fname) {
             const char *slash = std::strrchr(dli.dli_fname, '/');
             const char *lib_name = slash ? (slash + 1) : dli.dli_fname;
-            uintptr_t rel_pc = addr - reinterpret_cast<uintptr_t>(info ? dli.dli_fbase : dli.dli_fbase);
+            uintptr_t rel_pc = addr - reinterpret_cast<uintptr_t>(dli.dli_fbase);
 
             if (s_pos > 0) {
                 int w = std::snprintf(stack_buf + s_pos, sizeof(stack_buf) - s_pos, " <- ");
@@ -257,7 +234,7 @@ inline void install_crash_signal_logger(const std::string &pkg) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 
-    // 不再拦截 SIGSEGV，避免把 ART 的 CheckSuspend / GC 屏障 / 隐式 NPE 误报为崩溃
+    // 不拦截 SIGSEGV，避免干扰 ART CheckSuspend / GC 屏障 / 隐式 NPE
     sigaction(SIGABRT, &sa, &g_old_sigabrt);
     sigaction(SIGBUS,  &sa, &g_old_sigbus);
     sigaction(SIGILL,  &sa, &g_old_sigill);

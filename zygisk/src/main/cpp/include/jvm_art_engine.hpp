@@ -12,27 +12,6 @@ inline JavaVM *g_jvm = nullptr;
 inline std::atomic<bool> g_post_specialized{false};
 inline std::atomic<bool> g_fps_spoof_applied{false};
 
-inline uint32_t g_am_get_memory_info_code = 0;
-
-// 动态读取当前 Android 版本的 IActivityManager$Stub.TRANSACTION_getMemoryInfo 交易号
-inline void resolve_am_get_memory_info_code(JNIEnv *env) {
-    if (!env || g_am_get_memory_info_code != 0) return;
-    jclass stub_cls = env->FindClass("android/app/IActivityManager$Stub");
-    if (!stub_cls) {
-        env->ExceptionClear();
-        return;
-    }
-    jfieldID fid = env->GetStaticFieldID(stub_cls, "TRANSACTION_getMemoryInfo", "I");
-    if (!env->ExceptionCheck() && fid) {
-        jint code = env->GetStaticIntField(stub_cls, fid);
-        if (code > 0) {
-            g_am_get_memory_info_code = static_cast<uint32_t>(code);
-        }
-    } else {
-        env->ExceptionClear();
-    }
-    env->DeleteLocalRef(stub_cls);
-}
 // 仅在 postAppSpecialize 之后、且当前已在合法 Java 线程且 DisplayManagerGlobal.sInstance 已存在时修补缓存，
 // 绝不在 Zygote 阶段主动触发 Binder IPC
 inline void try_lazy_spoof_display_modes() {
@@ -59,7 +38,6 @@ inline void try_lazy_spoof_display_modes() {
 
     jobject dmg = env->GetStaticObjectField(dmg_cls, sinst_fid);
     if (env->ExceptionCheck() || !dmg) {
-        // 应用尚未初始化 DisplayManagerGlobal，等待下次调用再试
         env->ExceptionClear();
         env->DeleteLocalRef(dmg_cls);
         return;
@@ -78,7 +56,6 @@ inline void try_lazy_spoof_display_modes() {
             jfieldID mode_rr_fid = mode_cls ? env->GetFieldID(mode_cls, "mRefreshRate", "F") : nullptr;
             if (env->ExceptionCheck()) { env->ExceptionClear(); mode_rr_fid = nullptr; }
 
-            // Android 15+ 新增 mVsyncRate 字段
             jfieldID mode_vsync_fid = mode_cls ? env->GetFieldID(mode_cls, "mVsyncRate", "F") : nullptr;
             if (env->ExceptionCheck()) { env->ExceptionClear(); mode_vsync_fid = nullptr; }
 

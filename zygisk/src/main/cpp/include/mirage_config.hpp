@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cctype>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -61,7 +62,7 @@ inline void volatile_scrub_map(std::unordered_map<std::string, std::string> &m) 
     m.clear();
 }
 
-// 严格保护线程 errno 的守卫器：防止探针 send() 或日志调用污染原系统调用的 errno
+// 严格保护线程 errno 的守卫器
 struct ErrnoRestorer {
     int saved_errno;
     inline ErrnoRestorer() noexcept : saved_errno(errno) {}
@@ -106,8 +107,38 @@ inline uint64_t hash_str(const std::string &s) noexcept {
     return fnv1a_64(s.data(), s.size());
 }
 
+// 解析 0x 开头的十六进制或十进制 uint32_t（兼容 Vulkan VendorID / DeviceID）
+inline uint32_t parse_vk_u32(const std::string &raw) noexcept {
+    if (raw.empty()) return 0;
+    const char *s = raw.c_str();
+    while (*s == ' ' || *s == '\t') ++s;
+    if (*s == '\0') return 0;
+
+    bool has_hex_alpha = false;
+    for (const char *p = s; *p != '\0'; ++p) {
+        if ((*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+            has_hex_alpha = true;
+            break;
+        }
+    }
+    int base = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ? 16 : (has_hex_alpha ? 16 : 0);
+    return static_cast<uint32_t>(std::strtoul(s, nullptr, base));
+}
+
+// 按 Vulkan 标准位布局打包版本号：支持 "1.3.295"、"512.800.0" 或原始十六进制 "0x80320000"
+inline uint32_t pack_vk_version_str(const std::string &raw) noexcept {
+    if (raw.empty()) return 0;
+    if (raw.find('.') == std::string::npos) {
+        return parse_vk_u32(raw);
+    }
+    unsigned int major = 0, minor = 0, patch = 0;
+    int parsed = std::sscanf(raw.c_str(), "%u.%u.%u", &major, &minor, &patch);
+    if (parsed < 2) return 0;
+    return ((major & 0x3FFu) << 22) | ((minor & 0x3FFu) << 12) | (patch & 0xFFFu);
+}
+
 // ============================================================================
-// 微模块 1：Build 反射与受限属性区配置 (已移除 DPI)
+// 微模块 1：Build 反射与受限属性区配置
 // ============================================================================
 struct BuildModuleConfig {
     bool enabled = false;
@@ -123,17 +154,84 @@ struct BuildModuleConfig {
 };
 
 // ============================================================================
-// 微模块 2：OpenGL ES / Vulkan / MediaDrm / 屏幕高刷配置
+// 微模块 2：OpenGL ES / Vulkan 独立渲染层 / MediaDrm / 屏幕高刷配置
 // ============================================================================
 struct GraphicsModuleConfig {
     bool enabled = false;
-    int max_refresh_rate = 0; // 0 = 0改动；120 / 144 / 165 = 伪装屏幕最高刷新率
+    int max_refresh_rate = 0; // 0 = 0改动；90 / 120 / 144 / 165 = 伪装屏幕最高刷新率
+
+    // OpenGL ES 参数
     std::string gl_vendor;
     std::string gl_renderer;
     std::string gl_version;
     std::string gl_glsl_version = "OpenGL ES GLSL ES 3.20";
-    uint32_t vulkan_vendor_id = 0;
-    uint32_t vulkan_device_id = 0;
+
+    // Vulkan 独立参数（与 OpenGL ES 彻底解耦，避免驱动信息串台）
+    std::string vk_device_name;
+    uint32_t vk_vendor_id = 0;
+    uint32_t vk_device_id = 0;
+    std::string vk_api_version;
+    uint32_t vk_api_version_packed = 0;
+    std::string vk_driver_version;
+    uint32_t vk_driver_version_packed = 0;
+    std::string vk_driver_name;
+    std::string vk_driver_info;
+
+    inline const std::string &effective_vk_device_name() const noexcept {
+        return !vk_device_name.empty() ? vk_device_name : gl_renderer;
+    }
+
+    // 兼容旧版未显式填写 VULKAN:* 字段的配置，自动推导合理的 Vulkan 身份与驱动信息（绝不混入 OpenGL ES 字样）
+    inline void finalize_vulkan_defaults() {
+        if (vk_device_name.empty()) {
+            vk_device_name = gl_renderer;
+        }
+        bool is_arm = (vk_vendor_id == 0x13B5U) ||
+                      (vk_vendor_id == 0 && (gl_vendor.find("ARM") != std::string::npos ||
+                                             gl_vendor.find("Arm") != std::string::npos ||
+                                             gl_renderer.find("Mali") != std::string::npos ||
+                                             gl_renderer.find("Immortalis") != std::string::npos));
+        bool is_samsung = (vk_vendor_id == 0x144DU) ||
+                          (vk_vendor_id == 0 && gl_renderer.find("Xclipse") != std::string::npos);
+
+        if (vk_vendor_id == 0) {
+            vk_vendor_id = is_arm ? 0x13B5U : (is_samsung ? 0x144DU : 0x5143U);
+        }
+        if (vk_device_id == 0) {
+            if (is_arm) {
+                vk_device_id = (vk_device_name.find("G925") != std::string::npos) ? 0x12870000U : 0x10860000U;
+            } else if (is_samsung) {
+                vk_device_id = 0x73A00000U;
+            } else {
+                vk_device_id = (vk_device_name.find("830") != std::string::npos) ? 0x43050A01U : 0x43050000U;
+            }
+        }
+        if (vk_api_version_packed == 0) {
+            vk_api_version_packed = pack_vk_version_str(vk_api_version.empty() ? "1.3.295" : vk_api_version);
+        }
+        if (vk_driver_version_packed == 0) {
+            std::string def_drv_ver = is_arm ? "49.0.0" : "512.800.0";
+            vk_driver_version_packed = pack_vk_version_str(vk_driver_version.empty() ? def_drv_ver : vk_driver_version);
+        }
+        if (vk_driver_name.empty()) {
+            if (is_arm) {
+                vk_driver_name = "ARM";
+            } else if (is_samsung) {
+                vk_driver_name = "Samsung Electronics";
+            } else {
+                vk_driver_name = "Qualcomm Technologies Inc. Adreno Vulkan Driver";
+            }
+        }
+        if (vk_driver_info.empty()) {
+            if (is_arm) {
+                vk_driver_info = "r49p0-01eac0";
+            } else if (is_samsung) {
+                vk_driver_info = "Xclipse Vulkan Driver 1.3";
+            } else {
+                vk_driver_info = "Driver Build: 0800.0";
+            }
+        }
+    }
 };
 
 // ============================================================================
@@ -151,7 +249,7 @@ struct CpuClusterSpec {
 
 struct VfsModuleConfig {
     bool enabled = false;
-    bool enable_seccomp = false; // false = 0改动；true = 开启按需 Seccomp-BPF 拦截裸 svc #0
+    bool enable_seccomp = false;
     std::string cpu_hardware;
     std::string cpu_arch = "aarch64";
     std::string soc_id;

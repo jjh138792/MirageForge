@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstring>
+#include <atomic>
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -149,20 +150,26 @@ inline void freeze_bionic_prop_arena() {
         set_default_restricted("ro.sys.cloud.root.global", "0");
     }
 
-    // 完整覆盖云机底层 4 项 Vulkan 属性与 OpenGL 属性 (对应 DevCheck 日志第 9~12 行与 AIDA64 日志第 112~120 行)
-    if (g_cfg.gl.enabled && !g_cfg.gl.gl_renderer.empty()) {
-        bool is_arm = (g_cfg.gl.vulkan_vendor_id == 0x13B5);
-        std::string vk_vendor = std::to_string(is_arm ? 0x13B5 : 0x5143);
-        std::string vk_device = std::to_string(is_arm ? 0x72120000 : 0x044C2500);
-        std::string vk_driver = std::to_string(is_arm ? 0x01D00000 : 0x80200000);
+    // 使用独立的 Vulkan / OpenGL 参数同步覆写系统图形属性
+    if (g_cfg.gl.enabled) {
+        const std::string &vk_name = g_cfg.gl.effective_vk_device_name();
+        if (!vk_name.empty()) {
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_devicename"] = vk_name;
+        }
+        if (g_cfg.gl.vk_vendor_id != 0) {
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_vendorid"] = std::to_string(g_cfg.gl.vk_vendor_id);
+        }
+        if (g_cfg.gl.vk_device_id != 0) {
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_deviceid"] = std::to_string(g_cfg.gl.vk_device_id);
+        }
+        if (g_cfg.gl.vk_driver_version_packed != 0) {
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_driverversion"] = std::to_string(g_cfg.gl.vk_driver_version_packed);
+        }
 
-        g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_devicename"] = g_cfg.gl.gl_renderer;
-        g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_vendorid"] = vk_vendor;
-        g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_deviceid"] = vk_device;
-        g_cfg.build.prop_map["persist.sys.cloud.gpu.vk_driverversion"] = vk_driver;
-
-        g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
-        g_cfg.build.prop_map["persist.sys.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
+        if (!g_cfg.gl.gl_renderer.empty()) {
+            g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
+            g_cfg.build.prop_map["persist.sys.gpu.gl_renderer"] = g_cfg.gl.gl_renderer;
+        }
         if (!g_cfg.gl.gl_vendor.empty()) {
             g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_vendor"] = g_cfg.gl.gl_vendor;
             g_cfg.build.prop_map["persist.sys.gpu.gl_vendor"] = g_cfg.gl.gl_vendor;
