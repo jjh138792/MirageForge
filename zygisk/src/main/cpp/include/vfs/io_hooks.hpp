@@ -24,8 +24,13 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
 
 inline int open_cloaked_vfs_fd_norm(const std::string &norm) {
     if (norm.empty() || !g_cfg.vfs.enabled) return -1;
-    ErrnoRestorer errno_guard;
+    // 若该节点已由私有 Mount NS 在内核层完成只读 Bind-Mount，直接透传原生 openat，0 memfd 痕迹！
+    if (is_ns_mounted_path(norm)) {
+        emit_probe("VFS_MOUNT_NS", norm, "Served by Kernel Bind-Mount");
+        return -1;
+    }
 
+    ErrnoRestorer errno_guard;
     std::string content;
     int dyn_core_id = -1;
     if (!synthesize_vfs_node_on_demand(norm, &content, &dyn_core_id)) {
@@ -48,25 +53,6 @@ inline int open_cloaked_vfs_fd_norm(const std::string &norm) {
 inline int open_cloaked_vfs_fd(const char *raw_path) {
     if (__builtin_expect(!is_vfs_candidate_prefix(raw_path), 1)) return -1;
     return open_cloaked_vfs_fd_norm(normalize_vfs_path(raw_path));
-}
-
-// 解析 /proc/self/fd/<N> 是否对应 Seccomp 无锁伪装 fd 或常规 g_fd_cloak fd
-inline bool resolve_any_cloaked_proc_fd(const char *pathname, std::string *out_path) {
-    if (g_fd_cloak.resolve_proc_fd_link(pathname, out_path)) {
-        return true;
-    }
-    if (!pathname || std::strncmp(pathname, "/proc/", 6) != 0) return false;
-    const char *fd_seg = std::strstr(pathname, "/fd/");
-    if (!fd_seg) return false;
-    char *endp = nullptr;
-    long fd_num = std::strtol(fd_seg + 4, &endp, 10);
-    if (endp == fd_seg + 4 || *endp != '\0' || fd_num < 0) return false;
-    const char *sec_path = get_seccomp_fd_path(static_cast<int>(fd_num));
-    if (sec_path) {
-        if (out_path) *out_path = sec_path;
-        return true;
-    }
-    return false;
 }
 
 // ============================================================================
@@ -172,23 +158,18 @@ inline FILE *hook_fopen64(const char *pathname, const char *mode) {
 inline int hook_fclose(FILE *fp) {
     if (fp) {
         int fd = fileno(fp);
-        if (fd >= 0) {
-            g_fd_cloak.unregister_fd(fd);
-            clear_seccomp_fd_path(fd);
-        }
+        if (fd >= 0) g_fd_cloak.unregister_fd(fd);
     }
     return orig_fclose ? orig_fclose(fp) : std::fclose(fp);
 }
 
 inline int hook_close(int fd) {
     g_fd_cloak.unregister_fd(fd);
-    clear_seccomp_fd_path(fd);
     return orig_close ? orig_close(fd) : close(fd);
 }
 
 inline int hook_android_fdsan_close_with_tag(int fd, uint64_t tag) {
     g_fd_cloak.unregister_fd(fd);
-    clear_seccomp_fd_path(fd);
     return orig_fdsan_close ? orig_fdsan_close(fd, tag) : (orig_close ? orig_close(fd) : close(fd));
 }
 
@@ -220,9 +201,10 @@ inline off64_t hook_lseek64(int fd, off64_t offset, int whence) {
 inline int hook_access(const char *pathname, int mode) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname), 0)) {
         ScopedHookGuard guard;
-        std::string content;
-        if (guard && synthesize_vfs_node_on_demand(normalize_vfs_path(pathname), &content)) {
-            return 0;
+        std::string norm = normalize_vfs_path(pathname);
+        if (guard && !is_ns_mounted_path(norm)) {
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) return 0;
         }
     }
     return orig_access ? orig_access(pathname, mode) : -1;
@@ -231,9 +213,10 @@ inline int hook_access(const char *pathname, int mode) {
 inline int hook_faccessat(int dirfd, const char *pathname, int mode, int flags) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname) || is_cpufreq_relative_candidate(pathname), 0)) {
         ScopedHookGuard guard;
-        std::string content;
-        if (guard && synthesize_vfs_node_on_demand(resolve_dirfd_path_fast(dirfd, pathname), &content)) {
-            return 0;
+        std::string norm = resolve_dirfd_path_fast(dirfd, pathname);
+        if (guard && !is_ns_mounted_path(norm)) {
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) return 0;
         }
     }
     return orig_faccessat ? orig_faccessat(dirfd, pathname, mode, flags) : -1;
@@ -243,10 +226,12 @@ inline int hook_stat(const char *pathname, struct stat *statbuf) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname), 0)) {
         ScopedHookGuard guard;
         std::string norm = normalize_vfs_path(pathname);
-        std::string content;
-        if (guard && statbuf && synthesize_vfs_node_on_demand(norm, &content)) {
-            populate_virtual_stat(statbuf, norm, content.size());
-            return 0;
+        if (guard && statbuf && !is_ns_mounted_path(norm)) {
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) {
+                populate_virtual_stat(statbuf, norm, content.size());
+                return 0;
+            }
         }
     }
     return orig_stat ? orig_stat(pathname, statbuf) : -1;
@@ -256,10 +241,12 @@ inline int hook_stat64(const char *pathname, struct stat64 *statbuf) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname), 0)) {
         ScopedHookGuard guard;
         std::string norm = normalize_vfs_path(pathname);
-        std::string content;
-        if (guard && statbuf && synthesize_vfs_node_on_demand(norm, &content)) {
-            populate_virtual_stat(statbuf, norm, content.size());
-            return 0;
+        if (guard && statbuf && !is_ns_mounted_path(norm)) {
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) {
+                populate_virtual_stat(statbuf, norm, content.size());
+                return 0;
+            }
         }
     }
     return orig_stat64 ? orig_stat64(pathname, statbuf) : -1;
@@ -277,10 +264,12 @@ inline int hook_fstatat(int dirfd, const char *pathname, struct stat *statbuf, i
     if (__builtin_expect(is_vfs_candidate_prefix(pathname) || is_cpufreq_relative_candidate(pathname), 0)) {
         ScopedHookGuard guard;
         std::string norm = resolve_dirfd_path_fast(dirfd, pathname);
-        std::string content;
-        if (guard && statbuf && synthesize_vfs_node_on_demand(norm, &content)) {
-            populate_virtual_stat(statbuf, norm, content.size());
-            return 0;
+        if (guard && statbuf && !is_ns_mounted_path(norm)) {
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) {
+                populate_virtual_stat(statbuf, norm, content.size());
+                return 0;
+            }
         }
     }
     return orig_fstatat ? orig_fstatat(dirfd, pathname, statbuf, flags) : -1;
@@ -290,10 +279,12 @@ inline int hook_fstatat64(int dirfd, const char *pathname, struct stat64 *statbu
     if (__builtin_expect(is_vfs_candidate_prefix(pathname) || is_cpufreq_relative_candidate(pathname), 0)) {
         ScopedHookGuard guard;
         std::string norm = resolve_dirfd_path_fast(dirfd, pathname);
-        std::string content;
-        if (guard && statbuf && synthesize_vfs_node_on_demand(norm, &content)) {
-            populate_virtual_stat(statbuf, norm, content.size());
-            return 0;
+        if (guard && statbuf && !is_ns_mounted_path(norm)) {
+            std::string content;
+            if (synthesize_vfs_node_on_demand(norm, &content)) {
+                populate_virtual_stat(statbuf, norm, content.size());
+                return 0;
+            }
         }
     }
     return orig_fstatat64 ? orig_fstatat64(dirfd, pathname, statbuf, flags) : -1;
@@ -315,7 +306,7 @@ inline int hook_fstat64(int fd, struct stat64 *statbuf) {
 
 inline ssize_t hook_readlink(const char *pathname, char *buf, size_t bufsiz) {
     std::string cloaked_path;
-    if (__builtin_expect(resolve_any_cloaked_proc_fd(pathname, &cloaked_path), 0) && buf && bufsiz > 0) {
+    if (__builtin_expect(g_fd_cloak.resolve_proc_fd_link(pathname, &cloaked_path), 0) && buf && bufsiz > 0) {
         size_t copy_len = std::min(bufsiz, cloaked_path.size());
         std::memcpy(buf, cloaked_path.data(), copy_len);
         ScopedHookGuard guard;
@@ -327,7 +318,7 @@ inline ssize_t hook_readlink(const char *pathname, char *buf, size_t bufsiz) {
 
 inline ssize_t hook_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
     std::string cloaked_path;
-    if (__builtin_expect(resolve_any_cloaked_proc_fd(pathname, &cloaked_path), 0) && buf && bufsiz > 0) {
+    if (__builtin_expect(g_fd_cloak.resolve_proc_fd_link(pathname, &cloaked_path), 0) && buf && bufsiz > 0) {
         size_t copy_len = std::min(bufsiz, cloaked_path.size());
         std::memcpy(buf, cloaked_path.data(), copy_len);
         ScopedHookGuard guard;

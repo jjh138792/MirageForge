@@ -4,11 +4,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <atomic>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-#include <signal.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
@@ -23,6 +23,24 @@
 #endif
 
 namespace mirage {
+
+// Companion 控制通道协议指令 (App postAppSpecialize <-> Root Companion)
+constexpr uint8_t CMD_MOUNT_NS        = 0x01;
+constexpr uint8_t CMD_USER_NOTIF      = 0x02;
+constexpr uint8_t CMD_DONE_ENTER_SINK = 0x03;
+
+// Companion 控制通道与双引擎运行状态
+inline int g_companion_ctrl_fd = -1;
+inline std::atomic<bool> g_seccomp_active{false};
+inline std::atomic<bool> g_vfs_ns_mounted{false};
+inline std::unordered_set<std::string> g_ns_mounted_paths;
+
+inline bool is_ns_mounted_path(const std::string &norm) noexcept {
+    if (__builtin_expect(!g_vfs_ns_mounted.load(std::memory_order_acquire), 1)) {
+        return false;
+    }
+    return g_ns_mounted_paths.find(norm) != g_ns_mounted_paths.end();
+}
 
 // 原始 Bionic I/O & 系统信息函数指针
 inline int (*orig_open)(const char *pathname, int flags, mode_t mode) = nullptr;
@@ -57,33 +75,6 @@ inline FILE *(*orig_popen)(const char *command, const char *type) = nullptr;
 inline int (*orig_uname)(struct utsname *buf) = nullptr;
 inline int (*orig_sysinfo)(struct sysinfo *info) = nullptr;
 inline long (*orig_sysconf)(int name) = nullptr;
-inline int (*orig_sigaction)(int signum, const struct sigaction *act, struct sigaction *oldact) = nullptr;
-
-// Seccomp 状态与无锁静态 FD 伪装表（供 SIGSYS 内 0 malloc 追踪 memfd 路径）
-inline std::atomic<bool> g_seccomp_active{false};
-inline constexpr int kSeccompFdTableSize = 4096;
-inline std::atomic<const char *> g_seccomp_fd_paths[kSeccompFdTableSize]{};
-
-inline void set_seccomp_fd_path(int fd, const char *static_path) noexcept {
-    if (fd >= 0 && fd < kSeccompFdTableSize) {
-        g_seccomp_fd_paths[fd].store(static_path, std::memory_order_release);
-    }
-}
-
-inline void clear_seccomp_fd_path(int fd) noexcept {
-    if (fd >= 0 && fd < kSeccompFdTableSize) {
-        if (__builtin_expect(g_seccomp_fd_paths[fd].load(std::memory_order_relaxed) != nullptr, 0)) {
-            g_seccomp_fd_paths[fd].store(nullptr, std::memory_order_release);
-        }
-    }
-}
-
-inline const char *get_seccomp_fd_path(int fd) noexcept {
-    if (fd >= 0 && fd < kSeccompFdTableSize) {
-        return g_seccomp_fd_paths[fd].load(std::memory_order_acquire);
-    }
-    return nullptr;
-}
 
 inline void init_vfs_symbols() {
     if (orig_openat) return;
@@ -120,7 +111,6 @@ inline void init_vfs_symbols() {
     orig_uname = reinterpret_cast<decltype(orig_uname)>(dlsym(RTLD_DEFAULT, "uname"));
     orig_sysinfo = reinterpret_cast<decltype(orig_sysinfo)>(dlsym(RTLD_DEFAULT, "sysinfo"));
     orig_sysconf = reinterpret_cast<decltype(orig_sysconf)>(dlsym(RTLD_DEFAULT, "sysconf"));
-    orig_sigaction = reinterpret_cast<decltype(orig_sigaction)>(dlsym(RTLD_DEFAULT, "sigaction"));
 }
 
 inline bool is_vfs_candidate_prefix(const char *p) noexcept {
@@ -133,6 +123,31 @@ inline bool is_cpufreq_relative_candidate(const char *rel) noexcept {
     if (!rel || rel[0] == '/' || rel[0] == '.') return false;
     char c = rel[0];
     return (c == 's' || c == 'c' || c == 'o' || c == 'r' || c == 'a' || c == 't' || c == 'm' || c == 'p');
+}
+
+inline bool is_proc_status_path_raw(const char *p) noexcept {
+    if (!p || std::strncmp(p, "/proc/", 6) != 0) return false;
+    const char *s = p + 6;
+    if (std::strcmp(s, "self/status") == 0 || std::strcmp(s, "thread-self/status") == 0) {
+        return true;
+    }
+    if (std::strncmp(s, "self/task/", 10) == 0) {
+        const char *t = s + 10;
+        if (*t < '0' || *t > '9') return false;
+        while (*t >= '0' && *t <= '9') ++t;
+        return std::strcmp(t, "/status") == 0;
+    }
+    if (*s >= '0' && *s <= '9') {
+        while (*s >= '0' && *s <= '9') ++s;
+        if (std::strcmp(s, "/status") == 0) return true;
+        if (std::strncmp(s, "/task/", 6) == 0) {
+            const char *t = s + 6;
+            if (*t < '0' || *t > '9') return false;
+            while (*t >= '0' && *t <= '9') ++t;
+            return std::strcmp(t, "/status") == 0;
+        }
+    }
+    return false;
 }
 
 inline std::string normalize_vfs_path(const char *raw_path) {
@@ -172,32 +187,6 @@ inline std::string resolve_dirfd_path_fast(int dirfd, const char *pathname) {
 
     std::string combined = std::string(link_target) + "/" + pathname;
     return normalize_vfs_path(combined.c_str());
-}
-
-// 零堆分配判定是否为当前进程/线程的 /proc/*/status（供 PLT 与 SIGSYS 双通道共用）
-inline bool is_proc_status_path_raw(const char *p) noexcept {
-    if (!p || std::strncmp(p, "/proc/", 6) != 0) return false;
-    const char *s = p + 6;
-    if (std::strcmp(s, "self/status") == 0 || std::strcmp(s, "thread-self/status") == 0) {
-        return true;
-    }
-    if (std::strncmp(s, "self/task/", 10) == 0) {
-        const char *t = s + 10;
-        if (*t < '0' || *t > '9') return false;
-        while (*t >= '0' && *t <= '9') ++t;
-        return std::strcmp(t, "/status") == 0;
-    }
-    if (*s >= '0' && *s <= '9') {
-        while (*s >= '0' && *s <= '9') ++s;
-        if (std::strcmp(s, "/status") == 0) return true;
-        if (std::strncmp(s, "/task/", 6) == 0) {
-            const char *t = s + 6;
-            if (*t < '0' || *t > '9') return false;
-            while (*t >= '0' && *t <= '9') ++t;
-            return std::strcmp(t, "/status") == 0;
-        }
-    }
-    return false;
 }
 
 } // namespace mirage

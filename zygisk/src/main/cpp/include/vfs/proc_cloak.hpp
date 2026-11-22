@@ -9,15 +9,24 @@
 
 namespace mirage {
 
-inline bool is_sensitive_proc_line(const char *line) noexcept {
-    return std::strstr(line, "mirage_forge") != nullptr ||
-           std::strstr(line, "zygisk") != nullptr ||
-           std::strstr(line, "magisk") != nullptr ||
-           std::strstr(line, "/data/adb") != nullptr ||
-           std::strstr(line, "kernelsu") != nullptr ||
-           std::strstr(line, "/memfd:") != nullptr ||
-           std::strstr(line, "apatch") != nullptr ||
-           std::strstr(line, "lsposed") != nullptr;
+inline bool is_sensitive_proc_line(const char *line, bool is_mounts) noexcept {
+    if (std::strstr(line, "mirage_forge") != nullptr ||
+        std::strstr(line, "zygisk") != nullptr ||
+        std::strstr(line, "magisk") != nullptr ||
+        std::strstr(line, "/data/adb") != nullptr ||
+        std::strstr(line, "kernelsu") != nullptr ||
+        std::strstr(line, "/memfd:") != nullptr ||
+        std::strstr(line, "apatch") != nullptr ||
+        std::strstr(line, "lsposed") != nullptr) {
+        return true;
+    }
+    // 隐藏私有 Mount NS 挂载到 /proc/* 或 /sys/* 的匿名 tmpfs 绑定项
+    if (is_mounts && g_vfs_ns_mounted.load(std::memory_order_acquire) &&
+        std::strstr(line, "tmpfs") != nullptr &&
+        (std::strstr(line, " /proc/") != nullptr || std::strstr(line, " /sys/") != nullptr)) {
+        return true;
+    }
+    return false;
 }
 
 inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *out_clean) {
@@ -29,8 +38,6 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
                       norm_path == "/proc/mounts");
     bool is_status = g_seccomp_active.load(std::memory_order_acquire) &&
                      is_proc_status_path_raw(norm_path.c_str());
-                     (norm_path == "/proc/self/status" ||
-                      norm_path == "/proc/thread-self/status");
 
     if (!is_maps && !is_mounts && !is_status) return false;
 
@@ -43,7 +50,6 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
 
     while (std::fgets(line, sizeof(line), real_fp)) {
         if (is_status) {
-            // 隐匿本模块附加的 1 层 Seccomp BPF 过滤器，将 Seccomp_filters: 2 还原为 Zygote 原生值 1
             if (std::strncmp(line, "Seccomp_filters:", 16) == 0) {
                 char *p = line + 16;
                 while (*p == ' ' || *p == '\t') ++p;
@@ -57,7 +63,7 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
             clean_ss << line;
             continue;
         }
-        if (is_sensitive_proc_line(line)) {
+        if (is_sensitive_proc_line(line, is_mounts)) {
             ++stripped;
             continue;
         }

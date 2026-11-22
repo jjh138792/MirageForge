@@ -96,8 +96,9 @@ public:
             }
         }
 
-        uint8_t sink_ready = 0;
-        read_full(fd, &sink_ready, sizeof(sink_ready));
+        // ctrl_ready != 0 表示 Root Companion 已建立两阶段控制/探针通道
+        uint8_t ctrl_ready = 0;
+        read_full(fd, &ctrl_ready, sizeof(ctrl_ready));
 
         load_modular_config(raw_kvs);
         for (auto &kv : raw_kvs) {
@@ -112,17 +113,14 @@ public:
             return;
         }
 
-        if (g_cfg.probe.enabled && sink_ready == 1) {
+        if ((g_cfg.vfs.enabled || g_cfg.probe.enabled) && ctrl_ready == 1) {
             api->exemptFd(fd);
-            g_probe_log_fd = fd;
+            g_companion_ctrl_fd = fd;
         } else {
             close(fd);
         }
 
         init_linker_symbols();
-
-        // 严格子模块 0 改动隔离：
-        // 仅当 build 或 probe 开启时才解析 Bionic 属性符号；仅当 build 开启时才构建属性区与执行反射
         if (g_cfg.build.enabled || g_cfg.probe.enabled) {
             init_bionic_prop_symbols();
         }
@@ -150,6 +148,7 @@ public:
     void postAppSpecialize(const AppSpecializeArgs *) override {
         if (!g_cfg.active) return;
         g_post_specialized.store(true, std::memory_order_release);
+
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
             g_cfg.build.wipe_volatile_reflection_maps();
@@ -158,10 +157,43 @@ public:
             dlopen("libhardware.so", RTLD_NOW);
             dlopen("libvulkan.so", RTLD_NOW);
         }
-        scan_and_commit_plt_hooks();
-        if (g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {
-            install_on_demand_seccomp_bpf();
+
+        // Phase 1：经由 Root 控制通道执行私有 Mount NS 内核挂载与进程外 SECCOMP_RET_USER_NOTIF
+        uint32_t ns_mounted_cnt = 0;
+        bool unotif_ok = false;
+
+        if (g_companion_ctrl_fd >= 0) {
+            if (g_cfg.vfs.enabled) {
+                ns_mounted_cnt = request_private_mount_ns_spoof(g_companion_ctrl_fd);
+            }
+            if (g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {
+                unotif_ok = install_seccomp_user_notif_client(g_companion_ctrl_fd);
+            }
+
+            // Phase 2：通知 Companion 结束控制握手；若开启探针则转为日志通道，否则立即关闭 FD（0 句柄残留）
+            uint8_t done_cmd = CMD_DONE_ENTER_SINK;
+            write_full(g_companion_ctrl_fd, &done_cmd, sizeof(done_cmd));
+
+            if (g_cfg.probe.enabled) {
+                g_probe_log_fd = g_companion_ctrl_fd;
+            } else {
+                if (orig_close) orig_close(g_companion_ctrl_fd); else close(g_companion_ctrl_fd);
+            }
+            g_companion_ctrl_fd = -1;
         }
+
+        if (g_cfg.probe.enabled) {
+            if (ns_mounted_cnt > 0) {
+                emit_probe("VFS_MOUNT_NS", "PrivateMountNS_Active",
+                           "BindMounted=" + std::to_string(ns_mounted_cnt) + " nodes (0 memfd)");
+            }
+            if (unotif_ok) {
+                emit_probe("SECCOMP_UNOTIF", "OutOfProcess_Arbiter",
+                           "Active (uname/sysinfo, 0 SIGSYS, 0 openat trap)");
+            }
+        }
+
+        scan_and_commit_plt_hooks();
     }
 
     void preServerSpecialize(ServerSpecializeArgs *) override {
@@ -280,7 +312,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程（含真实死亡核验崩溃日志落盘）
+// Root Companion 守护进程（两阶段会话线程：VFS/USER_NOTIF 控制 -> 探针与死亡核验）
 // ============================================================================
 static std::mutex g_file_write_mtx;
 
@@ -295,8 +327,57 @@ static void append_line_as_root(const char *path, const std::string &line) {
     chmod(path, 0600);
 }
 
-static void *companion_log_sink_thread(void *arg) {
-    int sock_fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+struct CompanionSessionCtx {
+    int sock_fd;
+    bool probe_enabled;
+};
+
+static void *companion_session_thread(void *arg) {
+    auto *sctx = static_cast<CompanionSessionCtx *>(arg);
+    if (!sctx) return nullptr;
+    int sock_fd = sctx->sock_fd;
+    bool probe_enabled = sctx->probe_enabled;
+    delete sctx;
+
+    // Phase 1：接收 postAppSpecialize 控制指令 (Mount NS / USER_NOTIF)
+    bool entered_sink = false;
+    while (true) {
+        uint8_t cmd = 0;
+        int recv_fd = -1;
+        if (!recv_cmd_maybe_fd(sock_fd, &cmd, &recv_fd)) {
+            if (recv_fd >= 0) close(recv_fd);
+            close(sock_fd);
+            return nullptr;
+        }
+
+        if (cmd == CMD_MOUNT_NS) {
+            if (recv_fd >= 0) close(recv_fd);
+            if (!companion_handle_mount_ns_cmd(sock_fd)) {
+                close(sock_fd);
+                return nullptr;
+            }
+        } else if (cmd == CMD_USER_NOTIF) {
+            if (!companion_handle_user_notif_cmd(sock_fd, recv_fd)) {
+                close(sock_fd);
+                return nullptr;
+            }
+        } else if (cmd == CMD_DONE_ENTER_SINK) {
+            if (recv_fd >= 0) close(recv_fd);
+            entered_sink = true;
+            break;
+        } else {
+            if (recv_fd >= 0) close(recv_fd);
+            close(sock_fd);
+            return nullptr;
+        }
+    }
+
+    if (!entered_sink || !probe_enabled) {
+        close(sock_fd);
+        return nullptr;
+    }
+
+    // Phase 2：探针日志接收 + [PENDING_CRASH] 进程真实死亡核验
     std::string pending;
     std::string pending_crash_line;
     std::time_t pending_crash_ts = 0;
@@ -307,7 +388,6 @@ static void *companion_log_sink_thread(void *arg) {
         std::time_t now = std::time(nullptr);
 
         if (line.rfind("[PENDING_CRASH]", 0) == 0) {
-            // 暂存待核验崩溃信号；若同一死亡窗口内已捕获首个致命信号则保留第一现场
             if (pending_crash_line.empty() || (now - pending_crash_ts) > 8) {
                 pending_crash_line = "[CRASH]" + line.substr(15);
                 pending_crash_ts = now;
@@ -318,8 +398,6 @@ static void *companion_log_sink_thread(void *arg) {
             append_line_as_root(CRASH_LOG_PATH, line);
             return;
         }
-
-        // 收到后续正常探针且距离上次信号已超过 1 秒 -> 证明进程安然存活，自动作废该非致命信号
         if (!pending_crash_line.empty() && (now - pending_crash_ts) >= 2) {
             pending_crash_line.clear();
             pending_crash_ts = 0;
@@ -350,7 +428,6 @@ static void *companion_log_sink_thread(void *arg) {
         process_line(pending);
     }
 
-    // Socket 断开 (EOF)：仅当进程在捕获致命信号后的 8 秒窗口内真正退出，才确认为真实崩溃并落盘！
     if (!pending_crash_line.empty()) {
         std::time_t now = std::time(nullptr);
         if (now >= pending_crash_ts && (now - pending_crash_ts) <= 8) {
@@ -451,13 +528,12 @@ static void companion_handler(int fd) {
     }
 
     const auto &entries = it->second;
-    bool any_enabled =
-        (entries.count("META:ENABLE_BUILD") && entries.at("META:ENABLE_BUILD") == "1") ||
-        (entries.count("META:ENABLE_GL")    && entries.at("META:ENABLE_GL") == "1")    ||
-        (entries.count("META:ENABLE_VFS")   && entries.at("META:ENABLE_VFS") == "1")   ||
-        (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
+    bool build_on = (entries.count("META:ENABLE_BUILD") && entries.at("META:ENABLE_BUILD") == "1");
+    bool gl_on    = (entries.count("META:ENABLE_GL")    && entries.at("META:ENABLE_GL") == "1");
+    bool vfs_on   = (entries.count("META:ENABLE_VFS")   && entries.at("META:ENABLE_VFS") == "1");
+    bool probe_on = (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
 
-    if (!any_enabled) {
+    if (!build_on && !gl_on && !vfs_on && !probe_on) {
         uint8_t zero = 0;
         write_full(fd, &zero, sizeof(zero));
         return;
@@ -477,25 +553,27 @@ static void companion_handler(int fd) {
     std::string gpu   = entries.count("GLES:RENDERER") ? entries.at("GLES:RENDERER") : "DefaultGPU";
     int ram_gb        = entries.count("VFS:RAM_GB") ? std::atoi(entries.at("VFS:RAM_GB").c_str()) : 16;
 
-    bool probe_enabled = (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
-    if (probe_enabled) {
+    if (probe_on) {
         mkdir(DATA_ROOT_DIR, 0700);
         append_line_as_root(
             PROBE_LOG_PATH,
             "[PROBE][" + pkg_name + "][SESSION] MirageForge_v" + g_companion_cache.cached_version +
                 "_Attached => " + model + " | " + gpu + " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
         );
+    }
 
-        int sink_fd = dup(fd);
-        if (sink_fd >= 0) {
+    if (vfs_on || probe_on) {
+        int sess_fd = dup(fd);
+        if (sess_fd >= 0) {
+            auto *sctx = new CompanionSessionCtx{sess_fd, probe_on};
             pthread_t tid;
-            if (pthread_create(&tid, nullptr, companion_log_sink_thread,
-                               reinterpret_cast<void *>(static_cast<intptr_t>(sink_fd))) == 0) {
+            if (pthread_create(&tid, nullptr, companion_session_thread, sctx) == 0) {
                 pthread_detach(tid);
                 uint8_t ready = 1;
                 write_full(fd, &ready, sizeof(ready));
             } else {
-                close(sink_fd);
+                close(sess_fd);
+                delete sctx;
                 uint8_t no_ready = 0;
                 write_full(fd, &no_ready, sizeof(no_ready));
             }

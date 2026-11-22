@@ -69,8 +69,10 @@ inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) no
 inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
     if (path[0] != '/') return false;
 
+    // 豁免本模块自身、/data/adb 与反篡改核心虚拟机 (libpairipcore.so)，防止触发 GOT 完整性哈希自毁
     if (std::strstr(path, "mirage_forge") != nullptr ||
-        std::strncmp(path, "/data/adb/", 10) == 0) {
+        std::strncmp(path, "/data/adb/", 10) == 0 ||
+        std::strstr(path, "libpairipcore") != nullptr) {
         return false;
     }
 
@@ -189,10 +191,6 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
         if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
         if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
         if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
-        if (g_cfg.vfs.enable_seccomp &&
-            (std::strcmp(symbol, "sigaction") == 0 || std::strcmp(symbol, "sigaction64") == 0)) {
-            return reinterpret_cast<void *>(hook_sigaction);
-        }
     }
 
     return real_sym;
@@ -200,6 +198,7 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
 
 inline bool should_rescan_on_dlopen(const char *filename) noexcept {
     if (!filename) return false;
+    if (std::strstr(filename, "libpairipcore") != nullptr) return false;
     if (std::strstr(filename, "vulkan") != nullptr) return true;
     if (std::strncmp(filename, "/system/", 8) == 0 ||
         std::strncmp(filename, "/apex/", 6) == 0 ||
@@ -310,6 +309,9 @@ inline void scan_and_commit_plt_hooks() {
             reg("__system_property_foreach", reinterpret_cast<void *>(hook_system_property_foreach), reinterpret_cast<void **>(&orig_system_property_foreach));
             reg("__system_property_find_nth", reinterpret_cast<void *>(hook_system_property_find_nth), reinterpret_cast<void **>(&orig_system_property_find_nth));
         }
+        if (g_cfg.build.enabled) {
+            reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
+        }
 
         if (g_cfg.vfs.enabled) {
             reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
@@ -342,13 +344,6 @@ inline void scan_and_commit_plt_hooks() {
             reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo));
             reg("sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf));
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
-
-            if (g_cfg.vfs.enable_seccomp) {
-                reg("sigaction", reinterpret_cast<void *>(hook_sigaction), reinterpret_cast<void **>(&orig_sigaction));
-#if defined(__aarch64__)
-                reg("sigaction64", reinterpret_cast<void *>(hook_sigaction), reinterpret_cast<void **>(&orig_sigaction));
-#endif
-            }
         }
 
         if (g_cfg.gl.enabled) {
