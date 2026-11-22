@@ -91,7 +91,7 @@ export interface AppRoute {
   probe: boolean;
   sdkSpoof: boolean;
   refreshRate: number;
-  seccomp: boolean;
+  mountNs: boolean;
 }
 
 export interface ProbeEvent {
@@ -766,7 +766,7 @@ function compileModularConfInTs(rawTpl: DeviceTemplate, route: AppRoute): string
   push('META:ENABLE_VFS', route.vfs ? '1' : '0');
   push('META:ENABLE_PROBE', route.probe ? '1' : '0');
   push('META:FORCE_SPOOF_SDK', route.sdkSpoof ? '1' : '0');
-  push('META:ENABLE_SECCOMP', route.vfs && route.seccomp ? '1' : '0');
+  push('META:ENABLE_MOUNT_NS', route.vfs && route.mountNs ? '1' : '0');
   if (route.gl && effectiveFps >= 90) {
     push('META:REFRESH_RATE', effectiveFps);
   }
@@ -980,7 +980,7 @@ async function flushStateZeroFork() {
     const confText = compileModularConfInTs(tpl, r);
     await writeFileZeroFork(`${APPS_DIR_PATH}/${pkg}.conf`, confText);
     rLines.push(
-      `${pkg}|${r.tplId}|${r.build ? 1 : 0}|${r.gl ? 1 : 0}|${r.vfs ? 1 : 0}|${r.probe ? 1 : 0}|${r.sdkSpoof ? 1 : 0}|${r.refreshRate}|${r.seccomp ? 1 : 0}`
+      `${pkg}|${r.tplId}|${r.build ? 1 : 0}|${r.gl ? 1 : 0}|${r.vfs ? 1 : 0}|${r.probe ? 1 : 0}|${r.sdkSpoof ? 1 : 0}|${r.refreshRate}|${r.mountNs ? 1 : 0}`
     );
   }
   await writeFileZeroFork(ROUTES_DB_FILE, rLines.join('\n') + '\n');
@@ -1023,7 +1023,7 @@ function normalizeLoadedRoutes(rawRoutes: Record<string, any>): Record<string, A
       probe: Boolean(r.probe),
       sdkSpoof: Boolean(r.sdkSpoof),
       refreshRate: sanitizeRefreshRate(r.refreshRate),
-      seccomp: Boolean(r.seccomp),
+      mountNs: Boolean(r.mountNs),
     };
   }
   return out;
@@ -1159,7 +1159,7 @@ export async function updateAppRouteViaCli(
     await execRootShell(`"${CLI_BIN}" route remove "${pkg}" ${restart ? '--restart' : ''}`);
   } else {
     const fps = sanitizeRefreshRate(route.refreshRate);
-    const cmd = `"${CLI_BIN}" route set "${pkg}" "${route.tplId}" --build ${route.build ? 1 : 0} --gl ${route.gl ? 1 : 0} --vfs ${route.vfs ? 1 : 0} --probe ${route.probe ? 1 : 0} --sdk ${route.sdkSpoof ? 1 : 0} --fps ${fps} --seccomp ${route.seccomp ? 1 : 0} ${restart ? '--restart' : ''}`;
+    const cmd = `"${CLI_BIN}" route set "${pkg}" "${route.tplId}" --build ${route.build ? 1 : 0} --gl ${route.gl ? 1 : 0} --vfs ${route.vfs ? 1 : 0} --probe ${route.probe ? 1 : 0} --sdk ${route.sdkSpoof ? 1 : 0} --fps ${fps} --mount-ns ${route.mountNs ? 1 : 0} ${restart ? '--restart' : ''}`;
     await execRootShell(cmd);
   }
   await syncStateFromRustCli();

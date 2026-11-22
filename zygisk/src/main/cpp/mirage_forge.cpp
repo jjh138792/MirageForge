@@ -96,7 +96,6 @@ public:
             }
         }
 
-        // ctrl_ready != 0 表示 Root Companion 已建立两阶段控制/探针通道
         uint8_t ctrl_ready = 0;
         read_full(fd, &ctrl_ready, sizeof(ctrl_ready));
 
@@ -113,7 +112,9 @@ public:
             return;
         }
 
-        if ((g_cfg.vfs.enabled || g_cfg.probe.enabled) && ctrl_ready == 1) {
+        // 严格 0 改动：仅在开启 MountNS 引擎或开启探针时才保留控制通道 FD
+        bool need_ctrl = (g_cfg.vfs.enabled && g_cfg.vfs.enable_mount_ns) || g_cfg.probe.enabled;
+        if (need_ctrl && ctrl_ready == 1) {
             api->exemptFd(fd);
             g_companion_ctrl_fd = fd;
         } else {
@@ -158,19 +159,16 @@ public:
             dlopen("libvulkan.so", RTLD_NOW);
         }
 
-        // Phase 1：经由 Root 控制通道执行私有 Mount NS 内核挂载与进程外 SECCOMP_RET_USER_NOTIF
+        // Phase 1：仅在用户明确开启 MountNS 开关时执行私有 Mount NS 内核挂载；否则走传统 PLT 引擎
         uint32_t ns_mounted_cnt = 0;
-        bool unotif_ok = false;
+        std::string ns_diag;
+        bool want_mount_ns = (g_cfg.vfs.enabled && g_cfg.vfs.enable_mount_ns);
 
         if (g_companion_ctrl_fd >= 0) {
-            if (g_cfg.vfs.enabled) {
-                ns_mounted_cnt = request_private_mount_ns_spoof(g_companion_ctrl_fd);
-            }
-            if (g_cfg.vfs.enabled && g_cfg.vfs.enable_seccomp) {
-                unotif_ok = install_seccomp_user_notif_client(g_companion_ctrl_fd);
+            if (want_mount_ns) {
+                ns_mounted_cnt = request_private_mount_ns_spoof(g_companion_ctrl_fd, &ns_diag);
             }
 
-            // Phase 2：通知 Companion 结束控制握手；若开启探针则转为日志通道，否则立即关闭 FD（0 句柄残留）
             uint8_t done_cmd = CMD_DONE_ENTER_SINK;
             write_full(g_companion_ctrl_fd, &done_cmd, sizeof(done_cmd));
 
@@ -182,15 +180,10 @@ public:
             g_companion_ctrl_fd = -1;
         }
 
-        if (g_cfg.probe.enabled) {
-            if (ns_mounted_cnt > 0) {
-                emit_probe("VFS_MOUNT_NS", "PrivateMountNS_Active",
-                           "BindMounted=" + std::to_string(ns_mounted_cnt) + " nodes (0 memfd)");
-            }
-            if (unotif_ok) {
-                emit_probe("SECCOMP_UNOTIF", "OutOfProcess_Arbiter",
-                           "Active (uname/sysinfo, 0 SIGSYS, 0 openat trap)");
-            }
+        if (g_cfg.probe.enabled && want_mount_ns) {
+            emit_probe("VFS_MOUNT_NS",
+                       ns_mounted_cnt > 0 ? "PrivateMountNS_Active" : "PrivateMountNS_Fallback",
+                       ns_diag.empty() ? "no_ctrl_channel" : ns_diag);
         }
 
         scan_and_commit_plt_hooks();
@@ -214,7 +207,7 @@ private:
             else if (k == "META:ENABLE_PROBE")    g_cfg.probe.enabled = (v == "1");
             else if (k == "META:FORCE_SPOOF_SDK") g_cfg.build.force_spoof_sdk = (v == "1");
             else if (k == "META:REFRESH_RATE")    g_cfg.gl.max_refresh_rate = std::atoi(v.c_str());
-            else if (k == "META:ENABLE_SECCOMP")  g_cfg.vfs.enable_seccomp = (v == "1");
+            else if (k == "META:ENABLE_MOUNT_NS") g_cfg.vfs.enable_mount_ns = (v == "1");
         }
 
         for (const auto &kv : raw_kvs) {
@@ -312,7 +305,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程（两阶段会话线程：VFS/USER_NOTIF 控制 -> 探针与死亡核验）
+// Root Companion 守护进程（两阶段会话线程：Mount NS 控制 -> 探针与死亡核验）
 // ============================================================================
 static std::mutex g_file_write_mtx;
 
@@ -339,34 +332,24 @@ static void *companion_session_thread(void *arg) {
     bool probe_enabled = sctx->probe_enabled;
     delete sctx;
 
-    // Phase 1：接收 postAppSpecialize 控制指令 (Mount NS / USER_NOTIF)
+    // Phase 1：接收 postAppSpecialize 控制指令 (Mount NS)
     bool entered_sink = false;
     while (true) {
         uint8_t cmd = 0;
-        int recv_fd = -1;
-        if (!recv_cmd_maybe_fd(sock_fd, &cmd, &recv_fd)) {
-            if (recv_fd >= 0) close(recv_fd);
+        if (!read_full(sock_fd, &cmd, sizeof(cmd))) {
             close(sock_fd);
             return nullptr;
         }
 
         if (cmd == CMD_MOUNT_NS) {
-            if (recv_fd >= 0) close(recv_fd);
             if (!companion_handle_mount_ns_cmd(sock_fd)) {
                 close(sock_fd);
                 return nullptr;
             }
-        } else if (cmd == CMD_USER_NOTIF) {
-            if (!companion_handle_user_notif_cmd(sock_fd, recv_fd)) {
-                close(sock_fd);
-                return nullptr;
-            }
         } else if (cmd == CMD_DONE_ENTER_SINK) {
-            if (recv_fd >= 0) close(recv_fd);
             entered_sink = true;
             break;
         } else {
-            if (recv_fd >= 0) close(recv_fd);
             close(sock_fd);
             return nullptr;
         }
@@ -528,10 +511,11 @@ static void companion_handler(int fd) {
     }
 
     const auto &entries = it->second;
-    bool build_on = (entries.count("META:ENABLE_BUILD") && entries.at("META:ENABLE_BUILD") == "1");
-    bool gl_on    = (entries.count("META:ENABLE_GL")    && entries.at("META:ENABLE_GL") == "1");
-    bool vfs_on   = (entries.count("META:ENABLE_VFS")   && entries.at("META:ENABLE_VFS") == "1");
-    bool probe_on = (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
+    bool build_on    = (entries.count("META:ENABLE_BUILD")    && entries.at("META:ENABLE_BUILD") == "1");
+    bool gl_on       = (entries.count("META:ENABLE_GL")       && entries.at("META:ENABLE_GL") == "1");
+    bool vfs_on      = (entries.count("META:ENABLE_VFS")      && entries.at("META:ENABLE_VFS") == "1");
+    bool probe_on    = (entries.count("META:ENABLE_PROBE")    && entries.at("META:ENABLE_PROBE") == "1");
+    bool mount_ns_on = vfs_on && (entries.count("META:ENABLE_MOUNT_NS") && entries.at("META:ENABLE_MOUNT_NS") == "1");
 
     if (!build_on && !gl_on && !vfs_on && !probe_on) {
         uint8_t zero = 0;
@@ -562,7 +546,7 @@ static void companion_handler(int fd) {
         );
     }
 
-    if (vfs_on || probe_on) {
+    if (mount_ns_on || probe_on) {
         int sess_fd = dup(fd);
         if (sess_fd >= 0) {
             auto *sctx = new CompanionSessionCtx{sess_fd, probe_on};

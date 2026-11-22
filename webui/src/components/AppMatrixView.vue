@@ -45,14 +45,14 @@ async function handleTemplateChange(pkg: string, tplId: string) {
     probe: existing ? existing.probe : false,
     sdkSpoof: existing ? existing.sdkSpoof : false,
     refreshRate: existing ? sanitizeRefreshRate(existing.refreshRate) : 0,
-    seccomp: existing ? Boolean(existing.seccomp) : false,
+    mountNs: existing ? Boolean(existing.mountNs) : false,
   };
   await updateAppRouteViaCli(pkg, nextRoute, false);
 }
 
 async function toggleModuleSwitch(
   pkg: string,
-  field: 'build' | 'gl' | 'vfs' | 'probe' | 'sdkSpoof' | 'seccomp'
+  field: 'build' | 'gl' | 'vfs' | 'probe' | 'sdkSpoof' | 'mountNs'
 ) {
   triggerHaptic('light');
   const cur = mirageStore.appRoutes[pkg];
@@ -61,11 +61,12 @@ async function toggleModuleSwitch(
     ...cur,
     [field]: !cur[field],
   };
-  if (field === 'seccomp' && next.seccomp) {
+  if (field === 'mountNs' && next.mountNs) {
     next.vfs = true;
   } else if (field === 'vfs' && !next.vfs) {
-    next.seccomp = false;
+    next.mountNs = false;
   }
+
   await updateAppRouteViaCli(pkg, next, false);
 }
 
@@ -207,12 +208,12 @@ async function toggleSystemApps() {
               🛡️ {{ t('apps.swVfs') }}
             </span>
             <span
-              class="mod-pill seccomp tactile-press"
-              :class="{ on: mirageStore.appRoutes[app.packageName].seccomp }"
-              @click="toggleModuleSwitch(app.packageName, 'seccomp')"
+              class="mod-pill mountNs tactile-press"
+              :class="{ on: mirageStore.appRoutes[app.packageName].mountNs }"
+              @click="toggleModuleSwitch(app.packageName, 'mountNs')"
             >
               <Lock :size="12" />
-              <span>{{ t('apps.swSeccomp') }}</span>
+              <span>{{ t('apps.swMountNs') }}</span>
             </span>
             <span
               class="mod-pill probe tactile-press"
@@ -403,7 +404,7 @@ async function toggleSystemApps() {
   border-color: rgba(6, 182, 212, 0.42);
 }
 
-.mod-pill.seccomp.on {
+.mod-pill.mountNs.on {
   background: rgba(139, 92, 246, 0.22);
   color: var(--accent-primary);
   border-color: rgba(139, 92, 246, 0.48);

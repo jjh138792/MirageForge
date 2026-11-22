@@ -11,6 +11,7 @@ namespace mirage {
 
 inline bool is_sensitive_proc_line(const char *line, bool is_mounts) noexcept {
     if (std::strstr(line, "mirage_forge") != nullptr ||
+        std::strstr(line, "mnt_stage") != nullptr ||
         std::strstr(line, "zygisk") != nullptr ||
         std::strstr(line, "magisk") != nullptr ||
         std::strstr(line, "/data/adb") != nullptr ||
@@ -20,10 +21,9 @@ inline bool is_sensitive_proc_line(const char *line, bool is_mounts) noexcept {
         std::strstr(line, "lsposed") != nullptr) {
         return true;
     }
-    // 隐藏私有 Mount NS 挂载到 /proc/* 或 /sys/* 的匿名 tmpfs 绑定项
     if (is_mounts && g_vfs_ns_mounted.load(std::memory_order_acquire) &&
-        std::strstr(line, "tmpfs") != nullptr &&
-        (std::strstr(line, " /proc/") != nullptr || std::strstr(line, " /sys/") != nullptr)) {
+        (std::strstr(line, " /proc/") != nullptr || std::strstr(line, " /sys/") != nullptr) &&
+        (std::strstr(line, "tmpfs") != nullptr || std::strstr(line, "//deleted") != nullptr)) {
         return true;
     }
     return false;
@@ -36,10 +36,8 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
     bool is_mounts = (norm_path == "/proc/self/mountinfo" ||
                       norm_path == "/proc/self/mounts" ||
                       norm_path == "/proc/mounts");
-    bool is_status = g_seccomp_active.load(std::memory_order_acquire) &&
-                     is_proc_status_path_raw(norm_path.c_str());
 
-    if (!is_maps && !is_mounts && !is_status) return false;
+    if (!is_maps && !is_mounts) return false;
 
     FILE *real_fp = orig_fopen ? orig_fopen(norm_path.c_str(), "r") : nullptr;
     if (!real_fp) return false;
@@ -49,20 +47,6 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
     size_t stripped = 0;
 
     while (std::fgets(line, sizeof(line), real_fp)) {
-        if (is_status) {
-            if (std::strncmp(line, "Seccomp_filters:", 16) == 0) {
-                char *p = line + 16;
-                while (*p == ' ' || *p == '\t') ++p;
-                long filters = std::strtol(p, nullptr, 10);
-                if (filters > 1) {
-                    clean_ss << "Seccomp_filters:\t" << (filters - 1) << "\n";
-                    ++stripped;
-                    continue;
-                }
-            }
-            clean_ss << line;
-            continue;
-        }
         if (is_sensitive_proc_line(line, is_mounts)) {
             ++stripped;
             continue;
@@ -72,9 +56,7 @@ inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *o
     if (orig_fclose) orig_fclose(real_fp); else std::fclose(real_fp);
 
     *out_clean = clean_ss.str();
-    emit_probe(is_status ? "SECCOMP_CLOAK" : "MAPS_CLOAK",
-               norm_path,
-               is_status ? "Hidden extra Seccomp_filters layer" : ("Stripped " + std::to_string(stripped) + " traces"));
+    emit_probe("MAPS_CLOAK", norm_path, "Stripped " + std::to_string(stripped) + " traces");
     return true;
 }
 

@@ -26,12 +26,10 @@ namespace mirage {
 
 // Companion 控制通道协议指令 (App postAppSpecialize <-> Root Companion)
 constexpr uint8_t CMD_MOUNT_NS        = 0x01;
-constexpr uint8_t CMD_USER_NOTIF      = 0x02;
 constexpr uint8_t CMD_DONE_ENTER_SINK = 0x03;
 
-// Companion 控制通道与双引擎运行状态
+// Companion 控制通道与私有 Mount NS 状态
 inline int g_companion_ctrl_fd = -1;
-inline std::atomic<bool> g_seccomp_active{false};
 inline std::atomic<bool> g_vfs_ns_mounted{false};
 inline std::unordered_set<std::string> g_ns_mounted_paths;
 
@@ -123,31 +121,6 @@ inline bool is_cpufreq_relative_candidate(const char *rel) noexcept {
     if (!rel || rel[0] == '/' || rel[0] == '.') return false;
     char c = rel[0];
     return (c == 's' || c == 'c' || c == 'o' || c == 'r' || c == 'a' || c == 't' || c == 'm' || c == 'p');
-}
-
-inline bool is_proc_status_path_raw(const char *p) noexcept {
-    if (!p || std::strncmp(p, "/proc/", 6) != 0) return false;
-    const char *s = p + 6;
-    if (std::strcmp(s, "self/status") == 0 || std::strcmp(s, "thread-self/status") == 0) {
-        return true;
-    }
-    if (std::strncmp(s, "self/task/", 10) == 0) {
-        const char *t = s + 10;
-        if (*t < '0' || *t > '9') return false;
-        while (*t >= '0' && *t <= '9') ++t;
-        return std::strcmp(t, "/status") == 0;
-    }
-    if (*s >= '0' && *s <= '9') {
-        while (*s >= '0' && *s <= '9') ++s;
-        if (std::strcmp(s, "/status") == 0) return true;
-        if (std::strncmp(s, "/task/", 6) == 0) {
-            const char *t = s + 6;
-            if (*t < '0' || *t > '9') return false;
-            while (*t >= '0' && *t <= '9') ++t;
-            return std::strcmp(t, "/status") == 0;
-        }
-    }
-    return false;
 }
 
 inline std::string normalize_vfs_path(const char *raw_path) {

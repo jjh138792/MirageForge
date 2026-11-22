@@ -90,7 +90,7 @@ impl StoreEngine {
                     probe: parts[5] == "1",
                     sdk_spoof: parts.get(6).copied() == Some("1"),
                     refresh_rate: sanitize_refresh_rate(raw_col7),
-                    seccomp: parts.get(8).copied() == Some("1"),
+                    mount_ns: parts.get(8).copied() == Some("1"),
                 };
                 if r.is_any_enabled() {
                     self.routes.insert(r.pkg_name.clone(), r);
@@ -150,7 +150,7 @@ impl StoreEngine {
                 if r.probe { "1" } else { "0" },
                 if r.sdk_spoof { "1" } else { "0" },
                 sanitize_refresh_rate(r.refresh_rate),
-                if r.seccomp { "1" } else { "0" }
+                if r.mount_ns { "1" } else { "0" }
             ));
         }
         write_file_atomic(ROUTES_DB, &(r_lines.join("\n") + "\n"), 0o600);

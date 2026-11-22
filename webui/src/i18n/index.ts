@@ -77,7 +77,7 @@ const messages = {
       swVfs: '单核频率/对称内存/VFS',
       swProbe: '探针与调用栈',
       swSdk: '强改 SDK 版本',
-      swSeccomp: '拦截直连 SVC 调用',
+      swMountNs: '使用 MountNS 内核引擎',
       fpsLabel: '屏幕最高刷新率欺骗 (0=原生不改):',
     },
     probe: {
@@ -169,7 +169,7 @@ const messages = {
       swVfs: '單核頻率/對稱記憶體/VFS',
       swProbe: '探針與調用棧',
       swSdk: '強改 SDK 版本',
-      swSeccomp: '攔截直連 SVC 調用',
+      swMountNs: '使用 MountNS 核心引擎',
       fpsLabel: '螢幕最高更新率欺騙 (0=原生不改):',
     },
     probe: {
@@ -261,7 +261,7 @@ const messages = {
       swVfs: 'Per-Core Freq/DDR/VFS',
       swProbe: 'Probe & Backtrace',
       swSdk: 'Force Spoof SDK',
-      swSeccomp: 'Intercept Inline SVC',
+      swMountNs: 'Use MountNS Kernel Engine',
       fpsLabel: 'Max Refresh Rate Spoof (0=Native):',
     },
     probe: {

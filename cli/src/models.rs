@@ -301,8 +301,8 @@ pub struct AppRoute {
     pub sdk_spoof: bool,
     #[serde(rename = "refreshRate", default, deserialize_with = "de_i32_flex")]
     pub refresh_rate: i32,
-    #[serde(default)]
-    pub seccomp: bool,
+    #[serde(rename = "mountNs", default)]
+    pub mount_ns: bool,
 }
 
 impl AppRoute {

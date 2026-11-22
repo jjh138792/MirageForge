@@ -22,7 +22,7 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
     push_kv(&mut lines, "META:ENABLE_VFS", if route.vfs { "1" } else { "0" });
     push_kv(&mut lines, "META:ENABLE_PROBE", if route.probe { "1" } else { "0" });
     push_kv(&mut lines, "META:FORCE_SPOOF_SDK", if route.sdk_spoof { "1" } else { "0" });
-    push_kv(&mut lines, "META:ENABLE_SECCOMP", if route.vfs && route.seccomp { "1" } else { "0" });
+    push_kv(&mut lines, "META:ENABLE_MOUNT_NS", if route.vfs && route.mount_ns { "1" } else { "0" });
     if route.gl && effective_fps >= 90 {
         push_kv(&mut lines, "META:REFRESH_RATE", &effective_fps.to_string());
     }

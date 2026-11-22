@@ -6,4 +6,3 @@
 #include "vfs/proc_cloak.hpp"
 #include "vfs/io_hooks.hpp"
 #include "vfs/mount_ns_engine.hpp"
-#include "vfs/seccomp_svc.hpp"

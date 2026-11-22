@@ -111,7 +111,7 @@ inline void write_direct_log_line(int prio, const std::string &line) {
 }
 
 inline void emit_probe(const char *domain, const std::string &key, const std::string &val) {
-    if (__builtin_expect(!g_cfg.probe.enabled || g_tls_in_sigsys, 1)) return;
+    if (__builtin_expect(!g_cfg.probe.enabled, 1)) return;
     ErrnoRestorer errno_guard;
 
     uint64_t h = hash_str(std::string(domain) + ":" + key);
@@ -198,15 +198,14 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
             const char *sl = std::strrchr(pc_dli.dli_fname, '/');
             const char *pc_lib = sl ? (sl + 1) : pc_dli.dli_fname;
             uintptr_t pc_off = pc - reinterpret_cast<uintptr_t>(pc_dli.dli_fbase);
-            std::snprintf(reg_buf, sizeof(reg_buf), "pc=%s+0x%zx sp=0x%zx lr=0x%zx sigsys=%d",
-                          pc_lib, static_cast<size_t>(pc_off),
-                          static_cast<size_t>(sp), static_cast<size_t>(lr),
-                          g_tls_in_sigsys ? 1 : 0);
-        } else {
-            std::snprintf(reg_buf, sizeof(reg_buf), "pc=0x%zx sp=0x%zx lr=0x%zx sigsys=%d",
-                          static_cast<size_t>(pc), static_cast<size_t>(sp),
-                          static_cast<size_t>(lr), g_tls_in_sigsys ? 1 : 0);
-        }
+          std::snprintf(reg_buf, sizeof(reg_buf), "pc=%s+0x%zx sp=0x%zx lr=0x%zx",
+                        pc_lib, static_cast<size_t>(pc_off),
+                        static_cast<size_t>(sp), static_cast<size_t>(lr));
+      } else {
+          std::snprintf(reg_buf, sizeof(reg_buf), "pc=0x%zx sp=0x%zx lr=0x%zx",
+                        static_cast<size_t>(pc), static_cast<size_t>(sp),
+                        static_cast<size_t>(lr));
+      }
     }
 #endif
 

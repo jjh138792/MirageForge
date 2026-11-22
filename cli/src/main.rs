@@ -105,7 +105,7 @@ fn main() {
                         .map(|t| t.name.as_str())
                         .unwrap_or(&r.tpl_id);
                     println!(
-                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{} FPS:{}Hz Seccomp:{}]",
+                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{} FPS:{}Hz MountNS:{}]",
                         r.pkg_name,
                         m_name,
                         r.build as u8,
@@ -114,7 +114,7 @@ fn main() {
                         r.probe as u8,
                         r.sdk_spoof as u8,
                         r.refresh_rate,
-                        r.seccomp as u8
+                        r.mount_ns as u8
                     );
                 }
             }
@@ -229,6 +229,7 @@ fn main() {
             let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
             if sub == "set" && args.len() >= 5 {
                 let fps_str = get_opt(&args, "--fps", get_opt(&args, "--refresh-rate", "0"));
+                let mount_ns_str = get_opt(&args, "--mount-ns", get_opt(&args, "--seccomp", "0"));
                 let route = AppRoute {
                     pkg_name: args[3].clone(),
                     tpl_id: args[4].clone(),
@@ -238,7 +239,7 @@ fn main() {
                     probe: get_opt(&args, "--probe", "0") == "1",
                     sdk_spoof: get_opt(&args, "--sdk", "0") == "1",
                     refresh_rate: sanitize_refresh_rate(fps_str.parse::<i32>().unwrap_or(0)),
-                    seccomp: get_opt(&args, "--seccomp", "0") == "1",
+                    mount_ns: mount_ns_str == "1" || mount_ns_str == "true",
                 };
                 let restart = has_flag(&args, "--restart");
                 let ok = store.set_route(route, restart);
