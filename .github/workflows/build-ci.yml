@@ -38,16 +38,13 @@ jobs:
           # 版本格式：原版本-Canary-提交短哈希，versionCode 永远锁死为 999
           CANARY_VER="${BASE_VER}-Canary-${SHORT_SHA}"
           CANARY_SEMVER="${BASE_SEMVER}-Canary.${SHORT_SHA}"
-          CANARY_CODE="999"
           ZIP_NAME="MirageForge-Zygisk-${CANARY_VER}.zip"
 
           # 直接覆写构建工作区的 module.prop（不会提交回仓库，仅生效于构建产物）
           sed -i "s/^version=.*/version=${CANARY_VER}/" module/module.prop
-          sed -i "s/^versionCode=.*/versionCode=${CANARY_CODE}/" module/module.prop
 
           echo "canary_version=$CANARY_VER" >> $GITHUB_OUTPUT
           echo "canary_semver=$CANARY_SEMVER" >> $GITHUB_OUTPUT
-          echo "canary_code=$CANARY_CODE" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
 
@@ -157,7 +154,6 @@ jobs:
           ### 🧪 MirageForge Canary Pre-Release (\`${{ steps.meta.outputs.canary_version }}\`)
 
           * **构建版本 (Version)**: \`${{ steps.meta.outputs.canary_version }}\`
-          * **版本号 (versionCode)**: \`999\` *(锁定 999，屏蔽正式版更新推送)*
           * **触发提交 (Commit)**: \`${{ github.sha }}\`
 
           #### 📝 本次提交变更
