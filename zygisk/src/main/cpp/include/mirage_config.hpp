@@ -13,7 +13,6 @@
 #include <unordered_map>
 #include <unistd.h>
 #include <android/log.h>
-#include <sys/socket.h>
 
 #define LOG_TAG "MirageForge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -158,15 +157,13 @@ struct BuildModuleConfig {
 // ============================================================================
 struct GraphicsModuleConfig {
     bool enabled = false;
-    int max_refresh_rate = 0; // 0 = 0改动；90 / 120 / 144 / 165 = 伪装屏幕最高刷新率
+    int max_refresh_rate = 0;
 
-    // OpenGL ES 参数
     std::string gl_vendor;
     std::string gl_renderer;
     std::string gl_version;
     std::string gl_glsl_version = "OpenGL ES GLSL ES 3.20";
 
-    // Vulkan 独立参数（与 OpenGL ES 彻底解耦，避免驱动信息串台）
     std::string vk_device_name;
     uint32_t vk_vendor_id = 0;
     uint32_t vk_device_id = 0;
@@ -181,7 +178,6 @@ struct GraphicsModuleConfig {
         return !vk_device_name.empty() ? vk_device_name : gl_renderer;
     }
 
-    // 兼容旧版未显式填写 VULKAN:* 字段的配置，自动推导合理的 Vulkan 身份与驱动信息（绝不混入 OpenGL ES 字样）
     inline void finalize_vulkan_defaults() {
         if (vk_device_name.empty()) {
             vk_device_name = gl_renderer;
@@ -235,7 +231,7 @@ struct GraphicsModuleConfig {
 };
 
 // ============================================================================
-// 微模块 3：VFS 硬件拓扑与按需 Seccomp-BPF 配置
+// 微模块 3：VFS 硬件拓扑与可选私有 Mount NS 引擎配置
 // ============================================================================
 struct CpuClusterSpec {
     int first_core = 0;
@@ -249,7 +245,7 @@ struct CpuClusterSpec {
 
 struct VfsModuleConfig {
     bool enabled = false;
-    bool enable_mount_ns = false;
+    bool enable_mount_ns = false; // false = 传统 PLT VFS 引擎；true = 启用私有 Mount NS 内核级挂载引擎
     std::string cpu_hardware;
     std::string cpu_arch = "aarch64";
     std::string soc_id;
@@ -319,10 +315,11 @@ inline bool read_full(int fd, void *buf, size_t len) {
     return true;
 }
 
-inline void write_str(int fd, const std::string &s) {
+inline bool write_str(int fd, const std::string &s) {
     uint32_t len = static_cast<uint32_t>(s.size());
-    write_full(fd, &len, sizeof(len));
-    if (len > 0) write_full(fd, s.data(), len);
+    if (!write_full(fd, &len, sizeof(len))) return false;
+    if (len > 0 && !write_full(fd, s.data(), len)) return false;
+    return true;
 }
 
 inline std::string read_str(int fd) {
@@ -330,50 +327,6 @@ inline std::string read_str(int fd) {
     if (!read_full(fd, &len, sizeof(len)) || len == 0 || len > 524288) return "";
     std::string s(len, '\0');
     if (!read_full(fd, &s[0], len)) return "";
-    return s;
-}
-
-// Socket 专用收发（使用 send/recv 绕过 untrusted_app 下 vfs_write/vfs_read 的 SELinux FD__USE 检查并防 SIGPIPE）
-inline bool send_full(int fd, const void *buf, size_t len) {
-    const auto *p = static_cast<const uint8_t *>(buf);
-    while (len > 0) {
-        ssize_t n;
-        do {
-            n = send(fd, p, len, MSG_NOSIGNAL);
-        } while (n == -1 && errno == EINTR);
-        if (n <= 0) return false;
-        p += n;
-        len -= static_cast<size_t>(n);
-    }
-    return true;
-}
-
-inline bool recv_full(int fd, void *buf, size_t len) {
-    auto *p = static_cast<uint8_t *>(buf);
-    while (len > 0) {
-        ssize_t n;
-        do {
-            n = recv(fd, p, len, 0);
-        } while (n == -1 && errno == EINTR);
-        if (n <= 0) return false;
-        p += n;
-        len -= static_cast<size_t>(n);
-    }
-    return true;
-}
-
-inline bool send_str(int fd, const std::string &s) {
-    uint32_t len = static_cast<uint32_t>(s.size());
-    if (!send_full(fd, &len, sizeof(len))) return false;
-    if (len > 0 && !send_full(fd, s.data(), len)) return false;
-    return true;
-}
-
-inline std::string recv_str(int fd) {
-    uint32_t len = 0;
-    if (!recv_full(fd, &len, sizeof(len)) || len == 0 || len > 524288) return "";
-    std::string s(len, '\0');
-    if (!recv_full(fd, &s[0], len)) return "";
     return s;
 }
 

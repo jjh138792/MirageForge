@@ -13,8 +13,6 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
-#include <sys/socket.h>
-#include <sys/time.h>
 
 #include "zygisk.hpp"
 #include "mirage_config.hpp"
@@ -98,9 +96,6 @@ public:
             }
         }
 
-        uint8_t ctrl_ready = 0;
-        read_full(fd, &ctrl_ready, sizeof(ctrl_ready));
-
         load_modular_config(raw_kvs);
         for (auto &kv : raw_kvs) {
             volatile_scrub_string(kv.first);
@@ -109,23 +104,42 @@ public:
         raw_kvs.clear();
 
         if (!g_cfg.is_any_enabled()) {
+            uint8_t no_ns = 0;
+            write_full(fd, &no_ns, sizeof(no_ns));
             close(fd);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        // 严格 0 改动：仅在开启 MountNS 引擎或开启探针时才保留控制通道 FD
-        bool need_ctrl = (g_cfg.vfs.enabled && g_cfg.vfs.enable_mount_ns) || g_cfg.probe.enabled;
-        if (need_ctrl && ctrl_ready == 1) {
-            int fl = fcntl(fd, F_GETFL, 0);
-            if (fl >= 0 && (fl & O_NONBLOCK)) {
-                fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-            }
-            struct timeval zero_tv{0, 0};
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &zero_tv, sizeof(zero_tv));
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &zero_tv, sizeof(zero_tv));
+        // 先初始化 VFS 拓扑与符号，再于 preAppSpecialize (u:r:zygote:s0) 阶段同步完成私有 Mount NS 挂载，
+        // 彻底避免 postAppSpecialize 降权为 untrusted_app 后的 SELinux EACCES！
+        if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
+            init_vfs_symbols();
+        }
+        if (g_cfg.vfs.enabled) {
+            init_vfs_clusters_lightweight();
+        }
+
+        bool want_mount_ns = (g_cfg.vfs.enabled && g_cfg.vfs.enable_mount_ns);
+        uint32_t ns_mounted_cnt = 0;
+        std::string ns_diag;
+        if (want_mount_ns) {
+            ns_mounted_cnt = request_private_mount_ns_in_pre_specialize(fd, &ns_diag);
+        } else {
+            uint8_t no_ns = 0;
+            write_full(fd, &no_ns, sizeof(no_ns));
+        }
+
+        uint8_t sink_ready = 0;
+        read_full(fd, &sink_ready, sizeof(sink_ready));
+
+        // 严格 0 改动：仅开启探针时才保留日志 FD，否则立即关闭（0 句柄残留）
+        if (g_cfg.probe.enabled && sink_ready == 1) {
             api->exemptFd(fd);
-            g_companion_ctrl_fd = fd;
+            g_probe_log_fd = fd;
+            if (want_mount_ns && ns_mounted_cnt == 0 && !ns_diag.empty()) {
+                emit_probe("VFS_MOUNT_NS", "PrivateMountNS_Fallback", ns_diag);
+            }
         } else {
             close(fd);
         }
@@ -137,12 +151,6 @@ public:
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
             reflect_java_build_fields(env);
-        }
-        if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
-            init_vfs_symbols();
-        }
-        if (g_cfg.vfs.enabled) {
-            init_vfs_clusters_lightweight();
         }
         if (g_cfg.gl.enabled) {
             init_graphics_symbols();
@@ -167,34 +175,6 @@ public:
             dlopen("libhardware.so", RTLD_NOW);
             dlopen("libvulkan.so", RTLD_NOW);
         }
-
-        // Phase 1：仅在用户明确开启 MountNS 开关时执行私有 Mount NS 内核挂载；否则走传统 PLT 引擎
-        uint32_t ns_mounted_cnt = 0;
-        std::string ns_diag;
-        bool want_mount_ns = (g_cfg.vfs.enabled && g_cfg.vfs.enable_mount_ns);
-
-        if (g_companion_ctrl_fd >= 0) {
-            if (want_mount_ns) {
-                ns_mounted_cnt = request_private_mount_ns_spoof(g_companion_ctrl_fd, &ns_diag);
-            }
-
-            uint8_t done_cmd = CMD_DONE_ENTER_SINK;
-            send_full(g_companion_ctrl_fd, &done_cmd, sizeof(done_cmd));
-
-            if (g_cfg.probe.enabled) {
-                g_probe_log_fd = g_companion_ctrl_fd;
-            } else {
-                if (orig_close) orig_close(g_companion_ctrl_fd); else close(g_companion_ctrl_fd);
-            }
-            g_companion_ctrl_fd = -1;
-        }
-
-        if (g_cfg.probe.enabled && want_mount_ns) {
-            emit_probe("VFS_MOUNT_NS",
-                       ns_mounted_cnt > 0 ? "PrivateMountNS_Active" : "PrivateMountNS_Fallback",
-                       ns_diag.empty() ? "no_ctrl_channel" : ns_diag);
-        }
-
         scan_and_commit_plt_hooks();
     }
 
@@ -314,7 +294,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程（两阶段会话线程：Mount NS 控制 -> 探针与死亡核验）
+// Root Companion 守护进程（纯日志落盘 + [PENDING_CRASH] 进程真实死亡核验）
 // ============================================================================
 static std::mutex g_file_write_mtx;
 
@@ -329,51 +309,8 @@ static void append_line_as_root(const char *path, const std::string &line) {
     chmod(path, 0600);
 }
 
-struct CompanionSessionCtx {
-    int sock_fd;
-    bool probe_enabled;
-};
-
-static void *companion_session_thread(void *arg) {
-    auto *sctx = static_cast<CompanionSessionCtx *>(arg);
-    if (!sctx) return nullptr;
-    int sock_fd = sctx->sock_fd;
-    bool probe_enabled = sctx->probe_enabled;
-    delete sctx;
-    
-    struct timeval zero_tv{0, 0};
-    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &zero_tv, sizeof(zero_tv));
-    setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &zero_tv, sizeof(zero_tv));
-
-    // Phase 1：接收 postAppSpecialize 控制指令 (Mount NS)
-    bool entered_sink = false;
-    while (true) {
-        uint8_t cmd = 0;
-        if (!recv_full(sock_fd, &cmd, sizeof(cmd))) {
-            close(sock_fd);
-            return nullptr;
-        }
-
-        if (cmd == CMD_MOUNT_NS) {
-            if (!companion_handle_mount_ns_cmd(sock_fd)) {
-                close(sock_fd);
-                return nullptr;
-            }
-        } else if (cmd == CMD_DONE_ENTER_SINK) {
-            entered_sink = true;
-            break;
-        } else {
-            close(sock_fd);
-            return nullptr;
-        }
-    }
-
-    if (!entered_sink || !probe_enabled) {
-        close(sock_fd);
-        return nullptr;
-    }
-
-    // Phase 2：探针日志接收 + [PENDING_CRASH] 进程真实死亡核验
+static void *companion_log_sink_thread(void *arg) {
+    int sock_fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
     std::string pending;
     std::string pending_crash_line;
     std::time_t pending_crash_ts = 0;
@@ -404,7 +341,7 @@ static void *companion_session_thread(void *arg) {
     while (true) {
         ssize_t n;
         do {
-            n = recv(sock_fd, buf, sizeof(buf), 0);
+            n = read(sock_fd, buf, sizeof(buf));
         } while (n == -1 && errno == EINTR);
 
         if (n <= 0) break;
@@ -524,11 +461,10 @@ static void companion_handler(int fd) {
     }
 
     const auto &entries = it->second;
-    bool build_on    = (entries.count("META:ENABLE_BUILD")    && entries.at("META:ENABLE_BUILD") == "1");
-    bool gl_on       = (entries.count("META:ENABLE_GL")       && entries.at("META:ENABLE_GL") == "1");
-    bool vfs_on      = (entries.count("META:ENABLE_VFS")      && entries.at("META:ENABLE_VFS") == "1");
-    bool probe_on    = (entries.count("META:ENABLE_PROBE")    && entries.at("META:ENABLE_PROBE") == "1");
-    bool mount_ns_on = vfs_on && (entries.count("META:ENABLE_MOUNT_NS") && entries.at("META:ENABLE_MOUNT_NS") == "1");
+    bool build_on = (entries.count("META:ENABLE_BUILD") && entries.at("META:ENABLE_BUILD") == "1");
+    bool gl_on    = (entries.count("META:ENABLE_GL")    && entries.at("META:ENABLE_GL") == "1");
+    bool vfs_on   = (entries.count("META:ENABLE_VFS")   && entries.at("META:ENABLE_VFS") == "1");
+    bool probe_on = (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
 
     if (!build_on && !gl_on && !vfs_on && !probe_on) {
         uint8_t zero = 0;
@@ -546,6 +482,10 @@ static void companion_handler(int fd) {
         write_str(fd, kv.second);
     }
 
+    // 在 preAppSpecialize 阶段同步响应私有 Mount NS 挂载（无 postAppSpecialize 控制 IPC）
+    std::string ns_diag;
+    uint32_t ns_mounted_cnt = companion_handle_mount_ns_sync(fd, app_pid, &ns_diag);
+
     std::string model = entries.count("BUILD:MODEL") ? entries.at("BUILD:MODEL") : "Custom";
     std::string gpu   = entries.count("GLES:RENDERER") ? entries.at("GLES:RENDERER") : "DefaultGPU";
     int ram_gb        = entries.count("VFS:RAM_GB") ? std::atoi(entries.at("VFS:RAM_GB").c_str()) : 16;
@@ -557,20 +497,25 @@ static void companion_handler(int fd) {
             "[PROBE][" + pkg_name + "][SESSION] MirageForge_v" + g_companion_cache.cached_version +
                 "_Attached => " + model + " | " + gpu + " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
         );
-    }
+        if (!ns_diag.empty()) {
+            append_line_as_root(
+                PROBE_LOG_PATH,
+                "[PROBE][" + pkg_name + "][VFS_MOUNT_NS] " +
+                    std::string(ns_mounted_cnt > 0 ? "PrivateMountNS_Active" : "PrivateMountNS_Fallback") +
+                    " => " + ns_diag + " @@ companion::mount_ns(pid=" + std::to_string(app_pid) + ")"
+            );
+        }
 
-    if (mount_ns_on || probe_on) {
-        int sess_fd = dup(fd);
-        if (sess_fd >= 0) {
-            auto *sctx = new CompanionSessionCtx{sess_fd, probe_on};
+        int sink_fd = dup(fd);
+        if (sink_fd >= 0) {
             pthread_t tid;
-            if (pthread_create(&tid, nullptr, companion_session_thread, sctx) == 0) {
+            if (pthread_create(&tid, nullptr, companion_log_sink_thread,
+                               reinterpret_cast<void *>(static_cast<intptr_t>(sink_fd))) == 0) {
                 pthread_detach(tid);
                 uint8_t ready = 1;
                 write_full(fd, &ready, sizeof(ready));
             } else {
-                close(sess_fd);
-                delete sctx;
+                close(sink_fd);
                 uint8_t no_ready = 0;
                 write_full(fd, &no_ready, sizeof(no_ready));
             }

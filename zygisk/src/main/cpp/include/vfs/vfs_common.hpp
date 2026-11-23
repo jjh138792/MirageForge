@@ -24,12 +24,7 @@
 
 namespace mirage {
 
-// Companion 控制通道协议指令 (App postAppSpecialize <-> Root Companion)
-constexpr uint8_t CMD_MOUNT_NS        = 0x01;
-constexpr uint8_t CMD_DONE_ENTER_SINK = 0x03;
-
-// Companion 控制通道与私有 Mount NS 状态
-inline int g_companion_ctrl_fd = -1;
+// 私有 Mount NS 生效状态与已挂载路径表
 inline std::atomic<bool> g_vfs_ns_mounted{false};
 inline std::unordered_set<std::string> g_ns_mounted_paths;
 

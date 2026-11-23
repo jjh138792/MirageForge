@@ -169,15 +169,11 @@ inline void forward_crash_signal(int sig, siginfo_t *info, void *ucontext, struc
     }
 }
 
-// 双层防误报崩溃捕获器（覆盖 SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE）：
-// 1. 优先通过 libsigchain.so 注册，排在 ART FaultManager 之后，不截获 CheckSuspend / 隐式 NPE
-// 2. 发送 [PENDING_CRASH] 给 Root Companion，仅当进程随后真正死亡 (socket EOF) 时才落盘为真实崩溃
 inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext) {
     int saved_errno = errno;
     struct sigaction *prev = get_old_crash_sa(sig);
     uintptr_t fault_addr = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
 
-    // 兜底快路径：若未能挂载进 libsigchain，直接跳过 ART 的页对齐 CheckSuspend / 隐式 NPE
     if (!g_crash_via_sigchain && sig == SIGSEGV && info &&
         (fault_addr < 0x1000 || (info->si_code == SEGV_ACCERR && (fault_addr & 0xFFFU) == 0))) {
         errno = saved_errno;
@@ -198,14 +194,14 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
             const char *sl = std::strrchr(pc_dli.dli_fname, '/');
             const char *pc_lib = sl ? (sl + 1) : pc_dli.dli_fname;
             uintptr_t pc_off = pc - reinterpret_cast<uintptr_t>(pc_dli.dli_fbase);
-          std::snprintf(reg_buf, sizeof(reg_buf), "pc=%s+0x%zx sp=0x%zx lr=0x%zx",
-                        pc_lib, static_cast<size_t>(pc_off),
-                        static_cast<size_t>(sp), static_cast<size_t>(lr));
-      } else {
-          std::snprintf(reg_buf, sizeof(reg_buf), "pc=0x%zx sp=0x%zx lr=0x%zx",
-                        static_cast<size_t>(pc), static_cast<size_t>(sp),
-                        static_cast<size_t>(lr));
-      }
+            std::snprintf(reg_buf, sizeof(reg_buf), "pc=%s+0x%zx sp=0x%zx lr=0x%zx",
+                          pc_lib, static_cast<size_t>(pc_off),
+                          static_cast<size_t>(sp), static_cast<size_t>(lr));
+        } else {
+            std::snprintf(reg_buf, sizeof(reg_buf), "pc=0x%zx sp=0x%zx lr=0x%zx",
+                          static_cast<size_t>(pc), static_cast<size_t>(sp),
+                          static_cast<size_t>(lr));
+        }
     }
 #endif
 
@@ -255,7 +251,6 @@ inline void mirage_crash_signal_handler(int sig, siginfo_t *info, void *ucontext
     );
     if (total_len > 0) {
         size_t safe_len = std::min(static_cast<size_t>(total_len), sizeof(crash_buf) - 1);
-        // 仅送往 Root Companion 待死亡核验，不提前刷屏 logcat ERROR
         write_direct_log_raw(ANDROID_LOG_DEBUG, crash_buf, safe_len, false);
     }
 
