@@ -6,7 +6,7 @@
 
 **「千面万象，一念幻化」—— 基于 Zygisk 的按应用机型与硬件信息伪装模块**
 
-[![Version](https://img.shields.io/badge/Version-v1.2.0-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
+[![Version](https://img.shields.io/badge/Version-v1.2.1-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
 [![Zygisk](https://img.shields.io/badge/Zygisk-Supported-06b6d4?style=flat-square)](https://github.com/topjohnwu/zygisk-module-sample)
 [![License](https://img.shields.io/badge/License-GPL--3.0--only-f43f5e?style=flat-square)](LICENSE)
 
@@ -65,7 +65,7 @@
 刷入模块重启后，直接在 **KernelSU / APatch / MMRL / KSUWebUI** 管理器中点开「蜃楼工坊 · MirageForge」即可进入可视化面板（支持浅色护眼/深色模式跟随系统切换、简/繁/英三语切换以及在线检查更新）：
 1. **全息熔炉**：管理内置的旗舰机型模板，或点击「铸造新机型」自己新建/编辑一套硬件配置。
 2. **属性炼金**：上传或粘贴 `build.prop` 文件内容，自动解析成机型模板。
-3. **分流矩阵**：搜索你要伪装的应用，在下拉框里选好机型模板，按需调整下方的功能开关或独立 DPI，点一下右侧的 ⚡ 按钮重启应用即可生效。
+3. **分流矩阵**：搜索你要伪装的应用，在下拉框里选好机型模板，按需调整下方的功能开关，点一下右侧的 ⚡ 按钮重启应用即可生效。
 4. **幻境探针**：查看应用启动遥测记录、崩溃诊断日志，以及开启探针后的属性与文件读取抓包记录。
 
 ### 3. 命令行工具 (`mirageforge_cli`)
