@@ -111,8 +111,6 @@ public:
             return;
         }
 
-        // 先初始化 VFS 拓扑与符号，再于 preAppSpecialize (u:r:zygote:s0) 阶段同步完成私有 Mount NS 挂载，
-        // 彻底避免 postAppSpecialize 降权为 untrusted_app 后的 SELinux EACCES！
         if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
             init_vfs_symbols();
         }
@@ -120,6 +118,9 @@ public:
             init_vfs_clusters_lightweight();
         }
 
+        // 若开启了 MountNS，先尝试私有命名空间挂载：
+        // 成功则 g_vfs_ns_mounted=true，下方 scan_and_commit_plt_hooks 自动关闭传统文件 PLT 引擎；
+        // 失败则自动回退到传统文件 PLT 引擎
         bool want_mount_ns = (g_cfg.vfs.enabled && g_cfg.vfs.enable_mount_ns);
         uint32_t ns_mounted_cnt = 0;
         std::string ns_diag;
@@ -133,7 +134,7 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 严格 0 改动：仅开启探针时才保留日志 FD，否则立即关闭（0 句柄残留）
+        // 严格 0 改动：仅开启探针时才保留日志 FD，否则当场关闭（0 句柄残留）
         if (g_cfg.probe.enabled && sink_ready == 1) {
             api->exemptFd(fd);
             g_probe_log_fd = fd;
@@ -150,7 +151,6 @@ public:
         }
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
-            reflect_java_build_fields(env);
         }
         if (g_cfg.gl.enabled) {
             init_graphics_symbols();
@@ -167,15 +167,13 @@ public:
         if (!g_cfg.active) return;
         g_post_specialized.store(true, std::memory_order_release);
 
+        // 仅在 postAppSpecialize 执行一次 Java Build 反射并立即擦除临时映射（避免 pre/post 重复反射）
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
             g_cfg.build.wipe_volatile_reflection_maps();
         }
-        if (g_cfg.gl.enabled) {
-            dlopen("libhardware.so", RTLD_NOW);
-            dlopen("libvulkan.so", RTLD_NOW);
-        }
-        scan_and_commit_plt_hooks();
+        // 严格 0 改动 + 冷启动零拖慢：绝不主动 dlopen("libvulkan.so") / "libhardware.so"，
+        // 改为纯按需由 hook_dlopen / hook_dlsym_all 懒拦截
     }
 
     void preServerSpecialize(ServerSpecializeArgs *) override {
@@ -294,9 +292,10 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程（纯日志落盘 + [PENDING_CRASH] 进程真实死亡核验）
+// Root Companion 守护进程（并发安全缓存 + Mount NS + 探针与真实死亡核验）
 // ============================================================================
 static std::mutex g_file_write_mtx;
+static std::mutex g_companion_cache_mtx;
 
 static void append_line_as_root(const char *path, const std::string &line) {
     std::lock_guard<std::mutex> lock(g_file_write_mtx);
@@ -452,15 +451,21 @@ static void companion_handler(int fd) {
         return;
     }
 
-    g_companion_cache.refresh_if_needed();
-    auto it = g_companion_cache.pkg_configs.find(pkg_name);
-    if (it == g_companion_cache.pkg_configs.end()) {
-        uint8_t zero = 0;
-        write_full(fd, &zero, sizeof(zero));
-        return;
+    std::unordered_map<std::string, std::string> entries;
+    std::string version_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_companion_cache_mtx);
+        g_companion_cache.refresh_if_needed();
+        auto it = g_companion_cache.pkg_configs.find(pkg_name);
+        if (it == g_companion_cache.pkg_configs.end()) {
+            uint8_t zero = 0;
+            write_full(fd, &zero, sizeof(zero));
+            return;
+        }
+        entries = it->second;
+        version_snapshot = g_companion_cache.cached_version;
     }
 
-    const auto &entries = it->second;
     bool build_on = (entries.count("META:ENABLE_BUILD") && entries.at("META:ENABLE_BUILD") == "1");
     bool gl_on    = (entries.count("META:ENABLE_GL")    && entries.at("META:ENABLE_GL") == "1");
     bool vfs_on   = (entries.count("META:ENABLE_VFS")   && entries.at("META:ENABLE_VFS") == "1");
@@ -474,7 +479,7 @@ static void companion_handler(int fd) {
 
     uint8_t one = 1;
     write_full(fd, &one, sizeof(one));
-    write_str(fd, g_companion_cache.cached_version);
+    write_str(fd, version_snapshot);
     uint32_t count = static_cast<uint32_t>(entries.size());
     write_full(fd, &count, sizeof(count));
     for (const auto &kv : entries) {
@@ -482,7 +487,6 @@ static void companion_handler(int fd) {
         write_str(fd, kv.second);
     }
 
-    // 在 preAppSpecialize 阶段同步响应私有 Mount NS 挂载（无 postAppSpecialize 控制 IPC）
     std::string ns_diag;
     uint32_t ns_mounted_cnt = companion_handle_mount_ns_sync(fd, app_pid, &ns_diag);
 
@@ -494,7 +498,7 @@ static void companion_handler(int fd) {
         mkdir(DATA_ROOT_DIR, 0700);
         append_line_as_root(
             PROBE_LOG_PATH,
-            "[PROBE][" + pkg_name + "][SESSION] MirageForge_v" + g_companion_cache.cached_version +
+            "[PROBE][" + pkg_name + "][SESSION] MirageForge_v" + version_snapshot +
                 "_Attached => " + model + " | " + gpu + " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
         );
         if (!ns_diag.empty()) {

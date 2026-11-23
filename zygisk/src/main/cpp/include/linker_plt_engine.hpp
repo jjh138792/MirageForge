@@ -4,7 +4,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <set>
-#include <tuple>
+#include <utility>
 #include <mutex>
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -20,7 +20,7 @@ namespace mirage {
 
 inline zygisk::Api *g_zygisk_api = nullptr;
 inline std::mutex g_maps_mtx;
-inline std::set<std::tuple<dev_t, ino_t, uintptr_t>> g_hooked_elves;
+inline std::set<std::pair<dev_t, ino_t>> g_hooked_elves;
 inline void *g_discard_old_slot = nullptr;
 inline dev_t g_self_dev = 0;
 inline ino_t g_self_ino = 0;
@@ -34,6 +34,11 @@ inline PFN_loader_dlopen orig_loader_dlopen = nullptr;
 inline PFN_loader_android_dlopen_ext orig_loader_android_dlopen_ext = nullptr;
 
 inline void scan_and_commit_plt_hooks();
+
+// 是否启用传统 PLT 文件 Hook 引擎：仅当 VFS 开启且私有 Mount NS 未激活（关闭或挂载失败回退）时启用
+inline bool should_use_legacy_vfs_plt() noexcept {
+    return g_cfg.vfs.enabled && !g_vfs_ns_mounted.load(std::memory_order_acquire);
+}
 
 inline void init_linker_symbols() {
     if (orig_dlopen) return;
@@ -69,7 +74,7 @@ inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) no
 inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
     if (path[0] != '/') return false;
 
-    // 豁免本模块自身、/data/adb 与反篡改核心虚拟机 (libpairipcore.so)，防止触发 GOT 完整性哈希自毁
+    // 豁免本模块自身、/data/adb 与反篡改核心虚拟机 (libpairipcore.so)
     if (std::strstr(path, "mirage_forge") != nullptr ||
         std::strncmp(path, "/data/adb/", 10) == 0 ||
         std::strstr(path, "libpairipcore") != nullptr) {
@@ -182,12 +187,15 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
     }
 
     if (g_cfg.vfs.enabled) {
-        if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
-        if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
-        if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
-        if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
-        if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
-        if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
+        // 仅当回退传统 PLT 引擎时才经由 dlsym 拦截文件 I/O
+        if (should_use_legacy_vfs_plt()) {
+            if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
+            if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
+            if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
+            if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
+            if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
+            if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
+        }
         if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
         if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
         if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
@@ -199,7 +207,14 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
 inline bool should_rescan_on_dlopen(const char *filename) noexcept {
     if (!filename) return false;
     if (std::strstr(filename, "libpairipcore") != nullptr) return false;
-    if (std::strstr(filename, "vulkan") != nullptr) return true;
+    // 开启 GPU 伪装时，应用按需加载 libvulkan / libhardware / GLES 时触发增量挂钩
+    if (g_cfg.gl.enabled &&
+        (std::strstr(filename, "vulkan") != nullptr ||
+         std::strstr(filename, "libhardware") != nullptr ||
+         std::strstr(filename, "libGLES") != nullptr ||
+         std::strstr(filename, "libEGL") != nullptr)) {
+        return true;
+    }
     if (std::strncmp(filename, "/system/", 8) == 0 ||
         std::strncmp(filename, "/apex/", 6) == 0 ||
         std::strncmp(filename, "/vendor/", 8) == 0) {
@@ -218,7 +233,9 @@ inline void *hook_dlopen(const char *filename, int flags) {
         if (guard) {
             emit_probe("DLOPEN", filename, "Incremental PLT Hook");
             scan_and_commit_plt_hooks();
-            try_lazy_spoof_display_modes();
+            if (g_cfg.gl.enabled && g_cfg.gl.max_refresh_rate >= 90) {
+                try_lazy_spoof_display_modes();
+            }
         }
     }
     return handle;
@@ -234,7 +251,9 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
         if (guard) {
             emit_probe("DLOPEN_EXT", filename, "Incremental PLT Hook");
             scan_and_commit_plt_hooks();
-            try_lazy_spoof_display_modes();
+            if (g_cfg.gl.enabled && g_cfg.gl.max_refresh_rate >= 90) {
+                try_lazy_spoof_display_modes();
+            }
         }
     }
     return handle;
@@ -251,10 +270,17 @@ inline void scan_and_commit_plt_hooks() {
         return;
     }
 
+    const bool use_legacy_vfs = should_use_legacy_vfs_plt();
     char line[1024];
     bool dirty = false;
 
     while (std::fgets(line, sizeof(line), fp)) {
+        // 极速预过滤：跳过 85%+ 的非可执行段，避免逐行执行重型 sscanf
+        const char *sp = std::strchr(line, ' ');
+        if (!sp || sp[1] == '\0' || sp[2] == '\0' || sp[3] != 'x') {
+            continue;
+        }
+
         uintptr_t start = 0, end = 0, offset = 0;
         unsigned int dev_maj = 0, dev_min = 0;
         unsigned long inode_ul = 0;
@@ -265,11 +291,17 @@ inline void scan_and_commit_plt_hooks() {
                         &start, &end, perms, &offset, &dev_maj, &dev_min, &inode_ul, &path_pos) < 7) {
             continue;
         }
-        if (inode_ul == 0 || std::strchr(perms, 'x') == nullptr) continue;
+        if (inode_ul == 0) continue;
 
         dev_t dev = makedev(dev_maj, dev_min);
         ino_t inode = static_cast<ino_t>(inode_ul);
         if (g_self_ino != 0 && dev == g_self_dev && inode == g_self_ino) {
+            continue;
+        }
+
+        // 先按 (dev, inode) 去重，再做路径字符串匹配
+        auto elf_id = std::make_pair(dev, inode);
+        if (g_hooked_elves.find(elf_id) != g_hooked_elves.end()) {
             continue;
         }
 
@@ -284,10 +316,7 @@ inline void scan_and_commit_plt_hooks() {
             continue;
         }
 
-        auto id_tuple = std::make_tuple(dev, inode, offset);
-        if (!g_hooked_elves.insert(id_tuple).second) {
-            continue;
-        }
+        g_hooked_elves.insert(elf_id);
         dirty = true;
 
         auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
@@ -313,7 +342,8 @@ inline void scan_and_commit_plt_hooks() {
             reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
         }
 
-        if (g_cfg.vfs.enabled) {
+        // 传统文件 I/O PLT 引擎：MountNS 成功后完全关闭（0 文件 Hook）；仅未开 MountNS 或挂载失败回退时才启用
+        if (use_legacy_vfs) {
             reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
             reg("open64", reinterpret_cast<void *>(hook_open64), reinterpret_cast<void **>(&orig_open64));
             reg("__open_2", reinterpret_cast<void *>(hook_open_2), reinterpret_cast<void **>(&orig_open_2));
@@ -341,6 +371,10 @@ inline void scan_and_commit_plt_hooks() {
             reg("fstat64", reinterpret_cast<void *>(hook_fstat64), reinterpret_cast<void **>(&orig_fstat64));
             reg("readlink", reinterpret_cast<void *>(hook_readlink), reinterpret_cast<void **>(&orig_readlink));
             reg("readlinkat", reinterpret_cast<void *>(hook_readlinkat), reinterpret_cast<void **>(&orig_readlinkat));
+        }
+
+        // 非文件类系统调用（不走 VFS 路径，独立于 MountNS）
+        if (g_cfg.vfs.enabled) {
             reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo));
             reg("sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf));
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));

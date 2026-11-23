@@ -3,9 +3,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <utility>
+#include <unordered_set>
+#include <atomic>
 #include <dirent.h>
 #include <signal.h>
 #include <unistd.h>
@@ -30,8 +33,8 @@ struct MountNsChildReport {
 };
 
 // ============================================================================
-// App 侧 (preAppSpecialize 阶段，仍处 u:r:zygote:s0，100% 避免 untrusted_app EACCES)
-// 先在已 fork 的 App 子进程内执行 unshare(CLONE_NEWNS)，再同步请 Companion 挂载
+// App 侧 (preAppSpecialize 阶段，处 u:r:zygote:s0)：
+// 收集并按 realpath 去重硬件节点（消除同簇 policy 叠挂），在子进程 unshare(CLONE_NEWNS) 后同步挂载
 // ============================================================================
 inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *out_diag) {
     auto send_skip = [&](const std::string &reason) -> uint32_t {
@@ -45,20 +48,32 @@ inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *
         return send_skip("disabled");
     }
 
-    // 绝对 0 改动安全闸门 0：父进程必须是 Zygote (>1)，绝不允许在 PID 1 子进程 (Zygote 本体) 中执行 unshare
+    // 绝对 0 改动安全闸门 0：父进程必须是 Zygote (>1)，绝不允许在 Zygote 本体执行 unshare
     pid_t ppid = getppid();
     if (ppid <= 1) {
         return send_skip("skip=ppid_is_init");
     }
 
     std::vector<std::pair<std::string, std::string>> jobs;
+    std::unordered_set<std::string> seen_real_paths;
     jobs.reserve(48);
 
     auto add_node = [&](const std::string &path) {
+        // 目标节点明确不存在 (ENOENT) 时提前跳过，减少无效 IPC 传输
+        if (access(path.c_str(), F_OK) != 0 && errno == ENOENT) {
+            return;
+        }
+        // 通过 realpath 对软链接目标去重（例如同簇 cpu0..cpu5/cpufreq 都指向 policy0，只挂载 1 次）
+        char resolved[PATH_MAX];
+        std::string canonical = (realpath(path.c_str(), resolved) != nullptr) ? std::string(resolved) : path;
+        if (!seen_real_paths.insert(canonical).second) {
+            return;
+        }
+
         std::string content;
         int dyn = -1;
-        if (synthesize_vfs_node_on_demand(path, &content, &dyn) && dyn < 0 && !content.empty()) {
-            jobs.emplace_back(path, std::move(content));
+        if (synthesize_vfs_node_on_demand(path, &content, &dyn) && !content.empty()) {
+            jobs.emplace_back(std::move(canonical), std::move(content));
         }
     };
 
@@ -91,6 +106,9 @@ inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *
         add_node(pfx + "cpu_capacity");
         add_node(pfx + "regs/identification/midr_el1");
         add_node(pfx + "topology/core_cpus_list");
+        // 关闭传统 PLT 引擎后，同时挂载 cur_freq 防止暴露真机当前频率
+        add_node(pfx + "cpufreq/scaling_cur_freq");
+        add_node(pfx + "cpufreq/cpuinfo_cur_freq");
         add_node(pfx + "cpufreq/cpuinfo_max_freq");
         add_node(pfx + "cpufreq/cpuinfo_min_freq");
         add_node(pfx + "cpufreq/scaling_max_freq");
@@ -103,7 +121,6 @@ inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *
         return send_skip("no_nodes");
     }
 
-    // 提前在本子进程创建独立 Mount Namespace（Android SpecializeCommon 后续再次 unshare 会自动继承所有绑定）
     if (unshare(CLONE_NEWNS) != 0) {
         return send_skip("unshare_failed(errno=" + std::to_string(errno) + ")");
     }
@@ -148,9 +165,16 @@ inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *
 }
 
 // ============================================================================
-// Root Companion 侧：清理已退出进程的遗留暂存目录
+// Root Companion 侧：节流清理已退出进程的遗留暂存目录（最多每 60 秒 1 次，不拖慢启动）
 // ============================================================================
-inline void cleanup_stale_mnt_stage_dirs() {
+inline void cleanup_stale_mnt_stage_dirs_throttled() {
+    static std::atomic<int64_t> s_last_clean_sec{0};
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    int64_t prev = s_last_clean_sec.load(std::memory_order_relaxed);
+    if (now - prev < 60 || !s_last_clean_sec.compare_exchange_strong(prev, now, std::memory_order_acq_rel)) {
+        return;
+    }
+
     DIR *dir = opendir(MNT_STAGE_DIR);
     if (!dir) return;
     struct dirent *ent = nullptr;
@@ -176,7 +200,7 @@ inline void cleanup_stale_mnt_stage_dirs() {
 
 // ============================================================================
 // Root Companion 侧：在 companion_handler 中同步处理 Mount NS 请求
-// 三级自适应策略：tmpfs-ctx -> tmpfs-xattr -> data-xattr（严格隔离，绝不污染宿主/Zygote）
+// 三级自适应策略：tmpfs-ctx -> tmpfs-xattr -> data-xattr
 // ============================================================================
 inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::string *out_diag) {
     uint8_t want_ns = 0;
@@ -219,7 +243,7 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
                        (l_ppid <= 0 || std::strcmp(app_ns_id, ppid_ns_id) != 0);
 
     if (!ns_isolated || count == 0) {
-        std::string diag = "skip=ns_not_isolated";
+        std::string diag = "skip=ns_not_isolated (fallback_legacy_plt)";
         if (out_diag) *out_diag = diag;
         write_full(fd, results.data(), results.size());
         write_str(fd, diag);
@@ -228,7 +252,7 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
 
     mkdir(DATA_ROOT_DIR, 0700);
     mkdir(MNT_STAGE_DIR, 0755);
-    cleanup_stale_mnt_stage_dirs();
+    cleanup_stale_mnt_stage_dirs_throttled();
 
     char pid_stage_dir[128];
     std::snprintf(pid_stage_dir, sizeof(pid_stage_dir), "%s/%d", MNT_STAGE_DIR, app_pid);
@@ -244,7 +268,7 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
 
     int res_pipe[2] = {-1, -1};
     if (pipe(res_pipe) != 0) {
-        std::string diag = "fail=pipe";
+        std::string diag = "fail=pipe (fallback_legacy_plt)";
         if (out_diag) *out_diag = diag;
         write_full(fd, results.data(), results.size());
         write_str(fd, diag);
@@ -254,6 +278,7 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
     pid_t worker = fork();
     if (worker == 0) {
         close(res_pipe[0]);
+        umask(0); // 配合 open(..., 0444) 一步到位，省掉循环内冗余 chmod/chown 调用
         MountNsChildReport rep{};
 
         int ns_fd = open(app_ns_path, O_RDONLY | O_CLOEXEC);
@@ -267,8 +292,7 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
         } else {
             close(ns_fd);
 
-            // 绝对 0 改动安全闸门 2：先将整棵挂载树设为 MS_REC | MS_SLAVE（与 AOSP MountEmulatedStorage 一致），
-            // 再将 /proc 与 /sys 及其所有子挂载设为 MS_REC | MS_PRIVATE，彻底杜绝任何挂载事件向外传播
+            // 绝对 0 改动安全闸门 2：先将整棵挂载树设为 MS_REC | MS_SLAVE，再将 /proc 与 /sys 设为 MS_REC | MS_PRIVATE
             bool root_slave = (mount(nullptr, "/", nullptr, MS_REC | MS_SLAVE, nullptr) == 0);
             bool proc_priv  = (mount(nullptr, "/proc", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0);
             bool sys_priv   = (mount(nullptr, "/sys", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0);
@@ -283,7 +307,6 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
                 mkdir(pid_stage_dir, 0755);
                 bool need_umount_stage = false;
 
-                // 仅当 / 已成功隔离为 MS_SLAVE 时，才允许在 pid_stage_dir 上挂载 tmpfs (Tier 1/2)
                 if (root_slave) {
                     if (mount("tmpfs", pid_stage_dir, "tmpfs", MS_NOSUID | MS_NODEV,
                               "size=2M,mode=0755,context=u:object_r:system_file:s0") == 0) {
@@ -309,7 +332,6 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
                     }
                 }
 
-                // Tier 3: /data (ext4/f2fs) 原生 fs_use_xattr + 绑定到私有 /proc & /sys 后立即 unlink
                 if (rep.mode == 0) {
                     char probe_f[160];
                     std::snprintf(probe_f, sizeof(probe_f), "%s/.p", pid_stage_dir);
@@ -352,8 +374,6 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
                             written += static_cast<size_t>(n);
                         }
                         close(sfd);
-                        chmod(src_path, 0444);
-                        chown(src_path, 0, 0);
 
                         if (rep.mode != 1) {
                             if (lsetxattr(src_path, "security.selinux", kSysFileCtx, kCtxLen, 0) != 0) {
@@ -405,11 +425,13 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
     const char *mode_name = (rep.mode == 1) ? "tmpfs-ctx" :
                             (rep.mode == 2) ? "tmpfs-xattr" :
                             (rep.mode == 3) ? "data-xattr" : "none";
-    char diag_buf[160];
+    char diag_buf[192];
     if (ok_cnt > 0) {
-        std::snprintf(diag_buf, sizeof(diag_buf), "mode=%s mounted=%u/%u (0 memfd)", mode_name, ok_cnt, count);
+        std::snprintf(diag_buf, sizeof(diag_buf),
+                      "mode=%s mounted=%u/%u (legacy_plt_vfs=OFF)", mode_name, ok_cnt, count);
     } else {
-        std::snprintf(diag_buf, sizeof(diag_buf), "fallback_plt stage=%u mode=%s errno=%d",
+        std::snprintf(diag_buf, sizeof(diag_buf),
+                      "fallback_legacy_plt stage=%u mode=%s errno=%d",
                       static_cast<unsigned>(rep.fail_stage), mode_name, rep.last_errno);
     }
 
