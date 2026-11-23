@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <unistd.h>
 #include <android/log.h>
+#include <sys/socket.h>
 
 #define LOG_TAG "MirageForge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -329,6 +330,50 @@ inline std::string read_str(int fd) {
     if (!read_full(fd, &len, sizeof(len)) || len == 0 || len > 524288) return "";
     std::string s(len, '\0');
     if (!read_full(fd, &s[0], len)) return "";
+    return s;
+}
+
+// Socket 专用收发（使用 send/recv 绕过 untrusted_app 下 vfs_write/vfs_read 的 SELinux FD__USE 检查并防 SIGPIPE）
+inline bool send_full(int fd, const void *buf, size_t len) {
+    const auto *p = static_cast<const uint8_t *>(buf);
+    while (len > 0) {
+        ssize_t n;
+        do {
+            n = send(fd, p, len, MSG_NOSIGNAL);
+        } while (n == -1 && errno == EINTR);
+        if (n <= 0) return false;
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+inline bool recv_full(int fd, void *buf, size_t len) {
+    auto *p = static_cast<uint8_t *>(buf);
+    while (len > 0) {
+        ssize_t n;
+        do {
+            n = recv(fd, p, len, 0);
+        } while (n == -1 && errno == EINTR);
+        if (n <= 0) return false;
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+inline bool send_str(int fd, const std::string &s) {
+    uint32_t len = static_cast<uint32_t>(s.size());
+    if (!send_full(fd, &len, sizeof(len))) return false;
+    if (len > 0 && !send_full(fd, s.data(), len)) return false;
+    return true;
+}
+
+inline std::string recv_str(int fd) {
+    uint32_t len = 0;
+    if (!recv_full(fd, &len, sizeof(len)) || len == 0 || len > 524288) return "";
+    std::string s(len, '\0');
+    if (!recv_full(fd, &s[0], len)) return "";
     return s;
 }
 

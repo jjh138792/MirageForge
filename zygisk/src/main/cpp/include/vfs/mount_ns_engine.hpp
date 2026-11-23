@@ -96,25 +96,27 @@ inline uint32_t request_private_mount_ns_spoof(int ctrl_fd, std::string *out_dia
     int32_t ppid = static_cast<int32_t>(getppid());
     uint32_t count = static_cast<uint32_t>(jobs.size());
 
-    if (!write_full(ctrl_fd, &cmd, sizeof(cmd)) ||
-        !write_full(ctrl_fd, &app_pid, sizeof(app_pid)) ||
-        !write_full(ctrl_fd, &ppid, sizeof(ppid)) ||
-        !write_full(ctrl_fd, &count, sizeof(count))) {
-        if (out_diag) *out_diag = "ipc_write_failed";
+    if (!send_full(ctrl_fd, &cmd, sizeof(cmd)) ||
+        !send_full(ctrl_fd, &app_pid, sizeof(app_pid)) ||
+        !send_full(ctrl_fd, &ppid, sizeof(ppid)) ||
+        !send_full(ctrl_fd, &count, sizeof(count))) {
+        if (out_diag) *out_diag = "ipc_send_hdr_failed(errno=" + std::to_string(errno) + ")";
         return 0;
     }
 
     for (const auto &job : jobs) {
-        write_str(ctrl_fd, job.first);
-        write_str(ctrl_fd, job.second);
+        if (!send_str(ctrl_fd, job.first) || !send_str(ctrl_fd, job.second)) {
+            if (out_diag) *out_diag = "ipc_send_body_failed(errno=" + std::to_string(errno) + ")";
+            return 0;
+        }
     }
 
     std::vector<uint8_t> results(count, 0);
-    if (!read_full(ctrl_fd, results.data(), results.size())) {
-        if (out_diag) *out_diag = "ipc_read_failed";
+    if (!recv_full(ctrl_fd, results.data(), results.size())) {
+        if (out_diag) *out_diag = "ipc_recv_res_failed(errno=" + std::to_string(errno) + ")";
         return 0;
     }
-    std::string diag = read_str(ctrl_fd);
+    std::string diag = recv_str(ctrl_fd);
     if (out_diag) *out_diag = diag;
 
     uint32_t ok_cnt = 0;
@@ -165,9 +167,9 @@ inline bool companion_handle_mount_ns_cmd(int sock_fd) {
     int32_t app_pid = 0;
     int32_t ppid = 0;
     uint32_t count = 0;
-    if (!read_full(sock_fd, &app_pid, sizeof(app_pid)) ||
-        !read_full(sock_fd, &ppid, sizeof(ppid)) ||
-        !read_full(sock_fd, &count, sizeof(count))) {
+    if (!recv_full(sock_fd, &app_pid, sizeof(app_pid)) ||
+        !recv_full(sock_fd, &ppid, sizeof(ppid)) ||
+        !recv_full(sock_fd, &count, sizeof(count))) {
         return false;
     }
 
@@ -178,8 +180,8 @@ inline bool companion_handle_mount_ns_cmd(int sock_fd) {
     contents.reserve(count);
 
     for (uint32_t i = 0; i < count; ++i) {
-        targets.push_back(read_str(sock_fd));
-        contents.push_back(read_str(sock_fd));
+        targets.push_back(recv_str(sock_fd));
+        contents.push_back(recv_str(sock_fd));
     }
 
     std::vector<uint8_t> results(count, 0);
@@ -199,11 +201,11 @@ inline bool companion_handle_mount_ns_cmd(int sock_fd) {
                        (l_ppid <= 0 || std::strcmp(app_ns_id, ppid_ns_id) != 0);
 
     if (!ns_isolated || count == 0) {
-        write_full(sock_fd, results.data(), results.size());
-        write_str(sock_fd, "skip=ns_not_isolated");
+        send_full(sock_fd, results.data(), results.size());
+        send_str(sock_fd, "skip=ns_not_isolated");
         return true;
     }
-
+    
     mkdir(DATA_ROOT_DIR, 0700);
     mkdir(MNT_STAGE_DIR, 0755);
     cleanup_stale_mnt_stage_dirs();
@@ -222,8 +224,8 @@ inline bool companion_handle_mount_ns_cmd(int sock_fd) {
 
     int res_pipe[2] = {-1, -1};
     if (pipe(res_pipe) != 0) {
-        write_full(sock_fd, results.data(), results.size());
-        write_str(sock_fd, "fail=pipe");
+        send_full(sock_fd, results.data(), results.size());
+        send_str(sock_fd, "fail=pipe");
         return true;
     }
 
@@ -388,8 +390,8 @@ inline bool companion_handle_mount_ns_cmd(int sock_fd) {
                       static_cast<unsigned>(rep.fail_stage), mode_name, rep.last_errno);
     }
 
-    write_full(sock_fd, results.data(), results.size());
-    write_str(sock_fd, diag_buf);
+    send_full(sock_fd, results.data(), results.size());
+    send_str(sock_fd, diag_buf);
     return true;
 }
 

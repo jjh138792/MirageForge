@@ -13,6 +13,8 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 #include "zygisk.hpp"
 #include "mirage_config.hpp"
@@ -115,6 +117,13 @@ public:
         // 严格 0 改动：仅在开启 MountNS 引擎或开启探针时才保留控制通道 FD
         bool need_ctrl = (g_cfg.vfs.enabled && g_cfg.vfs.enable_mount_ns) || g_cfg.probe.enabled;
         if (need_ctrl && ctrl_ready == 1) {
+            int fl = fcntl(fd, F_GETFL, 0);
+            if (fl >= 0 && (fl & O_NONBLOCK)) {
+                fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+            }
+            struct timeval zero_tv{0, 0};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &zero_tv, sizeof(zero_tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &zero_tv, sizeof(zero_tv));
             api->exemptFd(fd);
             g_companion_ctrl_fd = fd;
         } else {
@@ -170,7 +179,7 @@ public:
             }
 
             uint8_t done_cmd = CMD_DONE_ENTER_SINK;
-            write_full(g_companion_ctrl_fd, &done_cmd, sizeof(done_cmd));
+            send_full(g_companion_ctrl_fd, &done_cmd, sizeof(done_cmd));
 
             if (g_cfg.probe.enabled) {
                 g_probe_log_fd = g_companion_ctrl_fd;
@@ -331,12 +340,16 @@ static void *companion_session_thread(void *arg) {
     int sock_fd = sctx->sock_fd;
     bool probe_enabled = sctx->probe_enabled;
     delete sctx;
+    
+    struct timeval zero_tv{0, 0};
+    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &zero_tv, sizeof(zero_tv));
+    setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &zero_tv, sizeof(zero_tv));
 
     // Phase 1：接收 postAppSpecialize 控制指令 (Mount NS)
     bool entered_sink = false;
     while (true) {
         uint8_t cmd = 0;
-        if (!read_full(sock_fd, &cmd, sizeof(cmd))) {
+        if (!recv_full(sock_fd, &cmd, sizeof(cmd))) {
             close(sock_fd);
             return nullptr;
         }
@@ -391,7 +404,7 @@ static void *companion_session_thread(void *arg) {
     while (true) {
         ssize_t n;
         do {
-            n = read(sock_fd, buf, sizeof(buf));
+            n = recv(sock_fd, buf, sizeof(buf), 0);
         } while (n == -1 && errno == EINTR);
 
         if (n <= 0) break;
