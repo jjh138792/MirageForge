@@ -13,6 +13,7 @@ import {
   syncSystemBarsTheme,
   showToast,
   triggerHaptic,
+  detectRuntimeEnv,
   type InstalledAppInfo,
 } from '../bridge/ksu-io';
 
@@ -26,6 +27,11 @@ export const PROBE_LOG_FILE = '/data/adb/mirage_forge/probe_events.log';
 export const CRASH_LOG_FILE = '/data/adb/mirage_forge/crash_events.log';
 export const LAUNCH_LOG_FILE = '/data/adb/mirage_forge/launch_history.log';
 
+export const OTA_SCRIPT_FILE = '/data/local/tmp/mirage_forge_ota.sh';
+export const OTA_LOG_FILE = '/data/local/tmp/mirage_forge_ota.log';
+export const OTA_EXIT_FILE = '/data/local/tmp/mirage_forge_ota.exit';
+export const OTA_ZIP_FILE = '/data/local/tmp/mirage_forge_ota.zip';
+
 export const UPDATE_JSON_URL =
   'https://raw.githubusercontent.com/jjh138792/MirageForge/main/update.json';
 export const ONLINE_HUB_URL =
@@ -34,6 +40,16 @@ export const ONLINE_HUB_CDN_URL =
   'https://cdn.jsdelivr.net/gh/jjh138792/MirageForge@main/templates-hub.json';
 
 export type ThemeMode = 'auto' | 'light' | 'dark';
+export type RootManagerKind = 'auto' | 'ksu' | 'apatch' | 'magisk';
+export type OtaMirrorMode = 'auto' | 'ghfast' | 'ghproxy' | 'direct';
+export type OtaStage =
+  | 'idle'
+  | 'detecting'
+  | 'downloading'
+  | 'verifying'
+  | 'installing'
+  | 'success'
+  | 'error';
 
 export interface DeviceTemplate {
   id: string;
@@ -59,11 +75,9 @@ export interface DeviceTemplate {
   SDK_INT: string;
   SECURITY_PATCH: string;
   FINGERPRINT: string;
-  // OpenGL ES 参数
   GL_VENDOR: string;
   GL_RENDERER: string;
   GL_VERSION: string;
-  // Vulkan 独立参数
   VK_DEVICE_NAME: string;
   VK_VENDOR_ID: string;
   VK_DEVICE_ID: string;
@@ -72,7 +86,6 @@ export interface DeviceTemplate {
   VK_DRIVER_NAME: string;
   VK_DRIVER_INFO: string;
   MAX_REFRESH_RATE: number;
-  // VFS 硬件拓扑参数
   CPU_HARDWARE: string;
   CPU_CORES: number;
   CPU_MAX_FREQ: number;
@@ -129,7 +142,26 @@ export interface UpdateInfo {
   latestVersion: string;
   latestCode: number;
   zipUrl: string;
-  changelog: string;
+  changelogUrl: string;
+  changelogText: string;
+  changelogLoading: boolean;
+  changelogError: string;
+}
+
+export interface OtaRuntimeState {
+  stage: OtaStage;
+  running: boolean;
+  detectedManager: 'ksu' | 'apatch' | 'magisk' | 'none';
+  selectedManager: RootManagerKind;
+  managerVersion: string;
+  availableManagers: {
+    ksu: boolean;
+    apatch: boolean;
+    magisk: boolean;
+  };
+  mirrorMode: OtaMirrorMode;
+  logs: string[];
+  errorMsg: string;
 }
 
 export interface HubSyncStatus {
@@ -145,9 +177,6 @@ export function sanitizeRefreshRate(hz: number | undefined): number {
   return n >= 90 && n <= 240 ? n : 0;
 }
 
-/**
- * 自动补齐缺失的独立 Vulkan 字段，兼容旧版模板并防止驱动名与 OpenGL ES 串台
- */
 export function normalizeTemplateVulkanFields(raw: Partial<DeviceTemplate>): DeviceTemplate {
   const tpl = { ...raw } as DeviceTemplate;
   if (!tpl.VK_DEVICE_NAME || !tpl.VK_DEVICE_NAME.trim()) {
@@ -204,9 +233,6 @@ export function normalizeTemplateVulkanFields(raw: Partial<DeviceTemplate>): Dev
   return tpl;
 }
 
-// ============================================================================
-// 内置离线兜底精选库 (仅在断网或拉取全部失败时兜底展示)
-// ============================================================================
 export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
   {
     id: 'oneplus_13',
@@ -478,8 +504,26 @@ export const mirageStore = reactive({
     latestVersion: '',
     latestCode: 0,
     zipUrl: 'https://github.com/jjh138792/MirageForge/releases/latest',
-    changelog: '',
+    changelogUrl: '',
+    changelogText: '',
+    changelogLoading: false,
+    changelogError: '',
   } as UpdateInfo,
+  ota: {
+    stage: 'idle',
+    running: false,
+    detectedManager: 'none',
+    selectedManager: 'auto',
+    managerVersion: '',
+    availableManagers: {
+      ksu: false,
+      apatch: false,
+      magisk: false,
+    },
+    mirrorMode: ((localStorage.getItem('mirage_ota_mirror') as OtaMirrorMode) || 'auto') as OtaMirrorMode,
+    logs: [] as string[],
+    errorMsg: '',
+  } as OtaRuntimeState,
 });
 
 export const activeToastMsg = ref<string>('');
@@ -559,11 +603,19 @@ export async function loadVersionFromModuleProp() {
 /**
  * 通用多通道文本拉取器：WebView fetch (6s 超时) -> Root curl 兜底
  */
-function isSafeHttpUrl(url: string): boolean {
+export function isSafeHttpUrl(url: string): boolean {
   return /^https?:\/\/[^\s"'`$\\;|&<>]+$/i.test(url.trim());
 }
 
-async function fetchJsonTextWithFallback(url: string): Promise<{ text: string; via: 'fetch' | 'curl' }> {
+function toJsDelivrMirror(url: string): string | null {
+  const m = url
+    .trim()
+    .match(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/i);
+  if (!m) return null;
+  return `https://cdn.jsdelivr.net/gh/${m[1]}/${m[2]}@${m[3]}/${m[4]}`;
+}
+
+async function fetchTextWithFallback(url: string): Promise<{ text: string; via: 'fetch' | 'curl' }> {
   const cleanUrl = url.trim();
   if (!isSafeHttpUrl(cleanUrl)) {
     throw new Error('URL 格式不合法');
@@ -572,25 +624,23 @@ async function fetchJsonTextWithFallback(url: string): Promise<{ text: string; v
   const sep = cleanUrl.includes('?') ? '&' : '?';
   const bustedUrl = `${cleanUrl}${sep}t=${Date.now()}`;
 
-  // 1. 优先尝试浏览器原生 fetch
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
+    const timer = setTimeout(() => controller.abort(), 6500);
     const resp = await fetch(bustedUrl, { cache: 'no-store', signal: controller.signal });
     clearTimeout(timer);
     if (!resp.ok) {
       throw new Error(`HTTP ${resp.status}`);
     }
     const text = await resp.text();
-    if (text && text.trim().length > 2) {
+    if (text && text.trim().length > 0) {
       return { text, via: 'fetch' };
     }
   } catch (fetchErr: any) {
-    // 2. WebView 网络受限/跨域时自动降级到 Root curl 拉取
     const curlRes = await execRootShell(
       `curl -fsSL --connect-timeout 6 --max-time 12 -A "MirageForge-WebUI" "${bustedUrl}"`
     );
-    if (curlRes.errno === 0 && curlRes.stdout && curlRes.stdout.trim().length > 2) {
+    if (curlRes.errno === 0 && curlRes.stdout && curlRes.stdout.trim().length > 0) {
       return { text: curlRes.stdout, via: 'curl' };
     }
     throw new Error(fetchErr?.message || `curl exit ${curlRes.errno}`);
@@ -598,12 +648,73 @@ async function fetchJsonTextWithFallback(url: string): Promise<{ text: string; v
   throw new Error('empty response');
 }
 
+function compareSemver(a: string, b: string): number {
+  const pa = a.replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = b.replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const da = pa[i] || 0;
+    const db = pb[i] || 0;
+    if (da !== db) return da > db ? 1 : -1;
+  }
+  return 0;
+}
+
 /**
- * 3. 在线检查更新 (支持 CDN 与 curl 双兜底)
+ * 3. 拉取 update.json 中 changelog URL 正文（支持 jsDelivr CDN + 原链 + Root curl 兜底）
  */
-export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
+export async function fetchChangelogContent(force = false): Promise<string> {
+  const url = mirageStore.updateInfo.changelogUrl.trim();
+  if (!url) {
+    mirageStore.updateInfo.changelogError = '';
+    return mirageStore.updateInfo.changelogText;
+  }
+  if (!force && mirageStore.updateInfo.changelogText.trim()) {
+    return mirageStore.updateInfo.changelogText;
+  }
+  if (!isSafeHttpUrl(url)) {
+    mirageStore.updateInfo.changelogText = url;
+    return url;
+  }
+
+  mirageStore.updateInfo.changelogLoading = true;
+  mirageStore.updateInfo.changelogError = '';
+
+  const candidates: string[] = [];
+  const cdnUrl = toJsDelivrMirror(url);
+  if (cdnUrl) candidates.push(cdnUrl);
+  candidates.push(url);
+
+  let lastErr = '';
+  for (const target of candidates) {
+    try {
+      const { text } = await fetchTextWithFallback(target);
+      if (text && text.trim()) {
+        mirageStore.updateInfo.changelogText = text.trim();
+        mirageStore.updateInfo.changelogLoading = false;
+        return mirageStore.updateInfo.changelogText;
+      }
+    } catch (e: any) {
+      lastErr = e?.message || '拉取失败';
+    }
+  }
+
+  mirageStore.updateInfo.changelogError = lastErr || '无法获取更新日志';
+  mirageStore.updateInfo.changelogLoading = false;
+  return '';
+}
+
+/**
+ * 4. 在线检查更新 (拉取 update.json + 预加载 changelog URL)
+ * 返回值表示是否发现新版本
+ */
+export async function checkOnlineUpdate(
+  t: (k: string, p?: any) => string,
+  silent = false
+): Promise<boolean> {
   mirageStore.updateInfo.checking = true;
-  triggerHaptic('light');
+  if (!silent) triggerHaptic('light');
+
   const candidates = [
     'https://cdn.jsdelivr.net/gh/jjh138792/MirageForge@main/update.json',
     UPDATE_JSON_URL,
@@ -611,7 +722,7 @@ export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
   let parsed: any = null;
   for (const url of candidates) {
     try {
-      const { text } = await fetchJsonTextWithFallback(url);
+      const { text } = await fetchTextWithFallback(url);
       parsed = JSON.parse(text);
       if (parsed && parsed.version) break;
     } catch (_) {}
@@ -620,29 +731,480 @@ export async function checkOnlineUpdate(t: (k: string, p?: any) => string) {
   try {
     if (!parsed) throw new Error('all sources failed');
     const remoteCode = Number(parsed.versionCode || 0);
-    const remoteVer = String(parsed.version || '').replace(/^v/, '');
+    const remoteVer = String(parsed.version || '').replace(/^v/i, '');
+    const rawChangelog = String(parsed.changelog || '').trim();
 
     mirageStore.updateInfo.latestCode = remoteCode;
     mirageStore.updateInfo.latestVersion = remoteVer;
-    if (parsed.zipUrl) mirageStore.updateInfo.zipUrl = parsed.zipUrl;
+    if (parsed.zipUrl) mirageStore.updateInfo.zipUrl = String(parsed.zipUrl).trim();
 
-    if (remoteCode > mirageStore.versionCode && mirageStore.versionCode > 0) {
-      mirageStore.updateInfo.hasUpdate = true;
-      triggerHaptic('success');
-      showToast(t('app.hasUpdate', { ver: remoteVer }));
+    if (isSafeHttpUrl(rawChangelog)) {
+      if (mirageStore.updateInfo.changelogUrl !== rawChangelog) {
+        mirageStore.updateInfo.changelogUrl = rawChangelog;
+        mirageStore.updateInfo.changelogText = '';
+      }
     } else {
-      mirageStore.updateInfo.hasUpdate = false;
+      mirageStore.updateInfo.changelogUrl = '';
+      mirageStore.updateInfo.changelogText = rawChangelog;
+    }
+
+    const isNewer =
+      (remoteCode > 0 && mirageStore.versionCode > 0 && remoteCode > mirageStore.versionCode) ||
+      (remoteVer.length > 0 &&
+        mirageStore.version !== '...' &&
+        compareSemver(remoteVer, mirageStore.version) > 0);
+
+    mirageStore.updateInfo.hasUpdate = isNewer;
+
+    if (isNewer) {
+      fetchChangelogContent(false);
+      if (!silent) {
+        triggerHaptic('success');
+        showToast(t('app.hasUpdate', { ver: remoteVer }));
+      }
+      return true;
+    }
+
+    if (!silent) {
       showToast(t('app.upToDate', { ver: mirageStore.version }));
     }
+    return false;
   } catch (_) {
-    showToast(t('app.updateError'));
+    if (!silent) {
+      showToast(t('app.updateError'));
+    }
+    return false;
   } finally {
     mirageStore.updateInfo.checking = false;
   }
 }
 
 /**
- * 4. URL-Safe Base64 模板分享码编解码器 (与 Rust CLI mf:// 格式 100% 互通)
+ * 5. 自动识别活跃 Root 管理器 (KernelSU ksud / APatch apd / Magisk magiskd)
+ */
+export async function detectRootManagerForOta() {
+  if (detectRuntimeEnv() === 'BrowserMock') {
+    mirageStore.ota.detectedManager = 'ksu';
+    mirageStore.ota.managerVersion = 'KernelSU Mock v1.0.5';
+    mirageStore.ota.availableManagers = { ksu: true, apatch: false, magisk: true };
+    return;
+  }
+
+  const probeCmd = [
+    'KSU_BIN=""; [ -x /data/adb/ksud ] && KSU_BIN=/data/adb/ksud || KSU_BIN=$(command -v ksud 2>/dev/null)',
+    'APD_BIN=""; [ -x /data/adb/apd ] && APD_BIN=/data/adb/apd || APD_BIN=$(command -v apd 2>/dev/null)',
+    'MAG_BIN=""; for p in "$(command -v magisk 2>/dev/null)" /sbin/magisk /debug_ramdisk/magisk /system/bin/magisk; do [ -n "$p" ] && [ -x "$p" ] && MAG_BIN="$p" && break; done',
+    'HAS_KSU=0; [ -n "$KSU_BIN" ] && HAS_KSU=1',
+    'HAS_AP=0; [ -n "$APD_BIN" ] && HAS_AP=1',
+    'HAS_MAG=0; [ -n "$MAG_BIN" ] && HAS_MAG=1',
+    'ACT="none"; VER=""',
+    'if [ -n "$MAG_BIN" ] && "$MAG_BIN" -v >/dev/null 2>&1; then ACT="magisk"; VER=$("$MAG_BIN" -v 2>/dev/null | head -n 1); fi',
+    'if [ -n "$APD_BIN" ] && [ -d /data/adb/ap ] && "$APD_BIN" -V >/dev/null 2>&1; then if [ "$ACT" = "none" ] || [ -f /data/adb/ap/package_config ]; then ACT="apatch"; VER=$("$APD_BIN" -V 2>/dev/null | head -n 1); fi; fi',
+    'if [ -n "$KSU_BIN" ] && [ -d /data/adb/ksu ] && "$KSU_BIN" -V >/dev/null 2>&1; then if [ "$ACT" = "none" ] || [ "$ACT" != "magisk" ]; then ACT="ksu"; VER=$("$KSU_BIN" -V 2>/dev/null | head -n 1); fi; fi',
+    'if [ "$ACT" = "none" ]; then if [ "$HAS_KSU" = "1" ]; then ACT="ksu"; VER=$("$KSU_BIN" -V 2>/dev/null | head -n 1); elif [ "$HAS_AP" = "1" ]; then ACT="apatch"; VER=$("$APD_BIN" -V 2>/dev/null | head -n 1); elif [ "$HAS_MAG" = "1" ]; then ACT="magisk"; VER=$("$MAG_BIN" -v 2>/dev/null | head -n 1); fi; fi',
+    'echo "ACT=$ACT"',
+    'echo "VER=$VER"',
+    'echo "HAS_KSU=$HAS_KSU"',
+    'echo "HAS_AP=$HAS_AP"',
+    'echo "HAS_MAG=$HAS_MAG"',
+  ].join('\n');
+
+  const res = await execRootShell(probeCmd);
+  const kv: Record<string, string> = {};
+  for (const line of (res.stdout || '').split(/\r?\n/)) {
+    const eq = line.indexOf('=');
+    if (eq > 0) {
+      kv[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    }
+  }
+
+  const act = kv.ACT as 'ksu' | 'apatch' | 'magisk' | 'none';
+  mirageStore.ota.detectedManager =
+    act === 'ksu' || act === 'apatch' || act === 'magisk' ? act : 'none';
+  mirageStore.ota.managerVersion = kv.VER || '';
+  mirageStore.ota.availableManagers = {
+    ksu: kv.HAS_KSU === '1',
+    apatch: kv.HAS_AP === '1',
+    magisk: kv.HAS_MAG === '1',
+  };
+}
+
+export function setOtaMirrorMode(mode: OtaMirrorMode) {
+  mirageStore.ota.mirrorMode = mode;
+  localStorage.setItem('mirage_ota_mirror', mode);
+}
+
+/**
+ * 6. OTA 实时流式刷入引擎（后台执行下载/校验/调用 ksud|apd|magisk + 250ms 零 Fork 终端滚屏）
+ */
+let otaPollTimer: any = null;
+let otaPollStartTs = 0;
+
+export function stopOtaPolling() {
+  if (otaPollTimer) {
+    clearInterval(otaPollTimer);
+    otaPollTimer = null;
+  }
+}
+
+function stripAnsiAndParseLogs(rawLog: string): { stage: OtaStage | null; lines: string[] } {
+  const cleaned = rawLog.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+  const rawLines = cleaned.split('\n');
+  const out: string[] = [];
+  let latestStage: OtaStage | null = null;
+
+  for (const rawLine of rawLines) {
+    // 处理 curl / 进度条的 \r 回车覆盖，仅保留该行最后一个非空片段
+    const parts = rawLine.split('\r');
+    let line = '';
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (parts[i].trim().length > 0) {
+        line = parts[i];
+        break;
+      }
+    }
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const stageMatch = trimmed.match(/^\[MF_STAGE:(detecting|downloading|verifying|installing|done)\]$/);
+    if (stageMatch) {
+      const s = stageMatch[1];
+      latestStage = s === 'done' ? 'success' : (s as OtaStage);
+      continue;
+    }
+    out.push(line);
+  }
+  return { stage: latestStage, lines: out };
+}
+
+function buildDownloadUrlList(zipUrl: string, mirror: OtaMirrorMode): string[] {
+  const isGithub = /^https:\/\/github\.com\//i.test(zipUrl);
+  if (!isGithub || mirror === 'direct') {
+    return [zipUrl];
+  }
+  const ghfast = `https://ghfast.top/${zipUrl}`;
+  const ghproxy = `https://gh-proxy.com/${zipUrl}`;
+  if (mirror === 'ghfast') return [ghfast, zipUrl];
+  if (mirror === 'ghproxy') return [ghproxy, zipUrl];
+  return [ghfast, ghproxy, zipUrl];
+}
+
+function buildOtaInstallScript(
+  urls: string[],
+  preferredManager: RootManagerKind,
+  targetVersion: string
+): string {
+  const quotedUrls = urls.map((u) => `"${u}"`).join(' ');
+  return `#!/system/bin/sh
+LOG="${OTA_LOG_FILE}"
+EXITF="${OTA_EXIT_FILE}"
+ZIP="${OTA_ZIP_FILE}"
+rm -f "$LOG" "$EXITF" "$ZIP"
+: > "$LOG"
+chmod 600 "$LOG"
+exec > "$LOG" 2>&1
+
+finish() {
+  code="$1"
+  rm -f "$ZIP"
+  echo "$code" > "$EXITF"
+  chmod 600 "$EXITF"
+  exit "$code"
+}
+
+echo "[MF_STAGE:detecting]"
+echo "=========================================="
+echo "  MirageForge OTA Updater -> v${targetVersion}"
+echo "=========================================="
+
+PREF="${preferredManager}"
+KSU_BIN=""; [ -x /data/adb/ksud ] && KSU_BIN=/data/adb/ksud || KSU_BIN=$(command -v ksud 2>/dev/null)
+APD_BIN=""; [ -x /data/adb/apd ] && APD_BIN=/data/adb/apd || APD_BIN=$(command -v apd 2>/dev/null)
+MAG_BIN=""
+for p in "$(command -v magisk 2>/dev/null)" /sbin/magisk /debug_ramdisk/magisk /system/bin/magisk; do
+  if [ -n "$p" ] && [ -x "$p" ]; then
+    MAG_BIN="$p"
+    break
+  fi
+done
+
+TARGET_MGR="$PREF"
+if [ "$TARGET_MGR" = "auto" ]; then
+  TARGET_MGR="none"
+  if [ -n "$MAG_BIN" ] && "$MAG_BIN" -v >/dev/null 2>&1; then TARGET_MGR="magisk"; fi
+  if [ -n "$APD_BIN" ] && [ -d /data/adb/ap ] && "$APD_BIN" -V >/dev/null 2>&1; then
+    if [ "$TARGET_MGR" = "none" ] || [ -f /data/adb/ap/package_config ]; then TARGET_MGR="apatch"; fi
+  fi
+  if [ -n "$KSU_BIN" ] && [ -d /data/adb/ksu ] && "$KSU_BIN" -V >/dev/null 2>&1; then
+    if [ "$TARGET_MGR" = "none" ] || [ "$TARGET_MGR" != "magisk" ]; then TARGET_MGR="ksu"; fi
+  fi
+  if [ "$TARGET_MGR" = "none" ]; then
+    if [ -n "$KSU_BIN" ]; then TARGET_MGR="ksu"
+    elif [ -n "$APD_BIN" ]; then TARGET_MGR="apatch"
+    elif [ -n "$MAG_BIN" ]; then TARGET_MGR="magisk"
+    fi
+  fi
+fi
+
+INSTALL_BIN=""
+case "$TARGET_MGR" in
+  ksu)
+    INSTALL_BIN="$KSU_BIN"
+    echo "[*] 选定刷入后端: KernelSU ($INSTALL_BIN)"
+    ;;
+  apatch)
+    INSTALL_BIN="$APD_BIN"
+    echo "[*] 选定刷入后端: APatch ($INSTALL_BIN)"
+    ;;
+  magisk)
+    INSTALL_BIN="$MAG_BIN"
+    echo "[*] 选定刷入后端: Magisk ($INSTALL_BIN)"
+    ;;
+  *)
+    echo "[!] 未检测到可用的 KernelSU (ksud) / APatch (apd) / Magisk 命令行！"
+    finish 10
+    ;;
+esac
+
+if [ -z "$INSTALL_BIN" ] || [ ! -x "$INSTALL_BIN" ]; then
+  echo "[!] 所选管理器二进制不存在或不可执行: $TARGET_MGR"
+  finish 11
+fi
+
+echo "[MF_STAGE:downloading]"
+CURL_BIN=$(command -v curl 2>/dev/null)
+WGET_BIN=$(command -v wget 2>/dev/null)
+if [ -z "$WGET_BIN" ]; then
+  for bb in /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox /data/adb/magisk/busybox; do
+    if [ -x "$bb" ]; then
+      WGET_BIN="$bb wget"
+      break
+    fi
+  done
+fi
+
+if [ -z "$CURL_BIN" ] && [ -z "$WGET_BIN" ]; then
+  echo "[!] 系统缺少 curl 与 wget，无法下载更新包。"
+  finish 12
+fi
+
+DL_OK=0
+for URL in ${quotedUrls}; do
+  echo "[*] 正在下载更新包: $URL"
+  rm -f "$ZIP"
+  if [ -n "$CURL_BIN" ]; then
+    "$CURL_BIN" -fSL --connect-timeout 12 --max-time 180 -A "MirageForge-OTA" -o "$ZIP" "$URL"
+    RC=$?
+  else
+    $WGET_BIN -T 20 -O "$ZIP" "$URL"
+    RC=$?
+  fi
+  if [ "$RC" -eq 0 ] && [ -s "$ZIP" ]; then
+    DL_OK=1
+    echo "[+] 下载完成，已保存至临时文件"
+    break
+  else
+    echo "[!] 当前线路下载失败 (code=$RC)，尝试下一线路..."
+  fi
+done
+
+if [ "$DL_OK" -ne 1 ]; then
+  echo "[!] 所有下载线路均失败，请检查网络连接或切换镜像线路。"
+  finish 13
+fi
+
+echo "[MF_STAGE:verifying]"
+FILE_SIZE=$(wc -c < "$ZIP" 2>/dev/null | tr -d ' ')
+echo "[*] 更新包大小: \${FILE_SIZE:-0} bytes"
+if [ -z "$FILE_SIZE" ] || [ "$FILE_SIZE" -lt 10240 ]; then
+  echo "[!] 更新包体积异常过小，可能下载到了错误页面。"
+  finish 14
+fi
+
+MAGIC=$(head -c 2 "$ZIP" 2>/dev/null)
+if [ "$MAGIC" != "PK" ]; then
+  echo "[!] 文件头校验失败：不是有效的 ZIP 模块压缩包。"
+  finish 15
+fi
+
+UNZIP_BIN=$(command -v unzip 2>/dev/null)
+if [ -n "$UNZIP_BIN" ]; then
+  if "$UNZIP_BIN" -tq "$ZIP" >/dev/null 2>&1; then
+    echo "[+] ZIP 压缩包 CRC 完整性校验通过"
+  else
+    echo "[!] ZIP 压缩包已损坏，终止刷入！"
+    finish 16
+  fi
+else
+  echo "[+] ZIP 魔数头校验通过 (PK)"
+fi
+
+echo "[MF_STAGE:installing]"
+echo "------------------------------------------"
+echo "[*] 正在调用 $TARGET_MGR 安装模块，以下为脚本实时输出:"
+echo "------------------------------------------"
+
+case "$TARGET_MGR" in
+  ksu)
+    "$INSTALL_BIN" module install "$ZIP"
+    INST_RC=$?
+    ;;
+  apatch)
+    "$INSTALL_BIN" module install "$ZIP"
+    INST_RC=$?
+    ;;
+  magisk)
+    "$INSTALL_BIN" --install-module "$ZIP"
+    INST_RC=$?
+    ;;
+esac
+
+echo "------------------------------------------"
+if [ "$INST_RC" -eq 0 ]; then
+  echo "[+] 模块刷入成功 (exit=0)！请重启设备使新版本生效。"
+  echo "[MF_STAGE:done]"
+  finish 0
+else
+  echo "[!] 模块刷入失败 (exit=$INST_RC)"
+  finish "$INST_RC"
+fi
+`;
+}
+
+export async function startOtaInstall() {
+  if (mirageStore.ota.running) return;
+  const zipUrl = mirageStore.updateInfo.zipUrl.trim();
+  if (!zipUrl || !isSafeHttpUrl(zipUrl)) {
+    mirageStore.ota.stage = 'error';
+    mirageStore.ota.errorMsg = '更新包下载地址无效，请先重新检查更新';
+    showToast(mirageStore.ota.errorMsg);
+    return;
+  }
+
+  stopOtaPolling();
+  mirageStore.ota.running = true;
+  mirageStore.ota.stage = 'detecting';
+  mirageStore.ota.errorMsg = '';
+  mirageStore.ota.logs = ['[*] 正在初始化 OTA 刷入环境...'];
+  triggerHaptic('medium');
+
+  // 桌面浏览器调试环境模拟流式输出
+  if (detectRuntimeEnv() === 'BrowserMock') {
+    const mockSteps: Array<{ delay: number; stage: OtaStage; line: string }> = [
+      { delay: 400, stage: 'detecting', line: '[*] 选定刷入后端: KernelSU (/data/adb/ksud)' },
+      { delay: 900, stage: 'downloading', line: `[*] 正在下载更新包: ${zipUrl}` },
+      { delay: 1600, stage: 'downloading', line: '[+] 下载完成，已保存至临时文件 (2.4 MB)' },
+      { delay: 2000, stage: 'verifying', line: '[+] ZIP 压缩包 CRC 完整性校验通过' },
+      { delay: 2400, stage: 'installing', line: '- Unzipping files...' },
+      { delay: 2900, stage: 'installing', line: '- Mounting /data/adb/modules_update/mirage_forge' },
+      { delay: 3400, stage: 'installing', line: '- Installing MirageForge v' + (mirageStore.updateInfo.latestVersion || '1.3.0') },
+      { delay: 3900, stage: 'installing', line: '- Setting permissions...' },
+      { delay: 4400, stage: 'success', line: '[+] 模块刷入成功 (exit=0)！请重启设备使新版本生效。' },
+    ];
+    for (const s of mockSteps) {
+      setTimeout(() => {
+        mirageStore.ota.stage = s.stage;
+        mirageStore.ota.logs.push(s.line);
+        if (s.stage === 'success') {
+          mirageStore.ota.running = false;
+          triggerHaptic('success');
+        }
+      }, s.delay);
+    }
+    return;
+  }
+
+  await detectRootManagerForOta();
+
+  const urls = buildDownloadUrlList(zipUrl, mirageStore.ota.mirrorMode);
+  const scriptContent = buildOtaInstallScript(
+    urls,
+    mirageStore.ota.selectedManager,
+    mirageStore.updateInfo.latestVersion || 'latest'
+  );
+
+  await removeFileZeroFork(OTA_EXIT_FILE);
+  await removeFileZeroFork(OTA_LOG_FILE);
+
+  const written = await writeFileZeroFork(OTA_SCRIPT_FILE, scriptContent);
+  if (!written) {
+    mirageStore.ota.running = false;
+    mirageStore.ota.stage = 'error';
+    mirageStore.ota.errorMsg = '无法写入临时刷入脚本至 /data/local/tmp';
+    mirageStore.ota.logs.push(`[!] ${mirageStore.ota.errorMsg}`);
+    return;
+  }
+
+  // 彻底重定向 stdin/stdout/stderr 后后台拉起，避免阻塞 ksu.exec 回调
+  const launchRes = await execRootShell(
+    `chmod 700 "${OTA_SCRIPT_FILE}" && ( /system/bin/sh "${OTA_SCRIPT_FILE}" </dev/null >/dev/null 2>&1 & )`
+  );
+  if (launchRes.errno !== 0) {
+    mirageStore.ota.running = false;
+    mirageStore.ota.stage = 'error';
+    mirageStore.ota.errorMsg = `启动 OTA 后台进程失败 (errno=${launchRes.errno})`;
+    mirageStore.ota.logs.push(`[!] ${mirageStore.ota.errorMsg}`);
+    return;
+  }
+
+  otaPollStartTs = Date.now();
+  let pollingBusy = false;
+
+  otaPollTimer = setInterval(async () => {
+    if (pollingBusy) return;
+    pollingBusy = true;
+    try {
+      const rawLog = await readFileZeroFork(OTA_LOG_FILE);
+      if (rawLog) {
+        const parsed = stripAnsiAndParseLogs(rawLog);
+        if (parsed.lines.length > 0) {
+          mirageStore.ota.logs = parsed.lines;
+        }
+        if (parsed.stage) {
+          mirageStore.ota.stage = parsed.stage;
+        }
+      }
+
+      const exitRaw = (await readFileZeroFork(OTA_EXIT_FILE)).trim();
+      if (exitRaw.length > 0) {
+        stopOtaPolling();
+        const code = parseInt(exitRaw, 10);
+        mirageStore.ota.running = false;
+        await removeFileZeroFork(OTA_SCRIPT_FILE);
+        await removeFileZeroFork(OTA_EXIT_FILE);
+
+        if (code === 0) {
+          mirageStore.ota.stage = 'success';
+          mirageStore.ota.errorMsg = '';
+          triggerHaptic('success');
+          showToast('更新刷入完成，重启设备后生效');
+        } else {
+          mirageStore.ota.stage = 'error';
+          mirageStore.ota.errorMsg = `刷入中断，退出码: ${isNaN(code) ? exitRaw : code}`;
+          triggerHaptic('heavy');
+          showToast(mirageStore.ota.errorMsg);
+        }
+      } else if (Date.now() - otaPollStartTs > 300000) {
+        stopOtaPolling();
+        mirageStore.ota.running = false;
+        mirageStore.ota.stage = 'error';
+        mirageStore.ota.errorMsg = '更新执行超时 (超过 5 分钟)，请检查网络或手动重试';
+        mirageStore.ota.logs.push(`[!] ${mirageStore.ota.errorMsg}`);
+      }
+    } finally {
+      pollingBusy = false;
+    }
+  }, 250);
+}
+
+export async function rebootDeviceNow() {
+  triggerHaptic('heavy');
+  showToast('正在重启设备...');
+  await execRootShell('svc power reboot || reboot');
+}
+
+/**
+ * 7. URL-Safe Base64 模板分享码编解码器 (与 Rust CLI mf:// 格式 100% 互通)
  */
 export function encodeTemplateShareCode(tpl: DeviceTemplate): string {
   const normalized = normalizeTemplateVulkanFields(tpl);
@@ -686,7 +1248,7 @@ export function saveCustomHubUrl(url: string) {
 }
 
 /**
- * 5. 在线机型库多通道真联网拉取 (自定义源 -> jsDelivr CDN -> GitHub Raw，含 Root curl 兜底)
+ * 8. 在线机型库多通道真联网拉取
  */
 export async function fetchOnlineTemplateHub(forceToast = false) {
   mirageStore.hubLoading = true;
@@ -704,7 +1266,7 @@ export async function fetchOnlineTemplateHub(forceToast = false) {
 
   for (const src of sources) {
     try {
-      const { text, via } = await fetchJsonTextWithFallback(src.url);
+      const { text, via } = await fetchTextWithFallback(src.url);
       const raw = JSON.parse(text);
       const list = Array.isArray(raw) ? raw : Array.isArray(raw?.templates) ? raw.templates : null;
 
@@ -752,7 +1314,7 @@ export async function fetchOnlineTemplateHub(forceToast = false) {
 }
 
 /**
- * 6. TypeScript 内存级微模块 .conf 编译器 (与 Rust CLI compiler.rs 100% 同步)
+ * 9. TypeScript 内存级微模块 .conf 编译器 (与 Rust CLI compiler.rs 100% 同步)
  */
 function compileModularConfInTs(rawTpl: DeviceTemplate, route: AppRoute): string {
   const tpl = normalizeTemplateVulkanFields(rawTpl);

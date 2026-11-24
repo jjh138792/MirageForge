@@ -24,6 +24,8 @@ import TemplateForgeView from './components/TemplateForgeView.vue';
 import PropAlchemyView from './components/PropAlchemyView.vue';
 import AppMatrixView from './components/AppMatrixView.vue';
 import ProbeRadarView from './components/ProbeRadarView.vue';
+import OtaChangelogModal from './components/OtaChangelogModal.vue';
+import OtaUpdateView from './components/OtaUpdateView.vue';
 
 import { useI18n } from './i18n';
 import {
@@ -50,6 +52,11 @@ const currentTab = ref<TabKey>('templates');
 const runtimeEnv = ref(detectRuntimeEnv());
 const pendingParsedTemplate = ref<DeviceTemplate | null>(null);
 
+// OTA 更新日志弹窗与独立更新页面状态
+const showChangelogModal = ref(false);
+const inUpdatePage = ref(false);
+const otaAutoStart = ref(false);
+
 const activeAppCount = computed(() => Object.keys(mirageStore.appRoutes).length);
 
 const navItems = computed(() => [
@@ -65,12 +72,12 @@ const themeLabel = computed(() => {
 });
 
 // ============================================================================
-// 二阶弹簧阻尼液态玻璃球物理引擎 (支持点击跳跃、长按放大透镜、快慢阻尼拖拽)
+// 二阶弹簧阻尼液态玻璃球物理引擎
 // ============================================================================
 const dockRef = ref<HTMLElement | null>(null);
-const orbX = ref(0);        // 归一化页签位置 0.0 ~ 3.0
-const orbScaleX = ref(1);   // 水平水滴拉伸系数
-const orbScaleY = ref(1);   // 垂直水滴压缩系数
+const orbX = ref(0);
+const orbScaleX = ref(1);
+const orbScaleY = ref(1);
 const isOrbPressed = ref(false);
 const isOrbDragging = ref(false);
 
@@ -81,7 +88,6 @@ let rafId = 0;
 let lastFrameTime = performance.now();
 let longPressTimer: any = null;
 let pointerStartX = 0;
-let dragStartOrbX = 0;
 
 function startPhysicsLoop() {
   if (rafId) return;
@@ -93,9 +99,8 @@ function startPhysicsLoop() {
 
     const curX = springX.step(dt);
     const baseScale = springScale.step(dt);
-    const vx = springX.vel; // 当前水平运动速度
+    const vx = springX.vel;
 
-    // 根据拖拽/滑动速度产生真实的流体阻尼拉伸形变 (拖得越快，水滴拉得越长)
     const speedStretch = Math.min(0.32, Math.abs(vx) * 0.055);
     const speedSquash = Math.min(0.16, Math.abs(vx) * 0.028);
 
@@ -103,7 +108,6 @@ function startPhysicsLoop() {
     orbScaleX.value = baseScale + speedStretch;
     orbScaleY.value = baseScale - speedSquash;
 
-    // 动态调整 SVG 凸透镜折射强度：放大或高速移动时增强水波弯曲感
     const dynamicRefraction = 26 + Math.min(28, Math.abs(vx) * 4 + (baseScale - 1) * 55);
     setOrbRefractionScale(dynamicRefraction);
 
@@ -122,7 +126,6 @@ function selectTabByIndex(idx: number, fromDrag = false) {
   const clamped = Math.max(0, Math.min(3, idx));
   const targetKey = navItems.value[clamped].key;
 
-  // 根据跨越距离调整弹簧刚度，使长距离滑动更有流体惯性
   springX.stiffness = fromDrag ? 290 : 230;
   springX.damping = fromDrag ? 22 : 19;
   springX.target = clamped;
@@ -151,9 +154,6 @@ function onDockPointerDown(e: PointerEvent) {
   const slotW = innerW / 4;
   const clickIdx = Math.max(0, Math.min(3, (e.clientX - rect.left - pad) / slotW - 0.5));
 
-  dragStartOrbX = clickIdx;
-
-  // 长按超过 150ms 触发液态玻璃球膨胀放大为凸透镜
   if (longPressTimer) clearTimeout(longPressTimer);
   longPressTimer = setTimeout(() => {
     if (isOrbPressed.value) {
@@ -171,7 +171,7 @@ function onDockPointerMove(e: PointerEvent) {
   const deltaX = e.clientX - pointerStartX;
   if (Math.abs(deltaX) > 6 && !isOrbDragging.value) {
     isOrbDragging.value = true;
-    springScale.target = 1.18; // 拖拽态保持水滴饱满膨胀
+    springScale.target = 1.18;
   }
 
   if (isOrbDragging.value) {
@@ -180,11 +180,9 @@ function onDockPointerMove(e: PointerEvent) {
     const slotW = (rect.width - pad * 2) / 4;
     let rawIdx = (e.clientX - rect.left - pad) / slotW - 0.5;
 
-    // 左右边界橡皮筋阻尼效应 (Rubber-band damping)
     if (rawIdx < 0) rawIdx = rawIdx * 0.28;
     if (rawIdx > 3) rawIdx = 3 + (rawIdx - 3) * 0.28;
 
-    // 拖拽时调低弹簧刚度、增大阻尼，让球呈现“水滴粘滞跟随”手感
     springX.stiffness = 380;
     springX.damping = 26;
     springX.target = rawIdx;
@@ -215,17 +213,35 @@ function handleAlchemyParsed(tpl: DeviceTemplate) {
   selectTabByIndex(0);
 }
 
-function handleUpdateClick() {
-  if (mirageStore.updateInfo.hasUpdate && mirageStore.updateInfo.zipUrl) {
-    window.open(mirageStore.updateInfo.zipUrl, '_blank');
-  } else {
-    checkOnlineUpdate(t);
+async function handleUpdateClick() {
+  if (inUpdatePage.value) return;
+  if (mirageStore.updateInfo.hasUpdate) {
+    triggerHaptic('light');
+    showChangelogModal.value = true;
+    return;
   }
+  const hasNew = await checkOnlineUpdate(t, false);
+  if (hasNew) {
+    showChangelogModal.value = true;
+  }
+}
+
+function enterOtaUpdatePage() {
+  showChangelogModal.value = false;
+  otaAutoStart.value = true;
+  inUpdatePage.value = true;
+}
+
+function leaveOtaUpdatePage() {
+  otaAutoStart.value = false;
+  inUpdatePage.value = false;
 }
 
 onMounted(async () => {
   await syncStateFromRustCli();
   await reloadAppList();
+  // 启动后后台静默检查一次更新（仅在有新版本时点亮顶栏徽章，不打扰用户）
+  checkOnlineUpdate(t, true);
 });
 
 onUnmounted(() => {
@@ -235,7 +251,7 @@ onUnmounted(() => {
 
 <template>
   <div class="mirage-shell">
-    <!-- 1. 动态流体极光画布 (随日夜主题平滑过渡) -->
+    <!-- 1. 动态流体极光画布 -->
     <div class="ambient-canvas" aria-hidden="true">
       <div class="aurora-blob blob-1"></div>
       <div class="aurora-blob blob-2"></div>
@@ -257,7 +273,7 @@ onUnmounted(() => {
       </div>
 
       <div class="header-actions">
-        <!-- 在线检查更新按钮 -->
+        <!-- 在线检查更新 / 弹出更新日志按钮 -->
         <button
           class="tool-btn tactile-press"
           :class="{ 'has-update-glow': mirageStore.updateInfo.hasUpdate }"
@@ -305,11 +321,16 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <!-- 3. 主内容动态视图区 -->
+    <!-- 3. 主内容动态视图区 (支持无缝切换至独立 OTA 更新页) -->
     <main class="viewport-stage">
       <Transition name="view-morph" mode="out-in">
+        <OtaUpdateView
+          v-if="inUpdatePage"
+          :auto-start="otaAutoStart"
+          @back="leaveOtaUpdatePage"
+        />
         <TemplateForgeView
-          v-if="currentTab === 'templates'"
+          v-else-if="currentTab === 'templates'"
           :incoming-template="pendingParsedTemplate"
           @clear-incoming="pendingParsedTemplate = null"
         />
@@ -322,7 +343,14 @@ onUnmounted(() => {
       </Transition>
     </main>
 
-    <!-- 4. 液态玻璃浮动通知气泡 -->
+    <!-- 4. 更新日志弹窗 -->
+    <OtaChangelogModal
+      :visible="showChangelogModal"
+      @close="showChangelogModal = false"
+      @start-update="enterOtaUpdatePage"
+    />
+
+    <!-- 5. 液态玻璃浮动通知气泡 -->
     <Transition name="view-morph">
       <div v-if="activeToastMsg" class="liquid-toast liquid-glass liquid-glass-elevated">
         <span class="toast-dot"></span>
@@ -330,39 +358,39 @@ onUnmounted(() => {
       </div>
     </Transition>
 
-    <!-- 5. 底部悬浮灵动岛：支持点击回弹、长按透镜放大、快慢阻尼拖拽的真·液态玻璃球 -->
-    <nav class="floating-dock-wrap">
-      <div
-        ref="dockRef"
-        class="floating-dock liquid-glass liquid-glass-elevated"
-        @pointerdown="onDockPointerDown"
-        @pointermove="onDockPointerMove"
-        @pointerup="onDockPointerUp"
-        @pointercancel="onDockPointerUp"
-      >
-        <!-- 底层页签图标与文字 (处于 z-index: 1，会被上方的液态玻璃球实时光学折射！) -->
+    <!-- 6. 底部悬浮灵动岛（进入独立更新页时自动收起，留出透明终端完整视野） -->
+    <Transition name="view-morph">
+      <nav v-if="!inUpdatePage" class="floating-dock-wrap">
         <div
-          v-for="(item, idx) in navItems"
-          :key="item.key"
-          class="dock-item"
-          :class="{ active: currentTab === item.key }"
+          ref="dockRef"
+          class="floating-dock liquid-glass liquid-glass-elevated"
+          @pointerdown="onDockPointerDown"
+          @pointermove="onDockPointerMove"
+          @pointerup="onDockPointerUp"
+          @pointercancel="onDockPointerUp"
         >
-          <component :is="item.icon" :size="19" class="dock-icon" />
-          <span class="dock-label">{{ item.label }}</span>
-        </div>
+          <div
+            v-for="item in navItems"
+            :key="item.key"
+            class="dock-item"
+            :class="{ active: currentTab === item.key }"
+          >
+            <component :is="item.icon" :size="19" class="dock-icon" />
+            <span class="dock-label">{{ item.label }}</span>
+          </div>
 
-        <!-- 顶层光学折射液态玻璃球 (处于 z-index: 2，透过它直接折射下方的文字与背景) -->
-        <div
-          class="dock-liquid-orb liquid-orb-pill"
-          :class="{ 'orb-magnified': isOrbPressed }"
-          :style="{
-            transform: `translate3d(${orbX * 100}%, 0, 0) scale(${orbScaleX}, ${orbScaleY})`,
-          }"
-        >
-          <div class="orb-specular-glint"></div>
+          <div
+            class="dock-liquid-orb liquid-orb-pill"
+            :class="{ 'orb-magnified': isOrbPressed }"
+            :style="{
+              transform: `translate3d(${orbX * 100}%, 0, 0) scale(${orbScaleX}, ${orbScaleY})`,
+            }"
+          >
+            <div class="orb-specular-glint"></div>
+          </div>
         </div>
-      </div>
-    </nav>
+      </nav>
+    </Transition>
   </div>
 </template>
 
@@ -506,9 +534,6 @@ onUnmounted(() => {
   box-shadow: 0 0 10px #10b981;
 }
 
-/* ==========================================================================
-   底部可拖拽光学折射液态玻璃球导航栏
-   ========================================================================== */
 .floating-dock-wrap {
   position: fixed;
   bottom: calc(var(--inset-bottom) + 12px);
@@ -539,7 +564,6 @@ onUnmounted(() => {
   cursor: grabbing;
 }
 
-/* 底层图标与文字：处于玻璃球下方，以便被液态玻璃球的 backdrop-filter 实时折射放大 */
 .dock-item {
   position: relative;
   z-index: 1;
@@ -570,7 +594,6 @@ onUnmounted(() => {
   font-weight: 700;
 }
 
-/* 顶层真·液态玻璃球：覆盖在 dock-item 之上，透过 backdrop-filter: url(#mirage-orb-lens) 产生水滴折射 */
 .dock-liquid-orb {
   position: absolute;
   z-index: 2;
@@ -583,7 +606,6 @@ onUnmounted(() => {
   transform-origin: center center;
 }
 
-/* 水滴顶部高光镜面反射弧 */
 .orb-specular-glint {
   position: absolute;
   top: 3px;
