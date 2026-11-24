@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2025-2026 jjh138792
+// MirageForge: https://github.com/jjh138792/MirageForge
+
 use crate::fs_atomic::{is_safe_token, read_file_str, truncate_file, write_file_atomic};
 use crate::models::*;
 use crate::store::StoreEngine;

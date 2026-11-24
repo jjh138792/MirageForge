@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2025-2026 jjh138792
+// MirageForge: https://github.com/jjh138792/MirageForge
+
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fs;

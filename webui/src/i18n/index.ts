@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2025-2026 jjh138792
+// MirageForge: https://github.com/jjh138792/MirageForge
+
 import { ref, computed } from 'vue';
 
 export type LocaleCode = 'zh-CN' | 'zh-TW' | 'en-US';
