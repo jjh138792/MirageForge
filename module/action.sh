@@ -1,4 +1,8 @@
 #!/system/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (c) 2025-2026 jjh138792
+# MirageForge: https://github.com/jjh138792/MirageForge
+
 CLI="/data/adb/modules/mirage_forge/bin/mirageforge_cli"
 
 if [ ! -x "$CLI" ]; then

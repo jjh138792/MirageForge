@@ -1,3 +1,9 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Copyright (c) 2025-2026 jjh138792
+ * MirageForge: https://github.com/jjh138792/MirageForge
+ */
+ 
 :root {
   --inset-top: var(--window-inset-top, env(safe-area-inset-top, 14px));
   --inset-bottom: var(--window-inset-bottom, env(safe-area-inset-bottom, 18px));

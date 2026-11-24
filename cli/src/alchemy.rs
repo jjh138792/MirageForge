@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2025-2026 jjh138792
+// MirageForge: https://github.com/jjh138792/MirageForge
+
 use crate::models::{sanitize_refresh_rate, DeviceTemplate};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};

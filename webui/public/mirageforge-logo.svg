@@ -1,3 +1,9 @@
+<!--
+SPDX-License-Identifier: GPL-3.0-only
+Copyright (c) 2025-2026 jjh138792
+MirageForge: https://github.com/jjh138792/MirageForge
+-->
+
 <svg width="120" height="120" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="mf-bg-grad" x1="10" y1="8" x2="110" y2="112" gradientUnits="userSpaceOnUse">

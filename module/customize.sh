@@ -1,4 +1,8 @@
 #!/system/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (c) 2025-2026 jjh138792
+# MirageForge: https://github.com/jjh138792/MirageForge
+
 SKIPUNZIP=1
 
 unzip -o "$ZIPFILE" "module.prop" -d "$MODPATH" >&2 || abort "! 错误：无法读取 module.prop"

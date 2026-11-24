@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2025-2026 jjh138792
+// MirageForge: https://github.com/jjh138792/MirageForge
+
 use crate::compiler::compile_modular_conf;
 use crate::fs_atomic::{
     ensure_dir, ensure_empty_log_file, is_safe_token, read_file_str, write_file_atomic,
