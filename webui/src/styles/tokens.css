@@ -20,7 +20,6 @@
   --accent-secondary-rgb: 6, 182, 212;
 }
 
-/* 5 套动态主题强调色 */
 :root[data-accent="violet"] {
   --accent-primary: #8b5cf6;
   --accent-secondary: #06b6d4;
@@ -62,27 +61,34 @@
   --bg-gradient: radial-gradient(circle at 50% 0%, #111a30 0%, #060913 72%);
   --blob-opacity: 0.44;
 
-  --glass-bg: rgba(16, 23, 40, 0.44);
-  --glass-bg-elevated: rgba(20, 29, 50, 0.56);
+  --glass-bg: rgba(16, 23, 40, 0.56);
+  --glass-bg-elevated: rgba(20, 28, 46, 0.72);
+  --dock-surface-bg: rgba(18, 25, 42, 0.80);
   --glass-border: rgba(255, 255, 255, 0.14);
-  --glass-rim-top: rgba(255, 255, 255, 0.44);
-  --glass-rim-bottom: rgba(var(--accent-secondary-rgb), 0.24);
-  --glass-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.56);
+  --glass-rim-top: rgba(255, 255, 255, 0.36);
+  --glass-rim-bottom: rgba(var(--accent-secondary-rgb), 0.18);
+  --glass-shadow: 0 14px 34px -8px rgba(0, 0, 0, 0.55);
 
-  /* 高透光学水滴基底：不再依赖模糊，靠明暗弧面高光与焦散边还原玻璃厚度 */
-  --orb-bg: radial-gradient(
-    130% 120% at 32% 16%,
-    rgba(255, 255, 255, 0.34) 0%,
-    rgba(255, 255, 255, 0.05) 42%,
-    rgba(var(--accent-primary-rgb), 0.14) 76%,
-    rgba(var(--accent-secondary-rgb), 0.24) 100%
+  /* 静止态药丸（柔和干净，无扭曲） */
+  --orb-idle-bg: rgba(255, 255, 255, 0.12);
+  --orb-idle-border: rgba(255, 255, 255, 0.14);
+  --orb-idle-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+
+  /* 交互液滴态（晶莹高透水晶球，仅边缘极细玻璃折光） */
+  --orb-liquid-bg: radial-gradient(
+    115% 115% at 50% 18%,
+    rgba(255, 255, 255, 0.14) 0%,
+    rgba(255, 255, 255, 0.03) 56%,
+    rgba(255, 255, 255, 0.11) 100%
   );
-  --orb-rim: inset 0 2px 3px rgba(255, 255, 255, 0.82),
-             inset 0 -2.5px 5px rgba(var(--accent-secondary-rgb), 0.52),
-             inset 1.5px 0 3px rgba(var(--accent-primary-rgb), 0.32),
-             0 10px 26px -6px rgba(0, 0, 0, 0.55);
+  --orb-liquid-rim:
+    inset 0 1.2px 1.8px rgba(255, 255, 255, 0.68),
+    inset 0 -1.2px 2.2px rgba(255, 255, 255, 0.24),
+    inset 1.2px 0 2px rgba(147, 197, 253, 0.28),
+    inset -1.2px 0 2px rgba(196, 181, 253, 0.28),
+    0 12px 28px -6px rgba(0, 0, 0, 0.52);
 
-  --input-bg: rgba(6, 10, 20, 0.56);
+  --input-bg: rgba(6, 10, 20, 0.58);
   --subcard-bg: rgba(255, 255, 255, 0.045);
   --toggle-off-bg: rgba(148, 163, 184, 0.26);
 
@@ -95,30 +101,38 @@
 :root[data-theme="light"] {
   --bg-base: #eef2ff;
   --bg-gradient: radial-gradient(circle at 50% 0%, #e0e7ff 0%, #f1f5f9 65%, #e2e8f0 100%);
-  --blob-opacity: 0.55;
+  --blob-opacity: 0.50;
 
-  --glass-bg: rgba(255, 255, 255, 0.52);
-  --glass-bg-elevated: rgba(255, 255, 255, 0.68);
-  --glass-border: rgba(255, 255, 255, 0.78);
+  --glass-bg: rgba(255, 255, 255, 0.66);
+  --glass-bg-elevated: rgba(255, 255, 255, 0.80);
+  --dock-surface-bg: rgba(255, 255, 255, 0.86);
+  --glass-border: rgba(255, 255, 255, 0.82);
   --glass-rim-top: rgba(255, 255, 255, 0.98);
-  --glass-rim-bottom: rgba(var(--accent-primary-rgb), 0.22);
-  --glass-shadow: 0 14px 30px -8px rgba(15, 23, 42, 0.10),
-                  0 4px 12px -2px rgba(var(--accent-primary-rgb), 0.08);
+  --glass-rim-bottom: rgba(var(--accent-primary-rgb), 0.14);
+  --glass-shadow: 0 12px 28px -8px rgba(15, 23, 42, 0.10),
+                  0 4px 10px -2px rgba(15, 23, 42, 0.05);
 
-  --orb-bg: radial-gradient(
-    130% 120% at 32% 16%,
-    rgba(255, 255, 255, 0.78) 0%,
-    rgba(255, 255, 255, 0.14) 46%,
-    rgba(var(--accent-primary-rgb), 0.13) 78%,
-    rgba(var(--accent-secondary-rgb), 0.22) 100%
+  /* 静止态药丸：对标原生高级温润浅灰药丸，图标与文字 100% 端正清晰 */
+  --orb-idle-bg: rgba(15, 23, 42, 0.085);
+  --orb-idle-border: rgba(15, 23, 42, 0.04);
+  --orb-idle-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+
+  /* 交互液滴态：对标高透纯白水晶球，边缘自然环绕微弱光学折光 */
+  --orb-liquid-bg: radial-gradient(
+    115% 115% at 50% 18%,
+    rgba(255, 255, 255, 0.32) 0%,
+    rgba(255, 255, 255, 0.04) 58%,
+    rgba(255, 255, 255, 0.22) 100%
   );
-  --orb-rim: inset 0 2px 4px rgba(255, 255, 255, 0.98),
-             inset 0 -2.5px 5px rgba(var(--accent-primary-rgb), 0.34),
-             inset 1.5px 0 3px rgba(var(--accent-secondary-rgb), 0.28),
-             0 10px 22px -6px rgba(15, 23, 42, 0.18);
+  --orb-liquid-rim:
+    inset 0 1.5px 2px rgba(255, 255, 255, 0.96),
+    inset 0 -1.5px 2.5px rgba(15, 23, 42, 0.07),
+    inset 1.5px 0 2.5px rgba(59, 130, 246, 0.18),
+    inset -1.5px 0 2.5px rgba(139, 92, 246, 0.16),
+    0 10px 24px -6px rgba(15, 23, 42, 0.18);
 
-  --input-bg: rgba(255, 255, 255, 0.72);
-  --subcard-bg: rgba(15, 23, 42, 0.04);
+  --input-bg: rgba(255, 255, 255, 0.78);
+  --subcard-bg: rgba(15, 23, 42, 0.042);
   --toggle-off-bg: rgba(100, 116, 139, 0.28);
 
   --text-primary: #0f172a;

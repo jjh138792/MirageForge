@@ -57,26 +57,21 @@
   100% { transform: translate3d(20px, -18px, 0) scale(0.95); }
 }
 
-/* 倒角折射液态玻璃卡片：锁定 flex-shrink: 0 彻底杜绝纵向 Flex 滚动容器内的挤压裁切 */
+/* 干净通透的液态毛玻璃卡片（锁定 flex-shrink: 0 杜绝滚动容器挤压） */
 .liquid-glass {
   position: relative;
   flex-shrink: 0;
   background: var(--glass-bg);
-  backdrop-filter: url(#mirage-card-lens) blur(16px) saturate(185%);
-  -webkit-backdrop-filter: url(#mirage-card-lens) blur(16px) saturate(185%);
+  backdrop-filter: blur(22px) saturate(185%);
+  -webkit-backdrop-filter: blur(22px) saturate(185%);
   border-radius: 24px;
   border: 1px solid var(--glass-border);
   box-shadow:
-    inset 0 1.5px 1.5px 0 var(--glass-rim-top),
-    inset 0 -1.5px 2px 0 var(--glass-rim-bottom),
+    inset 0 1px 1px 0 var(--glass-rim-top),
+    inset 0 -1px 1.5px 0 var(--glass-rim-bottom),
     var(--glass-shadow);
   overflow: hidden;
   transition: var(--theme-transition), transform 0.3s var(--spring-easing);
-}
-
-:root[data-refraction="off"] .liquid-glass {
-  backdrop-filter: blur(18px) saturate(170%);
-  -webkit-backdrop-filter: blur(18px) saturate(170%);
 }
 
 .liquid-glass::before {
@@ -101,26 +96,46 @@
 
 .liquid-glass-elevated {
   background: var(--glass-bg-elevated);
-  backdrop-filter: url(#mirage-card-lens) blur(22px) saturate(200%);
-  -webkit-backdrop-filter: url(#mirage-card-lens) blur(22px) saturate(200%);
+  backdrop-filter: blur(26px) saturate(195%);
+  -webkit-backdrop-filter: blur(26px) saturate(195%);
 }
 
-:root[data-refraction="off"] .liquid-glass-elevated {
-  backdrop-filter: blur(22px) saturate(180%);
-  -webkit-backdrop-filter: blur(22px) saturate(180%);
-}
-
-/* 真·零模糊水面拉伸液态玻璃球：纯光学位移 + RGB 色散 + 镜面焦散 */
+/* ==========================================================================
+   底部液态玻璃球：双态物理材质（静止 = 温润药丸，按住/滑动 = 晶莹曲面折射液滴）
+   ========================================================================== */
 .liquid-orb-pill {
-  background: var(--orb-bg);
-  backdrop-filter: url(#mirage-orb-lens) contrast(1.06) brightness(1.05);
-  -webkit-backdrop-filter: url(#mirage-orb-lens) contrast(1.06) brightness(1.05);
-  box-shadow: var(--orb-rim);
-  border: 1px solid var(--glass-rim-top);
+  background: var(--orb-idle-bg);
+  border: 1px solid var(--orb-idle-border);
+  box-shadow: var(--orb-idle-shadow);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   will-change: transform;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    box-shadow 0.24s ease;
 }
 
-:root[data-refraction="off"] .liquid-orb-pill {
-  backdrop-filter: blur(4px) saturate(180%);
-  -webkit-backdrop-filter: blur(4px) saturate(180%);
+/* 交互液滴态（按住、拖拽、滑行中）激活 1:1 胶囊 SDF 物理边缘拉伸折射 */
+.liquid-orb-pill.orb-liquid-active {
+  background: var(--orb-liquid-bg);
+  border: 1px solid var(--glass-rim-top);
+  box-shadow: var(--orb-liquid-rim);
+  backdrop-filter: url(#mirage-orb-lens) brightness(1.03) contrast(1.03);
+  -webkit-backdrop-filter: url(#mirage-orb-lens) brightness(1.03) contrast(1.03);
+}
+
+/* 「强水面拉伸」模式下，静止态也保留清透水滴边缘质感 */
+:root[data-refraction="vivid"] .liquid-orb-pill {
+  background: var(--orb-liquid-bg);
+  border: 1px solid var(--glass-rim-top);
+  box-shadow: var(--orb-liquid-rim);
+  backdrop-filter: url(#mirage-orb-lens) brightness(1.02);
+  -webkit-backdrop-filter: url(#mirage-orb-lens) brightness(1.02);
+}
+
+/* 「仅毛玻璃」模式下彻底关闭 SVG 位移，仅用柔和模糊 */
+:root[data-refraction="off"] .liquid-orb-pill.orb-liquid-active {
+  backdrop-filter: blur(6px) saturate(170%);
+  -webkit-backdrop-filter: blur(6px) saturate(170%);
 }

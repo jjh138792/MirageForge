@@ -4,18 +4,26 @@
 
 import type { RefractionLevel } from '../store/types';
 
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
 function clampByte(v: number): number {
-  return Math.max(0, Math.min(255, Math.round(v)));
+  return clamp(Math.round(v), 0, 255);
 }
 
 /**
- * 1. 生成高精度 Snell 定律球面液滴位移贴图 (256x128)
- * - 中心区 (r < 0.68)：温和凸透镜放大，底层文字/图标清晰放大不变糊
- * - 外缘液面弧面 (0.68 <= r < 1.0)：高曲率切向拉伸，产生真实水面边缘弯折与拉长效果
+ * 基于精确圆角胶囊距离场 (Rounded Capsule SDF) + Snell 折射定理生成位移贴图：
+ * - 按玻璃球真实 DOM 宽高比生成，保证左右半圆弧曲率与法线方向 100% 物理精确
+ * - 中心 56% 顶面：极平滑微放大（位移近乎 0），图标与文字完全端正锐利、零重影、零色散
+ * - 外圈 44% 液滴弧壁：沿真实胶囊圆弧法线强烈弯曲包裹，滑过相邻图标与汉字时呈现真液态玻璃边缘拉伸效果
  */
-function buildMeniscusOrbNormalMap(): string {
-  const width = 256;
+function buildCapsuleSdfRefractionMap(aspectWidth: number, aspectHeight: number): string {
+  const safeH = Math.max(40, aspectHeight);
+  const ratio = clamp(aspectWidth / safeH, 1.15, 3.2);
   const height = 128;
+  const width = Math.round(height * ratio);
+
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
@@ -24,99 +32,58 @@ function buildMeniscusOrbNormalMap(): string {
 
   const imgData = ctx.createImageData(width, height);
   const data = imgData.data;
-  const p = 3.2; // 超椭圆指数，贴合胶囊液滴轮廓
+
+  const halfW = (width - 1) * 0.5;
+  const halfH = (height - 1) * 0.5;
+  const radius = halfH; // 完美胶囊：圆角半径等于半高
+  const segHalfLen = Math.max(0, halfW - radius);
+
+  // 顶面平坦区比例（0 ~ 0.56 保持清澈端正，0.56 ~ 1.0 为强曲率液滴边缘弧面）
+  const rimStart = 0.56;
 
   for (let y = 0; y < height; y++) {
-    const ny = (y / (height - 1)) * 2 - 1;
-    const ay = Math.abs(ny);
+    const py = y - halfH;
     for (let x = 0; x < width; x++) {
-      const nx = (x / (width - 1)) * 2 - 1;
-      const ax = Math.abs(nx);
+      const px = x - halfW;
 
-      const r = Math.pow(Math.pow(ax, p) + Math.pow(ay, p), 1 / p);
+      // 到胶囊中心线段的最近点，得出严格垂直于胶囊轮廓的外法线
+      const cx = clamp(px, -segHalfLen, segHalfLen);
+      const vx = px - cx;
+      const vy = py;
+      const dist = Math.hypot(vx, vy);
+      const t = dist / radius; // 0 = 中心轴线, 1 = 胶囊最外缘
+
       let dx = 0;
       let dy = 0;
 
-      if (r > 0.0001 && r < 1.0) {
-        // 超椭圆外法线梯度方向
-        const gx = Math.sign(nx) * Math.pow(ax, p - 1);
-        const gy = Math.sign(ny) * Math.pow(ay, p - 1);
-        const gLen = Math.hypot(gx, gy) || 1;
-        const ux = gx / gLen;
-        const uy = gy / gLen;
+      if (dist > 0.001 && t < 1.0) {
+        const nx = vx / dist;
+        const ny = vy / dist;
 
-        // 分区物理折射斜率：中心凸透镜放大 + 边缘液面强拉伸
-        let strength = 0;
-        if (r < 0.68) {
-          strength = 0.24 * (r / 0.68);
+        let mag = 0;
+        if (t <= rimStart) {
+          // 顶面极微弱凸透镜过渡（最大仅 0.04，确保文字绝不分裂重影）
+          const uCenter = t / rimStart;
+          mag = 0.04 * uCenter * uCenter;
         } else {
-          const t = Math.min(0.985, (r - 0.68) / 0.32);
-          // 球面切线斜率 (1 - sqrt(1 - t^2)) 形成陡峭的边缘液面拉伸
-          const rimCurve = 1 - Math.sqrt(Math.max(0.015, 1 - t * t));
-          strength = 0.24 + 0.74 * rimCurve;
+          // 弧壁 Snell 陡峭弯曲：随靠近圆弧外缘急剧拉升，产生真实水面边缘包裹拉伸
+          const u = (t - rimStart) / (1.0 - rimStart); // 0..1
+          const curve = Math.pow(u, 2.15);
+          const meniscus = 1 - Math.sqrt(Math.max(0.01, 1 - u * u));
+          mag = 0.04 + 0.96 * (0.55 * curve + 0.45 * meniscus);
         }
 
-        // 外缘最后 3% 平滑收敛，避免采样超出边框产生硬锯齿
-        if (r > 0.96) {
-          strength *= Math.max(0, (1.0 - r) / 0.04);
+        // 最外缘 3% 柔和收边，彻底杜绝边缘越界采样拉出彩条
+        if (t > 0.97) {
+          mag *= Math.max(0, (1.0 - t) / 0.03);
         }
 
-        // 向内偏移采样源 -> 放大中心、拉伸边缘
-        dx = -ux * strength;
-        dy = -uy * strength;
+        // 沿法线向内采样 -> 靠近圆弧的像素被向外包裹拉伸并贴合弧面弯曲
+        dx = -nx * mag;
+        dy = -ny * mag;
       }
 
       const idx = (y * width + x) * 4;
-      data[idx] = clampByte(128 + dx * 127);
-      data[idx + 1] = clampByte(128 + dy * 127);
-      data[idx + 2] = 128;
-      data[idx + 3] = 255;
-    }
-  }
-
-  ctx.putImageData(imgData, 0, 0);
-  return canvas.toDataURL('image/png');
-}
-
-/**
- * 2. 生成圆角倒角玻璃卡片位移贴图 (192x192)
- * - 中心 84% 区域完全平坦 (128, 128)，保证卡片正文锐利零变形
- * - 仅外缘 16% 倒角产生光学玻璃折边效果
- */
-function buildCardBezelNormalMap(): string {
-  const size = 192;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return '';
-
-  const imgData = ctx.createImageData(size, size);
-  const data = imgData.data;
-  const p = 6.0; // 圆角矩形轮廓
-
-  for (let y = 0; y < size; y++) {
-    const ny = (y / (size - 1)) * 2 - 1;
-    const ay = Math.abs(ny);
-    for (let x = 0; x < size; x++) {
-      const nx = (x / (size - 1)) * 2 - 1;
-      const ax = Math.abs(nx);
-
-      const r = Math.pow(Math.pow(ax, p) + Math.pow(ay, p), 1 / p);
-      let dx = 0;
-      let dy = 0;
-
-      if (r > 0.84 && r < 1.0) {
-        const t = (r - 0.84) / 0.16;
-        const bezel = Math.sin(t * Math.PI);
-        const gx = Math.sign(nx) * Math.pow(ax, p - 1);
-        const gy = Math.sign(ny) * Math.pow(ay, p - 1);
-        const gLen = Math.hypot(gx, gy) || 1;
-        dx = -(gx / gLen) * bezel * 0.65;
-        dy = -(gy / gLen) * bezel * 0.65;
-      }
-
-      const idx = (y * size + x) * 4;
       data[idx] = clampByte(128 + dx * 127);
       data[idx + 1] = clampByte(128 + dy * 127);
       data[idx + 2] = 128;
@@ -136,31 +103,39 @@ function setFeImageHref(id: string, dataUrl: string) {
 }
 
 let refractionMultiplier = 1.0;
+let lastRatioKey = '';
+
+export function updateOrbLensGeometry(width: number, height: number) {
+  if (typeof document === 'undefined' || width <= 0 || height <= 0) return;
+  const ratioKey = (width / height).toFixed(2);
+  if (ratioKey === lastRatioKey) return;
+  lastRatioKey = ratioKey;
+  setFeImageHref('mirage-spherical-map', buildCapsuleSdfRefractionMap(width, height));
+}
 
 export function initOpticalLensEngine() {
   if (typeof document === 'undefined') return;
-  setFeImageHref('mirage-spherical-map', buildMeniscusOrbNormalMap());
-  setFeImageHref('mirage-card-map', buildCardBezelNormalMap());
+  lastRatioKey = '';
+  updateOrbLensGeometry(112, 54);
 }
 
 export function setRefractionIntensity(level: RefractionLevel) {
-  refractionMultiplier = level === 'off' ? 0 : level === 'vivid' ? 1.38 : 1.0;
-  setOrbRefractionScale(36);
-  const cardDisp = document.getElementById('mirage-card-disp');
-  if (cardDisp) {
-    cardDisp.setAttribute('scale', String(Math.round(12 * refractionMultiplier)));
-  }
+  refractionMultiplier = level === 'off' ? 0 : level === 'vivid' ? 1.32 : 1.0;
+  setOrbRefractionScale(22);
 }
 
 /**
- * 动态调节液态玻璃球三通道折射倍率与棱镜色散间距
+ * 动态调节液滴折射强度：
+ * - 色散固定在极克制的 ±1.5px ~ ±2.0px（仅在最外圈弧面出现淡蓝紫光学边缘，中心 0 重影）
  */
 export function setOrbRefractionScale(baseScale: number) {
-  const eff = baseScale * refractionMultiplier;
+  const eff = Math.max(0, baseScale * refractionMultiplier);
+  const spread = eff > 1 ? Math.min(2.0, eff * 0.075) : 0;
+
   const dispR = document.getElementById('mirage-orb-disp-r');
   const dispG = document.getElementById('mirage-orb-disp-g');
   const dispB = document.getElementById('mirage-orb-disp-b');
-  if (dispR) dispR.setAttribute('scale', String(Math.round(eff * 1.13)));
-  if (dispG) dispG.setAttribute('scale', String(Math.round(eff)));
-  if (dispB) dispB.setAttribute('scale', String(Math.round(eff * 0.87)));
+  if (dispR) dispR.setAttribute('scale', (eff + spread).toFixed(2));
+  if (dispG) dispG.setAttribute('scale', eff.toFixed(2));
+  if (dispB) dispB.setAttribute('scale', Math.max(0, eff - spread).toFixed(2));
 }

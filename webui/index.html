@@ -15,11 +15,17 @@ MirageForge: https://github.com/jjh138792/MirageForge
   <link rel="stylesheet" type="text/css" href="https://mui.kernelsu.org/internal/colors.css" />
 </head>
 <body>
-  <!-- 光学级 SVG 折射滤镜引擎：0 预模糊 + 球面液滴拉伸 + RGB 棱镜色散 -->
+  <!-- 精确 1:1 坐标对齐的物理液态玻璃折射引擎（x/y=0% 根治偏移与底边撕裂，R/G/B 仅 ±1.6px 边缘微色散） -->
   <svg style="position: fixed; width: 0; height: 0; pointer-events: none; z-index: -999;" aria-hidden="true">
     <defs>
-      <!-- 1. 底部液态玻璃球专用：无预模糊 Snell 凸面拉伸 + R/G/B 三通道独立位移色散 -->
-      <filter id="mirage-orb-lens" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+      <filter
+        id="mirage-orb-lens"
+        x="0%"
+        y="0%"
+        width="100%"
+        height="100%"
+        color-interpolation-filters="sRGB"
+      >
         <feImage
           id="mirage-spherical-map"
           x="0%"
@@ -30,7 +36,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
           result="lensMap"
         />
 
-        <!-- 拆分 R / G / B 三通道（backdrop-filter 的 SourceGraphic 不透明，screen 混合精确还原色彩） -->
+        <!-- 拆分 R / G / B 通道，仅在外缘高曲率处产生细腻棱镜微色散，中心位移为 0 故完全无重影 -->
         <feColorMatrix
           in="SourceGraphic"
           type="matrix"
@@ -50,12 +56,11 @@ MirageForge: https://github.com/jjh138792/MirageForge
           result="srcB"
         />
 
-        <!-- 差异化折射率位移：R 偏大 / G 基准 / B 偏小，在液滴弯曲边缘产生真实棱镜色散 -->
         <feDisplacementMap
           id="mirage-orb-disp-r"
           in="srcR"
           in2="lensMap"
-          scale="42"
+          scale="23.6"
           xChannelSelector="R"
           yChannelSelector="G"
           result="dispR"
@@ -64,7 +69,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
           id="mirage-orb-disp-g"
           in="srcG"
           in2="lensMap"
-          scale="37"
+          scale="22"
           xChannelSelector="R"
           yChannelSelector="G"
           result="dispG"
@@ -73,7 +78,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
           id="mirage-orb-disp-b"
           in="srcB"
           in2="lensMap"
-          scale="32"
+          scale="20.4"
           xChannelSelector="R"
           yChannelSelector="G"
           result="dispB"
@@ -81,30 +86,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
 
         <feBlend in="dispR" in2="dispG" mode="screen" result="dispRG" />
         <feBlend in="dispRG" in2="dispB" mode="screen" result="dispRGB" />
-
-        <!-- 适度提升水滴内部通透感与对比度 -->
-        <feColorMatrix in="dispRGB" type="saturate" values="1.38" />
-      </filter>
-
-      <!-- 2. 液态玻璃卡片边缘倒角折射滤镜（中心平直清晰，仅外缘 14% 玻璃倒角折射） -->
-      <filter id="mirage-card-lens" x="-8%" y="-8%" width="116%" height="116%" color-interpolation-filters="sRGB">
-        <feImage
-          id="mirage-card-map"
-          x="0%"
-          y="0%"
-          width="100%"
-          height="100%"
-          preserveAspectRatio="none"
-          result="bezelMap"
-        />
-        <feDisplacementMap
-          id="mirage-card-disp"
-          in="SourceGraphic"
-          in2="bezelMap"
-          scale="12"
-          xChannelSelector="R"
-          yChannelSelector="G"
-        />
+        <feColorMatrix in="dispRGB" type="saturate" values="1.15" />
       </filter>
     </defs>
   </svg>

@@ -5,10 +5,11 @@ MirageForge: https://github.com/jjh138792/MirageForge
 -->
 
 <script setup lang="ts">
-import { ref, watch, onUnmounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import type { Component } from 'vue';
 import { SpringSolver, triggerHaptic } from '../bridge/ksu-io';
-import { setOrbRefractionScale } from '../utils/lensEngine';
+import { setOrbRefractionScale, updateOrbLensGeometry } from '../utils/lensEngine';
+import { settingsStore } from '../store/settingsStore';
 import type { DockStyle } from '../store/types';
 
 export interface NavBarItem {
@@ -28,23 +29,45 @@ const emit = defineEmits<{
 }>();
 
 const dockRef = ref<HTMLElement | null>(null);
+const orbRef = ref<HTMLElement | null>(null);
 const orbX = ref(props.activeIndex);
 const orbScaleX = ref(1);
 const orbScaleY = ref(1);
 const isOrbPressed = ref(false);
 const isOrbDragging = ref(false);
+const isOrbMoving = ref(false);
 
-const springX = new SpringSolver(props.activeIndex, 240, 20);
-const springScale = new SpringSolver(1, 320, 18);
+const springX = new SpringSolver(props.activeIndex, 260, 22);
+const springScale = new SpringSolver(1, 340, 20);
 
 let rafId = 0;
 let lastFrameTime = performance.now();
 let longPressTimer: any = null;
 let pointerStartX = 0;
+let resizeObserver: ResizeObserver | null = null;
+
+// 按住、拖拽或滑行动画进行中时激活水晶液滴折射态；静止落位后回归干净温润药丸态
+const isLiquidLensActive = computed(
+  () =>
+    isOrbPressed.value ||
+    isOrbDragging.value ||
+    isOrbMoving.value ||
+    settingsStore.refractionLevel === 'vivid'
+);
+
+function syncOrbGeometry() {
+  if (!orbRef.value) return;
+  const w = orbRef.value.offsetWidth;
+  const h = orbRef.value.offsetHeight;
+  if (w > 10 && h > 10) {
+    updateOrbLensGeometry(w, h);
+  }
+}
 
 function startPhysicsLoop() {
   if (rafId) return;
   lastFrameTime = performance.now();
+  isOrbMoving.value = true;
 
   const tick = (now: number) => {
     const dt = (now - lastFrameTime) / 1000;
@@ -54,23 +77,29 @@ function startPhysicsLoop() {
     const baseScale = springScale.step(dt);
     const vx = springX.vel;
 
-    // 拖动速度越高，液滴水平拉伸越明显，呈现真实表面张力阻尼形变
-    const speedStretch = Math.min(0.30, Math.abs(vx) * 0.052);
-    const speedSquash = Math.min(0.15, Math.abs(vx) * 0.025);
+    // 速度越快，水滴沿水平方向自然拉伸、垂直微扁
+    const speedStretch = Math.min(0.24, Math.abs(vx) * 0.042);
+    const speedSquash = Math.min(0.11, Math.abs(vx) * 0.018);
 
     orbX.value = curX;
     orbScaleX.value = baseScale + speedStretch;
     orbScaleY.value = baseScale - speedSquash;
 
-    // 实时联动 Snell 三通道折射强度：拖拽/长按放大时水面边缘拉伸感更强
-    const dynamicRefraction = 36 + Math.min(26, Math.abs(vx) * 4.5 + (baseScale - 1) * 60);
-    setOrbRefractionScale(dynamicRefraction);
+    // 根据按压膨胀与滑行速度动态调制液滴边缘折弯幅度 (16 ~ 28px，绝不越界撕裂)
+    const activeBoost = isOrbPressed.value || isOrbDragging.value ? 1 : Math.min(1, Math.abs(vx) * 0.45);
+    const baseRefraction = settingsStore.refractionLevel === 'vivid' ? 14 : 0;
+    const dynamicScale = Math.max(
+      baseRefraction,
+      (19 + Math.min(9, Math.abs(vx) * 1.8 + (baseScale - 1) * 28)) * activeBoost
+    );
+    setOrbRefractionScale(dynamicScale);
 
     if (!springX.isSettled() || !springScale.isSettled() || isOrbPressed.value) {
       rafId = requestAnimationFrame(tick);
     } else {
       rafId = 0;
-      setOrbRefractionScale(36);
+      isOrbMoving.value = false;
+      setOrbRefractionScale(settingsStore.refractionLevel === 'vivid' ? 14 : 0);
     }
   };
 
@@ -81,17 +110,25 @@ watch(
   () => props.activeIndex,
   (nextIdx) => {
     if (!isOrbDragging.value) {
-      springX.stiffness = 230;
-      springX.damping = 19;
+      springX.stiffness = 240;
+      springX.damping = 21;
       springX.target = nextIdx;
       startPhysicsLoop();
     }
   }
 );
 
+watch(
+  () => props.dockStyle,
+  () => {
+    requestAnimationFrame(() => syncOrbGeometry());
+  }
+);
+
 function onDockPointerDown(e: PointerEvent) {
   if (!dockRef.value) return;
   (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  syncOrbGeometry();
 
   isOrbPressed.value = true;
   isOrbDragging.value = false;
@@ -103,24 +140,28 @@ function onDockPointerDown(e: PointerEvent) {
   const slotW = (rect.width - pad * 2) / count;
   const clickIdx = Math.max(0, Math.min(count - 1, (e.clientX - rect.left - pad) / slotW - 0.5));
 
+  // 轻触即微幅膨胀并激活液态光学边缘；长按进一步放大成水晶放大镜
+  springScale.target = 1.12;
+  startPhysicsLoop();
+
   if (longPressTimer) clearTimeout(longPressTimer);
   longPressTimer = setTimeout(() => {
     if (isOrbPressed.value) {
       triggerHaptic('medium');
-      springScale.target = 1.18;
+      springScale.target = 1.24;
       springX.target = clickIdx;
       startPhysicsLoop();
     }
-  }, 150);
+  }, 130);
 }
 
 function onDockPointerMove(e: PointerEvent) {
   if (!isOrbPressed.value || !dockRef.value) return;
 
   const deltaX = e.clientX - pointerStartX;
-  if (Math.abs(deltaX) > 6 && !isOrbDragging.value) {
+  if (Math.abs(deltaX) > 5 && !isOrbDragging.value) {
     isOrbDragging.value = true;
-    springScale.target = 1.15;
+    springScale.target = 1.22;
   }
 
   if (isOrbDragging.value) {
@@ -131,11 +172,12 @@ function onDockPointerMove(e: PointerEvent) {
     const slotW = (rect.width - pad * 2) / count;
     let rawIdx = (e.clientX - rect.left - pad) / slotW - 0.5;
 
-    if (rawIdx < 0) rawIdx = rawIdx * 0.28;
-    if (rawIdx > maxIdx) rawIdx = maxIdx + (rawIdx - maxIdx) * 0.28;
+    // 两端橡皮筋阻尼
+    if (rawIdx < 0) rawIdx = rawIdx * 0.25;
+    if (rawIdx > maxIdx) rawIdx = maxIdx + (rawIdx - maxIdx) * 0.25;
 
-    springX.stiffness = 380;
-    springX.damping = 26;
+    springX.stiffness = 400;
+    springX.damping = 28;
     springX.target = rawIdx;
     startPhysicsLoop();
   }
@@ -156,8 +198,8 @@ function onDockPointerUp(e: PointerEvent) {
     Math.max(0, Math.min(count - 1, (e.clientX - rect.left - pad) / slotW - 0.5))
   );
 
-  springX.stiffness = isOrbDragging.value ? 290 : 230;
-  springX.damping = isOrbDragging.value ? 22 : 19;
+  springX.stiffness = isOrbDragging.value ? 300 : 250;
+  springX.damping = isOrbDragging.value ? 23 : 21;
   springX.target = releaseIdx;
   startPhysicsLoop();
 
@@ -168,9 +210,18 @@ function onDockPointerUp(e: PointerEvent) {
   isOrbDragging.value = false;
 }
 
+onMounted(() => {
+  requestAnimationFrame(() => syncOrbGeometry());
+  if (typeof ResizeObserver !== 'undefined' && orbRef.value) {
+    resizeObserver = new ResizeObserver(() => syncOrbGeometry());
+    resizeObserver.observe(orbRef.value);
+  }
+});
+
 onUnmounted(() => {
   if (rafId) cancelAnimationFrame(rafId);
   if (longPressTimer) clearTimeout(longPressTimer);
+  if (resizeObserver) resizeObserver.disconnect();
 });
 </script>
 
@@ -178,7 +229,7 @@ onUnmounted(() => {
   <nav class="nav-dock-wrap" :class="dockStyle">
     <div
       ref="dockRef"
-      class="nav-dock-bar liquid-glass liquid-glass-elevated"
+      class="nav-dock-bar"
       :class="dockStyle"
       :style="{ gridTemplateColumns: `repeat(${items.length}, 1fr)` }"
       @pointerdown="onDockPointerDown"
@@ -186,7 +237,7 @@ onUnmounted(() => {
       @pointerup="onDockPointerUp"
       @pointercancel="onDockPointerUp"
     >
-      <!-- 底层图标与文字 (z-index: 1)，直接透过上方零模糊玻璃球产生边缘水面拉伸折射 -->
+      <!-- 底层图标与文字 (z-index: 1)：清晰干净，被上方交互液滴球精确折射 -->
       <div
         v-for="(item, idx) in items"
         :key="item.key"
@@ -197,18 +248,16 @@ onUnmounted(() => {
         <span class="dock-label">{{ item.label }}</span>
       </div>
 
-      <!-- 顶层光学折射液态玻璃球 (z-index: 2) -->
+      <!-- 顶层双态液态玻璃球 (z-index: 2)：静止=干净药丸，按住/滑动=晶莹曲面折射液滴 -->
       <div
+        ref="orbRef"
         class="dock-liquid-orb liquid-orb-pill"
-        :class="{ 'orb-pressed': isOrbPressed }"
+        :class="{ 'orb-liquid-active': isLiquidLensActive }"
         :style="{
           width: `calc((100% - 12px) / ${items.length})`,
           transform: `translate3d(${orbX * 100}%, 0, 0) scale(${orbScaleX}, ${orbScaleY})`,
         }"
-      >
-        <div class="orb-specular-top"></div>
-        <div class="orb-caustic-bottom"></div>
-      </div>
+      ></div>
     </div>
   </nav>
 </template>
@@ -227,20 +276,27 @@ onUnmounted(() => {
   transition: bottom 0.36s var(--spring-easing), padding 0.36s var(--spring-easing);
 }
 
-/* 贴底常规栏形态 */
 .nav-dock-wrap.docked {
   bottom: 0;
   padding: 0;
 }
 
+/* 干净柔和的底栏底座（彻底虚化页面底部背景文字，避免杂乱底字透入玻璃球） */
 .nav-dock-bar {
   pointer-events: auto;
   position: relative;
   display: grid;
   width: 100%;
-  max-width: 470px;
+  max-width: 460px;
   padding: 6px;
-  border-radius: 30px;
+  border-radius: 999px;
+  background: var(--dock-surface-bg);
+  backdrop-filter: blur(28px) saturate(190%);
+  -webkit-backdrop-filter: blur(28px) saturate(190%);
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    inset 0 1px 1px var(--glass-rim-top),
+    0 12px 32px -8px rgba(0, 0, 0, 0.22);
   touch-action: none;
   cursor: grab;
   overflow: visible;
@@ -269,23 +325,23 @@ onUnmounted(() => {
   z-index: 1;
   color: var(--text-secondary);
   padding: 8px 4px;
-  border-radius: 22px;
+  border-radius: 999px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 3px;
   pointer-events: none;
-  transition: color 0.24s ease, transform 0.24s var(--bounce-easing);
+  transition: color 0.22s ease, transform 0.24s var(--bounce-easing);
 }
 
 .dock-slot.active {
-  color: var(--text-primary);
+  color: var(--accent-primary);
 }
 
 .dock-slot.active .dock-icon {
   color: var(--accent-primary);
-  transform: scale(1.06);
+  transform: scale(1.05);
 }
 
 .dock-label {
@@ -294,51 +350,18 @@ onUnmounted(() => {
   letter-spacing: 0.01em;
 }
 
-/* 零模糊光学液滴球体 */
 .dock-liquid-orb {
   position: absolute;
   z-index: 2;
   top: 5px;
   bottom: 5px;
   left: 6px;
-  border-radius: 24px;
+  border-radius: 999px;
   pointer-events: none;
   transform-origin: center center;
 }
 
 .nav-dock-bar.docked .dock-liquid-orb {
   bottom: calc(var(--inset-bottom) + 5px);
-}
-
-/* 水滴顶部镜面高光弧 */
-.orb-specular-top {
-  position: absolute;
-  top: 2px;
-  left: 12%;
-  right: 12%;
-  height: 30%;
-  border-radius: 999px;
-  background: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.72) 0%,
-    rgba(255, 255, 255, 0.02) 100%
-  );
-  pointer-events: none;
-}
-
-/* 底部焦散内反射弧 */
-.orb-caustic-bottom {
-  position: absolute;
-  bottom: 2px;
-  left: 18%;
-  right: 18%;
-  height: 18%;
-  border-radius: 999px;
-  background: radial-gradient(
-    ellipse at center bottom,
-    rgba(var(--accent-secondary-rgb), 0.52) 0%,
-    transparent 75%
-  );
-  pointer-events: none;
 }
 </style>
