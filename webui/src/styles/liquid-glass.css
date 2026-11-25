@@ -3,90 +3,10 @@
  * Copyright (c) 2025-2026 jjh138792
  * MirageForge: https://github.com/jjh138792/MirageForge
  */
- 
-:root {
-  --inset-top: var(--window-inset-top, env(safe-area-inset-top, 14px));
-  --inset-bottom: var(--window-inset-bottom, env(safe-area-inset-bottom, 18px));
-  --spring-easing: cubic-bezier(0.22, 1, 0.36, 1);
-  --bounce-easing: cubic-bezier(0.34, 1.56, 0.64, 1);
-  --theme-transition: background-color 0.45s cubic-bezier(0.22, 1, 0.36, 1),
-                      color 0.35s ease,
-                      border-color 0.35s ease,
-                      box-shadow 0.45s cubic-bezier(0.22, 1, 0.36, 1);
-}
 
-/* ==========================================================================
-   1. 深色主题 (Dark Obsidian Liquid Glass)
-   ========================================================================== */
-:root[data-theme="dark"] {
-  --bg-base: #060913;
-  --bg-gradient: radial-gradient(circle at 50% 0%, #111a30 0%, #060913 72%);
-  --blob-opacity: 0.42;
-
-  --glass-bg: rgba(18, 25, 43, 0.38);
-  --glass-bg-elevated: rgba(24, 33, 56, 0.48);
-  --glass-border: rgba(255, 255, 255, 0.14);
-  --glass-rim-top: rgba(255, 255, 255, 0.42);
-  --glass-rim-bottom: rgba(56, 189, 248, 0.22);
-  --glass-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.58);
-
-  --orb-bg: radial-gradient(
-    120% 120% at 30% 20%,
-    rgba(255, 255, 255, 0.34) 0%,
-    rgba(139, 92, 246, 0.24) 45%,
-    rgba(6, 182, 212, 0.28) 100%
-  );
-  --orb-rim: inset 0 2px 3px rgba(255, 255, 255, 0.78),
-             inset 0 -2px 4px rgba(6, 182, 212, 0.52),
-             0 10px 28px -4px rgba(139, 92, 246, 0.55);
-
-  --input-bg: rgba(6, 10, 20, 0.52);
-  --subcard-bg: rgba(0, 0, 0, 0.28);
-
-  --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
-
-  --accent-primary: #8b5cf6;
-  --accent-secondary: #06b6d4;
-}
-
-/* ==========================================================================
-   2. 浅色护眼主题 (Light Crystal Water Glass)
-   ========================================================================== */
-:root[data-theme="light"] {
-  --bg-base: #eef2ff;
-  --bg-gradient: radial-gradient(circle at 50% 0%, #e0e7ff 0%, #f1f5f9 65%, #e2e8f0 100%);
-  --blob-opacity: 0.55;
-
-  --glass-bg: rgba(255, 255, 255, 0.42);
-  --glass-bg-elevated: rgba(255, 255, 255, 0.58);
-  --glass-border: rgba(255, 255, 255, 0.68);
-  --glass-rim-top: rgba(255, 255, 255, 0.95);
-  --glass-rim-bottom: rgba(99, 102, 241, 0.24);
-  --glass-shadow: 0 14px 32px -8px rgba(15, 23, 42, 0.11),
-                  0 4px 12px -2px rgba(99, 102, 241, 0.08);
-
-  --orb-bg: radial-gradient(
-    120% 120% at 30% 20%,
-    rgba(255, 255, 255, 0.72) 0%,
-    rgba(139, 92, 246, 0.18) 52%,
-    rgba(6, 182, 212, 0.24) 100%
-  );
-  --orb-rim: inset 0 2px 4px rgba(255, 255, 255, 0.98),
-             inset 0 -2px 5px rgba(99, 102, 241, 0.35),
-             0 10px 26px -4px rgba(99, 102, 241, 0.32);
-
-  --input-bg: rgba(255, 255, 255, 0.62);
-  --subcard-bg: rgba(255, 255, 255, 0.46);
-
-  --text-primary: #0f172a;
-  --text-secondary: #475569;
-  --text-muted: #64748b;
-
-  --accent-primary: #6366f1;
-  --accent-secondary: #0891b2;
-}
+@import './tokens.css';
+@import './liquid-refraction.css';
+@import './transitions.css';
 
 * {
   box-sizing: border-box;
@@ -107,131 +27,41 @@ body {
   min-height: 100vh;
   overflow-x: hidden;
   padding-top: var(--inset-top);
-  padding-bottom: calc(var(--inset-bottom) + 104px);
+  padding-bottom: calc(var(--inset-bottom) + 98px);
   transition: var(--theme-transition);
 }
 
-/* ==========================================================================
-   3. 动态流体背景画布 (使底层有清晰的色块与纹理供液态玻璃折射)
-   ========================================================================== */
-.ambient-canvas {
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  overflow: hidden;
-  background: var(--bg-gradient);
-  transition: background 0.5s ease;
+/* 页面大标题规范（模板 / 应用 / 设置） */
+.page-large-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 6px 4px 14px;
+  flex-wrap: wrap;
 }
 
-.aurora-blob {
-  position: absolute;
-  border-radius: 50%;
-  filter: blur(72px);
-  opacity: var(--blob-opacity);
-  will-change: transform;
-  transition: opacity 0.5s ease;
-  animation: aurora-float 16s infinite alternate ease-in-out;
+.page-large-title {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
 }
 
-.aurora-blob.blob-1 {
-  width: 350px;
-  height: 350px;
-  background: radial-gradient(circle, #8b5cf6, transparent 70%);
-  top: -70px;
-  right: -50px;
+.page-large-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
 }
 
-.aurora-blob.blob-2 {
-  width: 320px;
-  height: 320px;
-  background: radial-gradient(circle, #06b6d4, transparent 70%);
-  bottom: 14%;
-  left: -80px;
-  animation-delay: -5s;
-}
-
-.aurora-blob.blob-3 {
-  width: 260px;
-  height: 260px;
-  background: radial-gradient(circle, #f43f5e, transparent 70%);
-  top: 40%;
-  right: 12%;
-  opacity: calc(var(--blob-opacity) * 0.65);
-  animation-delay: -9s;
-}
-
-@keyframes aurora-float {
-  0% { transform: translate3d(0, 0, 0) scale(1); }
-  50% { transform: translate3d(-25px, 28px, 0) scale(1.1); }
-  100% { transform: translate3d(22px, -18px, 0) scale(0.95); }
-}
-
-/* ==========================================================================
-   4. 光学折射液态玻璃材质 (Refractive Liquid Glass)
-   ========================================================================== */
-.liquid-glass {
-  position: relative;
-  background: var(--glass-bg);
-  /* 同时启用 SVG 边缘水波折射与高饱和半透明背景穿透 */
-  backdrop-filter: url(#mirage-card-lens) blur(14px) saturate(190%);
-  -webkit-backdrop-filter: url(#mirage-card-lens) blur(14px) saturate(190%);
-  border-radius: 24px;
-  border: 1px solid var(--glass-border);
-  box-shadow:
-    inset 0 1.5px 1.5px 0 var(--glass-rim-top),
-    inset 0 -1.5px 2px 0 var(--glass-rim-bottom),
-    var(--glass-shadow);
-  overflow: hidden;
-  transition: var(--theme-transition), transform 0.32s var(--spring-easing);
-}
-
-.liquid-glass::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: radial-gradient(
-    260px circle at var(--px, -200px) var(--py, -200px),
-    rgba(255, 255, 255, 0.22),
-    transparent 65%
-  );
-  opacity: var(--spot-opacity, 0);
-  transition: opacity 0.25s ease;
-  pointer-events: none;
-  z-index: 0;
-}
-
-.liquid-glass > * {
-  position: relative;
-  z-index: 1;
-}
-
-.liquid-glass-elevated {
-  background: var(--glass-bg-elevated);
-  backdrop-filter: url(#mirage-card-lens) blur(20px) saturate(210%);
-  -webkit-backdrop-filter: url(#mirage-card-lens) blur(20px) saturate(210%);
-}
-
-/* ==========================================================================
-   5. 核心：底部可拖拽、长按放大、带速度阻尼形变的「真·液态玻璃球」(Liquid Orb)
-   ========================================================================== */
-.liquid-orb-pill {
-  background: var(--orb-bg);
-  /* 绑定球面法线透镜滤镜：直接对底部的图标与背景产生水滴凸透镜折射！ */
-  backdrop-filter: url(#mirage-orb-lens) blur(2px) saturate(220%);
-  -webkit-backdrop-filter: url(#mirage-orb-lens) blur(2px) saturate(220%);
-  box-shadow: var(--orb-rim);
-  border: 1px solid var(--glass-rim-top);
-  will-change: transform;
-}
-
-/* 按钮与表单组件 */
+/* 通用按钮与表单控件 */
 .tactile-press {
   cursor: pointer;
-  transition: transform 0.26s var(--bounce-easing), filter 0.2s ease;
+  transition: transform 0.25s var(--bounce-easing), filter 0.2s ease, opacity 0.2s ease;
 }
 
 .tactile-press:active {
-  transform: scale(0.94);
+  transform: scale(0.95);
 }
 
 .btn-liquid {
@@ -248,7 +78,7 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.35);
   box-shadow:
     inset 0 1px 1px rgba(255, 255, 255, 0.5),
-    0 6px 18px -4px rgba(99, 102, 241, 0.45);
+    0 6px 18px -4px rgba(var(--accent-primary-rgb), 0.45);
 }
 
 .btn-liquid-ghost {
@@ -295,20 +125,39 @@ body {
 
 .liquid-input:focus, .liquid-select:focus, .liquid-textarea:focus {
   border-color: var(--accent-secondary);
-  box-shadow: 0 0 0 3px rgba(6, 182, 212, 0.18);
+  box-shadow: 0 0 0 3px rgba(var(--accent-secondary-rgb), 0.18);
 }
 
-.view-morph-enter-active,
-.view-morph-leave-active {
-  transition: opacity 0.24s var(--spring-easing), transform 0.24s var(--spring-easing);
+/* 左侧标准开关控件 (关=灰，开=主题色) */
+.mf-switch {
+  position: relative;
+  width: 44px;
+  height: 25px;
+  border-radius: 999px;
+  background: var(--toggle-off-bg);
+  border: 1px solid var(--glass-border);
+  flex-shrink: 0;
+  transition: background-color 0.26s var(--spring-easing), border-color 0.26s ease, box-shadow 0.26s ease;
 }
 
-.view-morph-enter-from {
-  opacity: 0;
-  transform: translateY(10px) scale(0.985);
+.mf-switch.on {
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: 0 0 12px rgba(var(--accent-primary-rgb), 0.45);
 }
 
-.view-morph-leave-to {
-  opacity: 0;
-  transform: translateY(-6px) scale(0.99);
+.mf-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 19px;
+  height: 19px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.28);
+  transition: transform 0.28s var(--bounce-easing);
+}
+
+.mf-switch.on .mf-switch-thumb {
+  transform: translateX(19px);
 }

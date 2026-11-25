@@ -10,12 +10,66 @@ import {
   writeFileZeroFork,
   removeFileZeroFork,
   fetchInstalledAppsZeroFork,
-  syncSystemBarsTheme,
   showToast,
   triggerHaptic,
   detectRuntimeEnv,
   type InstalledAppInfo,
 } from '../bridge/ksu-io';
+import {
+  compileModularConfInTs,
+  isRouteAnyEnabled,
+  normalizeAppRoute,
+  normalizeTemplateVulkanFields,
+} from './confCompiler';
+import {
+  settingsStore,
+  applyThemeMode,
+  cycleThemeMode,
+  setAccentColor,
+  setDockStyle,
+  setRefractionLevel,
+  setEngineSetting,
+  applyAllVisualSettings,
+} from './settingsStore';
+import {
+  hostDeviceState,
+  fetchHostDeviceInfo,
+  cloneHostDeviceViaCli,
+} from './deviceInfoStore';
+import {
+  sanitizeRefreshRate,
+  type AppRoute,
+  type CrashEvent,
+  type DeviceTemplate,
+  type HubSyncStatus,
+  type OtaMirrorMode,
+  type OtaRuntimeState,
+  type OtaStage,
+  type ProbeEvent,
+  type RootManagerKind,
+  type TelemetryEvent,
+  type ThemeMode,
+  type UpdateInfo,
+} from './types';
+
+export * from './types';
+export {
+  normalizeTemplateVulkanFields,
+  normalizeAppRoute,
+  isRouteAnyEnabled,
+  compileModularConfInTs,
+  settingsStore,
+  applyThemeMode,
+  cycleThemeMode,
+  setAccentColor,
+  setDockStyle,
+  setRefractionLevel,
+  setEngineSetting,
+  applyAllVisualSettings,
+  hostDeviceState,
+  fetchHostDeviceInfo,
+  cloneHostDeviceViaCli,
+};
 
 export const CLI_BIN = '/data/adb/modules/mirage_forge/bin/mirageforge_cli';
 export const MODULE_PROP_FILE = '/data/adb/modules/mirage_forge/module.prop';
@@ -39,202 +93,8 @@ export const ONLINE_HUB_URL =
 export const ONLINE_HUB_CDN_URL =
   'https://cdn.jsdelivr.net/gh/jjh138792/MirageForge@main/templates-hub.json';
 
-export type ThemeMode = 'auto' | 'light' | 'dark';
-export type RootManagerKind = 'auto' | 'ksu' | 'apatch' | 'magisk';
-export type OtaMirrorMode = 'auto' | 'ghfast' | 'ghproxy' | 'direct';
-export type OtaStage =
-  | 'idle'
-  | 'detecting'
-  | 'downloading'
-  | 'verifying'
-  | 'installing'
-  | 'success'
-  | 'error';
-
-export interface DeviceTemplate {
-  id: string;
-  name: string;
-  MODEL: string;
-  BRAND: string;
-  MANUFACTURER: string;
-  DEVICE: string;
-  PRODUCT: string;
-  BOARD: string;
-  HARDWARE: string;
-  BOOTLOADER: string;
-  SOC_MANUFACTURER: string;
-  SOC_MODEL: string;
-  SUPPORTED_ABIS: string;
-  BUILD_ID: string;
-  DISPLAY_ID: string;
-  INCREMENTAL: string;
-  BUILD_HOST: string;
-  BUILD_USER: string;
-  BUILD_TIME: string;
-  RELEASE: string;
-  SDK_INT: string;
-  SECURITY_PATCH: string;
-  FINGERPRINT: string;
-  GL_VENDOR: string;
-  GL_RENDERER: string;
-  GL_VERSION: string;
-  VK_DEVICE_NAME: string;
-  VK_VENDOR_ID: string;
-  VK_DEVICE_ID: string;
-  VK_API_VERSION: string;
-  VK_DRIVER_VERSION: string;
-  VK_DRIVER_NAME: string;
-  VK_DRIVER_INFO: string;
-  MAX_REFRESH_RATE: number;
-  CPU_HARDWARE: string;
-  CPU_CORES: number;
-  CPU_MAX_FREQ: number;
-  CPU_CLUSTERS: string;
-  RAM_GB: number;
-  DDR_TYPE: string;
-  DDR_VENDOR: string;
-  SOC_ID: string;
-  SOC_MACHINE: string;
-  KERNEL_RELEASE: string;
-  KERNEL_VERSION: string;
-  CUSTOM_PROPS: string;
-}
-
-export interface AppRoute {
-  tplId: string;
-  build: boolean;
-  gl: boolean;
-  vfs: boolean;
-  probe: boolean;
-  sdkSpoof: boolean;
-  refreshRate: number;
-  mountNs: boolean;
-}
-
-export interface ProbeEvent {
-  pkg: string;
-  domain: string;
-  key: string;
-  value: string;
-  stack: string;
-  unmapped: boolean;
-}
-
-export interface CrashEvent {
-  pkg: string;
-  signal: string;
-  detail: string;
-  stack: string;
-}
-
-export interface TelemetryEvent {
-  timestamp: number;
-  pkg: string;
-  pid: number;
-  model: string;
-  gpu: string;
-  ram: string;
-}
-
-export interface UpdateInfo {
-  checking: boolean;
-  hasUpdate: boolean;
-  latestVersion: string;
-  latestCode: number;
-  zipUrl: string;
-  changelogUrl: string;
-  changelogText: string;
-  changelogLoading: boolean;
-  changelogError: string;
-}
-
-export interface OtaRuntimeState {
-  stage: OtaStage;
-  running: boolean;
-  detectedManager: 'ksu' | 'apatch' | 'magisk' | 'none';
-  selectedManager: RootManagerKind;
-  managerVersion: string;
-  availableManagers: {
-    ksu: boolean;
-    apatch: boolean;
-    magisk: boolean;
-  };
-  mirrorMode: OtaMirrorMode;
-  logs: string[];
-  errorMsg: string;
-}
-
-export interface HubSyncStatus {
-  state: 'idle' | 'loading' | 'online' | 'offline';
-  source: string;
-  remoteCount: number;
-  error: string;
-  customUrl: string;
-}
-
-export function sanitizeRefreshRate(hz: number | undefined): number {
-  const n = Number(hz || 0);
-  return n >= 90 && n <= 240 ? n : 0;
-}
-
-export function normalizeTemplateVulkanFields(raw: Partial<DeviceTemplate>): DeviceTemplate {
-  const tpl = { ...raw } as DeviceTemplate;
-  if (!tpl.VK_DEVICE_NAME || !tpl.VK_DEVICE_NAME.trim()) {
-    tpl.VK_DEVICE_NAME = tpl.GL_RENDERER || 'Adreno (TM) 830';
-  }
-  const token = `${tpl.GL_VENDOR || ''} ${tpl.GL_RENDERER || ''} ${tpl.VK_DEVICE_NAME || ''}`.toLowerCase();
-  const isArm =
-    (tpl.VK_VENDOR_ID || '').toLowerCase() === '0x13b5' ||
-    token.includes('arm') ||
-    token.includes('mali') ||
-    token.includes('immortalis');
-  const isSamsung =
-    (tpl.VK_VENDOR_ID || '').toLowerCase() === '0x144d' || token.includes('xclipse');
-
-  if (!tpl.VK_VENDOR_ID || !tpl.VK_VENDOR_ID.trim()) {
-    tpl.VK_VENDOR_ID = isArm ? '0x13B5' : isSamsung ? '0x144D' : '0x5143';
-  }
-  if (!tpl.VK_DEVICE_ID || !tpl.VK_DEVICE_ID.trim()) {
-    if (isArm) {
-      tpl.VK_DEVICE_ID = token.includes('g925') ? '0x12870000' : '0x10860000';
-    } else if (isSamsung) {
-      tpl.VK_DEVICE_ID = '0x73A00000';
-    } else if (token.includes('750')) {
-      tpl.VK_DEVICE_ID = '0x43050000';
-    } else if (token.includes('740')) {
-      tpl.VK_DEVICE_ID = '0x43030000';
-    } else {
-      tpl.VK_DEVICE_ID = '0x43050A01';
-    }
-  }
-  if (!tpl.VK_API_VERSION || !tpl.VK_API_VERSION.trim()) {
-    tpl.VK_API_VERSION = '1.3.295';
-  }
-  if (!tpl.VK_DRIVER_VERSION || !tpl.VK_DRIVER_VERSION.trim()) {
-    if (isArm) tpl.VK_DRIVER_VERSION = '49.0.0';
-    else if (isSamsung) tpl.VK_DRIVER_VERSION = '24.1.0';
-    else if (token.includes('750') || token.includes('740')) tpl.VK_DRIVER_VERSION = '512.762.0';
-    else tpl.VK_DRIVER_VERSION = '512.800.0';
-  }
-  if (!tpl.VK_DRIVER_NAME || !tpl.VK_DRIVER_NAME.trim()) {
-    tpl.VK_DRIVER_NAME = isArm
-      ? 'ARM'
-      : isSamsung
-      ? 'Samsung Electronics'
-      : 'Qualcomm Technologies Inc. Adreno Vulkan Driver';
-  }
-  if (!tpl.VK_DRIVER_INFO || !tpl.VK_DRIVER_INFO.trim()) {
-    if (isArm) tpl.VK_DRIVER_INFO = 'r49p0-01eac0';
-    else if (isSamsung) tpl.VK_DRIVER_INFO = 'Xclipse Vulkan Driver 1.3';
-    else if (token.includes('750') || token.includes('740')) tpl.VK_DRIVER_INFO = 'Driver Build: 0762.0';
-    else tpl.VK_DRIVER_INFO = 'Driver Build: 0800.0';
-  }
-  tpl.MAX_REFRESH_RATE = sanitizeRefreshRate(tpl.MAX_REFRESH_RATE) || 120;
-  return tpl;
-}
-
 export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
-  {
+  normalizeTemplateVulkanFields({
     id: 'oneplus_13',
     name: 'OnePlus 13 (骁龙8至尊版 / 24GB LPDDR5X / 120Hz)',
     MODEL: 'PJZ110',
@@ -261,13 +121,6 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     GL_VENDOR: 'Qualcomm',
     GL_RENDERER: 'Adreno (TM) 830',
     GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
-    VK_DEVICE_NAME: 'Adreno (TM) 830',
-    VK_VENDOR_ID: '0x5143',
-    VK_DEVICE_ID: '0x43050A01',
-    VK_API_VERSION: '1.3.295',
-    VK_DRIVER_VERSION: '512.800.0',
-    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
-    VK_DRIVER_INFO: 'Driver Build: 0800.0',
     MAX_REFRESH_RATE: 120,
     CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
     CPU_CORES: 8,
@@ -281,106 +134,10 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     KERNEL_RELEASE: '6.6.30-android15-8-o-g94b8f12ab4c1',
     KERNEL_VERSION: '#1 SMP PREEMPT Mon Jan 6 14:20:00 CST 2025',
     CUSTOM_PROPS: 'ro.vendor.oplus.market.name=一加 13\nro.build.version.oplusrom=V15.0.0',
-  },
-  {
-    id: 'iqoo_13',
-    name: 'iQOO 13 (骁龙8至尊版 / 16GB LPDDR5X / 144Hz)',
-    MODEL: 'V2408A',
-    BRAND: 'vivo',
-    MANUFACTURER: 'vivo',
-    DEVICE: 'PD2408',
-    PRODUCT: 'PD2408',
-    BOARD: 'sun',
-    HARDWARE: 'qcom',
-    BOOTLOADER: 'unknown',
-    SOC_MANUFACTURER: 'Qualcomm',
-    SOC_MODEL: 'SM8750-AB',
-    SUPPORTED_ABIS: 'arm64-v8a,armeabi-v7a,armeabi',
-    BUILD_ID: 'AP3A.240905.015.A2',
-    DISPLAY_ID: 'OriginOS 5 PD2408_A_15.0.11.8',
-    INCREMENTAL: 'compiler01151820',
-    BUILD_HOST: 'vivo-osc-compile',
-    BUILD_USER: 'compiler',
-    BUILD_TIME: '1736936400000',
-    RELEASE: '15',
-    SDK_INT: '35',
-    SECURITY_PATCH: '2025-02-01',
-    FINGERPRINT: 'vivo/PD2408/PD2408:15/AP3A.240905.015.A2/compiler01151820:user/release-keys',
-    GL_VENDOR: 'Qualcomm',
-    GL_RENDERER: 'Adreno (TM) 830',
-    GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
-    VK_DEVICE_NAME: 'Adreno (TM) 830',
-    VK_VENDOR_ID: '0x5143',
-    VK_DEVICE_ID: '0x43050A01',
-    VK_API_VERSION: '1.3.295',
-    VK_DRIVER_VERSION: '512.800.0',
-    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
-    VK_DRIVER_INFO: 'Driver Build: 0800.0',
-    MAX_REFRESH_RATE: 144,
-    CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
-    CPU_CORES: 8,
-    CPU_MAX_FREQ: 4320000,
-    CPU_CLUSTERS: '0-5:614400:3532800;6-7:806400:4320000',
-    RAM_GB: 16,
-    DDR_TYPE: 'LPDDR5X',
-    DDR_VENDOR: 'SKhynix',
-    SOC_ID: '618',
-    SOC_MACHINE: 'SM8750',
-    KERNEL_RELEASE: '6.6.30-android15-8-iqoo13',
-    KERNEL_VERSION: '#1 SMP PREEMPT Wed Jan 15 18:20:00 CST 2025',
-    CUSTOM_PROPS: 'ro.vivo.market.name=iQOO 13\nro.vivo.os.build.display.id=OriginOS 5',
-  },
-  {
-    id: 'galaxy_s25_ultra',
-    name: 'Samsung Galaxy S25 Ultra (骁龙8 Elite for Galaxy / 16GB)',
-    MODEL: 'SM-S9380',
-    BRAND: 'samsung',
-    MANUFACTURER: 'samsung',
-    DEVICE: 'pa3q',
-    PRODUCT: 'pa3qzcx',
-    BOARD: 'sun',
-    HARDWARE: 'qcom',
-    BOOTLOADER: 'S9380ZCU1AYA1',
-    SOC_MANUFACTURER: 'Qualcomm',
-    SOC_MODEL: 'SM8750-AC',
-    SUPPORTED_ABIS: 'arm64-v8a,armeabi-v7a,armeabi',
-    BUILD_ID: 'AP3A.240905.015.A2',
-    DISPLAY_ID: 'AP3A.240905.015.A2.S9380ZCU1AYA1',
-    INCREMENTAL: 'S9380ZCU1AYA1',
-    BUILD_HOST: 'SWDJ2914',
-    BUILD_USER: 'dpi',
-    BUILD_TIME: '1737590400000',
-    RELEASE: '15',
-    SDK_INT: '35',
-    SECURITY_PATCH: '2025-02-01',
-    FINGERPRINT: 'samsung/pa3qzcx/pa3q:15/AP3A.240905.015.A2/S9380ZCU1AYA1:user/release-keys',
-    GL_VENDOR: 'Qualcomm',
-    GL_RENDERER: 'Adreno (TM) 830',
-    GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
-    VK_DEVICE_NAME: 'Adreno (TM) 830',
-    VK_VENDOR_ID: '0x5143',
-    VK_DEVICE_ID: '0x43050A01',
-    VK_API_VERSION: '1.3.295',
-    VK_DRIVER_VERSION: '512.800.0',
-    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
-    VK_DRIVER_INFO: 'Driver Build: 0800.0',
-    MAX_REFRESH_RATE: 120,
-    CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
-    CPU_CORES: 8,
-    CPU_MAX_FREQ: 4473600,
-    CPU_CLUSTERS: '0-5:614400:3532800;6-7:806400:4473600',
-    RAM_GB: 16,
-    DDR_TYPE: 'LPDDR5X',
-    DDR_VENDOR: 'Samsung',
-    SOC_ID: '618',
-    SOC_MACHINE: 'SM8750',
-    KERNEL_RELEASE: '6.6.30-android15-8-s25u',
-    KERNEL_VERSION: '#1 SMP PREEMPT Thu Jan 23 10:00:00 UTC 2025',
-    CUSTOM_PROPS: 'ro.product.model=SM-S9380',
-  },
-  {
+  }),
+  normalizeTemplateVulkanFields({
     id: 'legion_y700_gen3',
-    name: '联想拯救者平板 Y700 三代 (骁龙8 Gen3 / 16GB / 165Hz 电竞平板)',
+    name: '联想拯救者平板 Y700 三代 (骁龙8 Gen3 / 16GB / 165Hz)',
     MODEL: 'Lenovo TB321FU',
     BRAND: 'Lenovo',
     MANUFACTURER: 'LENOVO',
@@ -405,13 +162,6 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     GL_VENDOR: 'Qualcomm',
     GL_RENDERER: 'Adreno (TM) 750',
     GL_VERSION: 'OpenGL ES 3.2 V@0762.0',
-    VK_DEVICE_NAME: 'Adreno (TM) 750',
-    VK_VENDOR_ID: '0x5143',
-    VK_DEVICE_ID: '0x43050000',
-    VK_API_VERSION: '1.3.279',
-    VK_DRIVER_VERSION: '512.762.0',
-    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
-    VK_DRIVER_INFO: 'Driver Build: 0762.0',
     MAX_REFRESH_RATE: 165,
     CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8650',
     CPU_CORES: 8,
@@ -425,62 +175,21 @@ export const BUILTIN_HUB_TEMPLATES: DeviceTemplate[] = [
     KERNEL_RELEASE: '6.1.68-android14-11-y700',
     KERNEL_VERSION: '#1 SMP PREEMPT Wed Nov 20 16:00:00 CST 2024',
     CUSTOM_PROPS: 'ro.build.characteristics=tablet\nro.product.marketname=拯救者 Y700',
-  },
-  {
-    id: 'redmi_k80_pro',
-    name: 'Redmi K80 Pro (骁龙8至尊版 / 16GB LPDDR5X / 120Hz)',
-    MODEL: '24122RKC7C',
-    BRAND: 'Redmi',
-    MANUFACTURER: 'Xiaomi',
-    DEVICE: 'miro',
-    PRODUCT: 'miro',
-    BOARD: 'sun',
-    HARDWARE: 'qcom',
-    BOOTLOADER: 'unknown',
-    SOC_MANUFACTURER: 'Qualcomm',
-    SOC_MODEL: 'SM8750-AB',
-    SUPPORTED_ABIS: 'arm64-v8a,armeabi-v7a,armeabi',
-    BUILD_ID: 'AP3A.240905.015.A2',
-    DISPLAY_ID: 'AP3A.240905.015.A2 release-keys',
-    INCREMENTAL: 'OS2.0.105.0.VOMCNXM',
-    BUILD_HOST: 'pangu-build-component-system',
-    BUILD_USER: 'builder',
-    BUILD_TIME: '1737158400000',
-    RELEASE: '15',
-    SDK_INT: '35',
-    SECURITY_PATCH: '2025-02-01',
-    FINGERPRINT: 'Redmi/miro/miro:15/AP3A.240905.015.A2/OS2.0.105.0.VOMCNXM:user/release-keys',
-    GL_VENDOR: 'Qualcomm',
-    GL_RENDERER: 'Adreno (TM) 830',
-    GL_VERSION: 'OpenGL ES 3.2 V@0800.0',
-    VK_DEVICE_NAME: 'Adreno (TM) 830',
-    VK_VENDOR_ID: '0x5143',
-    VK_DEVICE_ID: '0x43050A01',
-    VK_API_VERSION: '1.3.295',
-    VK_DRIVER_VERSION: '512.800.0',
-    VK_DRIVER_NAME: 'Qualcomm Technologies Inc. Adreno Vulkan Driver',
-    VK_DRIVER_INFO: 'Driver Build: 0800.0',
-    MAX_REFRESH_RATE: 120,
-    CPU_HARDWARE: 'Qualcomm Technologies, Inc SM8750',
-    CPU_CORES: 8,
-    CPU_MAX_FREQ: 4320000,
-    CPU_CLUSTERS: '0-5:614400:3532800;6-7:806400:4320000',
-    RAM_GB: 16,
-    DDR_TYPE: 'LPDDR5X',
-    DDR_VENDOR: 'SKhynix',
-    SOC_ID: '618',
-    SOC_MACHINE: 'SM8750',
-    KERNEL_RELEASE: '6.6.30-android15-8-g94b8f12ab4c1',
-    KERNEL_VERSION: '#1 SMP PREEMPT Sat Jan 18 12:00:00 UTC 2025',
-    CUSTOM_PROPS: 'ro.miui.ui.version.code=15\nro.miui.ui.version.name=V816\nro.product.marketname=Redmi K80 Pro',
-  },
+  }),
 ];
 
 export const mirageStore = reactive({
   version: '...',
   versionCode: 0,
-  themeMode: ((localStorage.getItem('mirage_theme') as ThemeMode) || 'auto') as ThemeMode,
-  resolvedTheme: 'dark' as 'light' | 'dark',
+  get themeMode(): ThemeMode {
+    return settingsStore.themeMode;
+  },
+  set themeMode(v: ThemeMode) {
+    settingsStore.themeMode = v;
+  },
+  get resolvedTheme(): 'light' | 'dark' {
+    return settingsStore.resolvedTheme;
+  },
   loading: false,
   templates: {} as Record<string, DeviceTemplate>,
   appRoutes: {} as Record<string, AppRoute>,
@@ -515,11 +224,7 @@ export const mirageStore = reactive({
     detectedManager: 'none',
     selectedManager: 'auto',
     managerVersion: '',
-    availableManagers: {
-      ksu: false,
-      apatch: false,
-      magisk: false,
-    },
+    availableManagers: { ksu: false, apatch: false, magisk: false },
     mirrorMode: ((localStorage.getItem('mirage_ota_mirror') as OtaMirrorMode) || 'auto') as OtaMirrorMode,
     logs: [] as string[],
     errorMsg: '',
@@ -537,56 +242,6 @@ export function triggerLiquidToast(msg: string) {
   }, 2800);
 }
 
-/**
- * 1. 日夜与跟随系统主题控制器
- */
-export function applyThemeMode(mode?: ThemeMode) {
-  if (mode) {
-    mirageStore.themeMode = mode;
-    localStorage.setItem('mirage_theme', mode);
-  }
-  const sysLight =
-    typeof window !== 'undefined' &&
-    window.matchMedia &&
-    window.matchMedia('(prefers-color-scheme: light)').matches;
-
-  const target: 'light' | 'dark' =
-    mirageStore.themeMode === 'auto'
-      ? sysLight
-        ? 'light'
-        : 'dark'
-      : mirageStore.themeMode;
-
-  mirageStore.resolvedTheme = target;
-  if (typeof document !== 'undefined') {
-    document.documentElement.setAttribute('data-theme', target);
-    const metaTheme = document.querySelector('meta[name="theme-color"]');
-    if (metaTheme) {
-      metaTheme.setAttribute('content', target === 'light' ? '#eef2ff' : '#060913');
-    }
-  }
-  syncSystemBarsTheme(target === 'light');
-}
-
-export function cycleThemeMode(): ThemeMode {
-  const order: ThemeMode[] = ['auto', 'light', 'dark'];
-  const next = order[(order.indexOf(mirageStore.themeMode) + 1) % order.length];
-  triggerHaptic('medium');
-  applyThemeMode(next);
-  return next;
-}
-
-if (typeof window !== 'undefined' && window.matchMedia) {
-  window
-    .matchMedia('(prefers-color-scheme: light)')
-    .addEventListener('change', () => {
-      if (mirageStore.themeMode === 'auto') applyThemeMode();
-    });
-}
-
-/**
- * 2. 动态读取 module.prop 版本号
- */
 export async function loadVersionFromModuleProp() {
   const raw = await readFileZeroFork(MODULE_PROP_FILE);
   if (!raw) return;
@@ -600,9 +255,6 @@ export async function loadVersionFromModuleProp() {
   }
 }
 
-/**
- * 通用多通道文本拉取器：WebView fetch (6s 超时) -> Root curl 兜底
- */
 export function isSafeHttpUrl(url: string): boolean {
   return /^https?:\/\/[^\s"'`$\\;|&<>]+$/i.test(url.trim());
 }
@@ -617,10 +269,7 @@ function toJsDelivrMirror(url: string): string | null {
 
 async function fetchTextWithFallback(url: string): Promise<{ text: string; via: 'fetch' | 'curl' }> {
   const cleanUrl = url.trim();
-  if (!isSafeHttpUrl(cleanUrl)) {
-    throw new Error('URL 格式不合法');
-  }
-
+  if (!isSafeHttpUrl(cleanUrl)) throw new Error('URL 格式不合法');
   const sep = cleanUrl.includes('?') ? '&' : '?';
   const bustedUrl = `${cleanUrl}${sep}t=${Date.now()}`;
 
@@ -629,13 +278,9 @@ async function fetchTextWithFallback(url: string): Promise<{ text: string; via: 
     const timer = setTimeout(() => controller.abort(), 6500);
     const resp = await fetch(bustedUrl, { cache: 'no-store', signal: controller.signal });
     clearTimeout(timer);
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const text = await resp.text();
-    if (text && text.trim().length > 0) {
-      return { text, via: 'fetch' };
-    }
+    if (text && text.trim().length > 0) return { text, via: 'fetch' };
   } catch (fetchErr: any) {
     const curlRes = await execRootShell(
       `curl -fsSL --connect-timeout 6 --max-time 12 -A "MirageForge-WebUI" "${bustedUrl}"`
@@ -660,9 +305,6 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-/**
- * 3. 拉取 update.json 中 changelog URL 正文（支持 jsDelivr CDN + 原链 + Root curl 兜底）
- */
 export async function fetchChangelogContent(force = false): Promise<string> {
   const url = mirageStore.updateInfo.changelogUrl.trim();
   if (!url) {
@@ -704,10 +346,6 @@ export async function fetchChangelogContent(force = false): Promise<string> {
   return '';
 }
 
-/**
- * 4. 在线检查更新 (拉取 update.json + 预加载 changelog URL)
- * 返回值表示是否发现新版本
- */
 export async function checkOnlineUpdate(
   t: (k: string, p?: any) => string,
   silent = false
@@ -765,27 +403,20 @@ export async function checkOnlineUpdate(
       return true;
     }
 
-    if (!silent) {
-      showToast(t('app.upToDate', { ver: mirageStore.version }));
-    }
+    if (!silent) showToast(t('app.upToDate', { ver: mirageStore.version }));
     return false;
   } catch (_) {
-    if (!silent) {
-      showToast(t('app.updateError'));
-    }
+    if (!silent) showToast(t('app.updateError'));
     return false;
   } finally {
     mirageStore.updateInfo.checking = false;
   }
 }
 
-/**
- * 5. 自动识别活跃 Root 管理器 (KernelSU ksud / APatch apd / Magisk magiskd)
- */
 export async function detectRootManagerForOta() {
   if (detectRuntimeEnv() === 'BrowserMock') {
     mirageStore.ota.detectedManager = 'ksu';
-    mirageStore.ota.managerVersion = 'KernelSU Mock v1.0.5';
+    mirageStore.ota.managerVersion = 'KernelSU Mock v1.0.9';
     mirageStore.ota.availableManagers = { ksu: true, apatch: false, magisk: true };
     return;
   }
@@ -813,9 +444,7 @@ export async function detectRootManagerForOta() {
   const kv: Record<string, string> = {};
   for (const line of (res.stdout || '').split(/\r?\n/)) {
     const eq = line.indexOf('=');
-    if (eq > 0) {
-      kv[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
-    }
+    if (eq > 0) kv[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
   }
 
   const act = kv.ACT as 'ksu' | 'apatch' | 'magisk' | 'none';
@@ -834,9 +463,6 @@ export function setOtaMirrorMode(mode: OtaMirrorMode) {
   localStorage.setItem('mirage_ota_mirror', mode);
 }
 
-/**
- * 6. OTA 实时流式刷入引擎（后台执行下载/校验/调用 ksud|apd|magisk + 250ms 零 Fork 终端滚屏）
- */
 let otaPollTimer: any = null;
 let otaPollStartTs = 0;
 
@@ -854,7 +480,6 @@ function stripAnsiAndParseLogs(rawLog: string): { stage: OtaStage | null; lines:
   let latestStage: OtaStage | null = null;
 
   for (const rawLine of rawLines) {
-    // 处理 curl / 进度条的 \r 回车覆盖，仅保留该行最后一个非空片段
     const parts = rawLine.split('\r');
     let line = '';
     for (let i = parts.length - 1; i >= 0; i--) {
@@ -879,9 +504,7 @@ function stripAnsiAndParseLogs(rawLog: string): { stage: OtaStage | null; lines:
 
 function buildDownloadUrlList(zipUrl: string, mirror: OtaMirrorMode): string[] {
   const isGithub = /^https:\/\/github\.com\//i.test(zipUrl);
-  if (!isGithub || mirror === 'direct') {
-    return [zipUrl];
-  }
+  if (!isGithub || mirror === 'direct') return [zipUrl];
   const ghfast = `https://ghfast.top/${zipUrl}`;
   const ghproxy = `https://gh-proxy.com/${zipUrl}`;
   if (mirror === 'ghfast') return [ghfast, zipUrl];
@@ -922,10 +545,7 @@ KSU_BIN=""; [ -x /data/adb/ksud ] && KSU_BIN=/data/adb/ksud || KSU_BIN=$(command
 APD_BIN=""; [ -x /data/adb/apd ] && APD_BIN=/data/adb/apd || APD_BIN=$(command -v apd 2>/dev/null)
 MAG_BIN=""
 for p in "$(command -v magisk 2>/dev/null)" /sbin/magisk /debug_ramdisk/magisk /system/bin/magisk; do
-  if [ -n "$p" ] && [ -x "$p" ]; then
-    MAG_BIN="$p"
-    break
-  fi
+  if [ -n "$p" ] && [ -x "$p" ]; then MAG_BIN="$p"; break; fi
 done
 
 TARGET_MGR="$PREF"
@@ -948,22 +568,10 @@ fi
 
 INSTALL_BIN=""
 case "$TARGET_MGR" in
-  ksu)
-    INSTALL_BIN="$KSU_BIN"
-    echo "[*] 选定刷入后端: KernelSU ($INSTALL_BIN)"
-    ;;
-  apatch)
-    INSTALL_BIN="$APD_BIN"
-    echo "[*] 选定刷入后端: APatch ($INSTALL_BIN)"
-    ;;
-  magisk)
-    INSTALL_BIN="$MAG_BIN"
-    echo "[*] 选定刷入后端: Magisk ($INSTALL_BIN)"
-    ;;
-  *)
-    echo "[!] 未检测到可用的 KernelSU (ksud) / APatch (apd) / Magisk 命令行！"
-    finish 10
-    ;;
+  ksu) INSTALL_BIN="$KSU_BIN"; echo "[*] 选定刷入后端: KernelSU ($INSTALL_BIN)" ;;
+  apatch) INSTALL_BIN="$APD_BIN"; echo "[*] 选定刷入后端: APatch ($INSTALL_BIN)" ;;
+  magisk) INSTALL_BIN="$MAG_BIN"; echo "[*] 选定刷入后端: Magisk ($INSTALL_BIN)" ;;
+  *) echo "[!] 未检测到可用的 KernelSU (ksud) / APatch (apd) / Magisk 命令行！"; finish 10 ;;
 esac
 
 if [ -z "$INSTALL_BIN" ] || [ ! -x "$INSTALL_BIN" ]; then
@@ -976,13 +584,9 @@ CURL_BIN=$(command -v curl 2>/dev/null)
 WGET_BIN=$(command -v wget 2>/dev/null)
 if [ -z "$WGET_BIN" ]; then
   for bb in /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox /data/adb/magisk/busybox; do
-    if [ -x "$bb" ]; then
-      WGET_BIN="$bb wget"
-      break
-    fi
+    if [ -x "$bb" ]; then WGET_BIN="$bb wget"; break; fi
   done
 fi
-
 if [ -z "$CURL_BIN" ] && [ -z "$WGET_BIN" ]; then
   echo "[!] 系统缺少 curl 与 wget，无法下载更新包。"
   finish 12
@@ -1007,34 +611,17 @@ for URL in ${quotedUrls}; do
     echo "[!] 当前线路下载失败 (code=$RC)，尝试下一线路..."
   fi
 done
-
-if [ "$DL_OK" -ne 1 ]; then
-  echo "[!] 所有下载线路均失败，请检查网络连接或切换镜像线路。"
-  finish 13
-fi
+if [ "$DL_OK" -ne 1 ]; then echo "[!] 所有下载线路均失败。"; finish 13; fi
 
 echo "[MF_STAGE:verifying]"
 FILE_SIZE=$(wc -c < "$ZIP" 2>/dev/null | tr -d ' ')
 echo "[*] 更新包大小: \${FILE_SIZE:-0} bytes"
-if [ -z "$FILE_SIZE" ] || [ "$FILE_SIZE" -lt 10240 ]; then
-  echo "[!] 更新包体积异常过小，可能下载到了错误页面。"
-  finish 14
-fi
-
-MAGIC=$(head -c 2 "$ZIP" 2>/dev/null)
-if [ "$MAGIC" != "PK" ]; then
-  echo "[!] 文件头校验失败：不是有效的 ZIP 模块压缩包。"
-  finish 15
-fi
-
+if [ -z "$FILE_SIZE" ] || [ "$FILE_SIZE" -lt 10240 ]; then echo "[!] 更新包体积异常过小。"; finish 14; fi
+if [ "$(head -c 2 "$ZIP" 2>/dev/null)" != "PK" ]; then echo "[!] 文件头校验失败：非有效 ZIP。"; finish 15; fi
 UNZIP_BIN=$(command -v unzip 2>/dev/null)
 if [ -n "$UNZIP_BIN" ]; then
-  if "$UNZIP_BIN" -tq "$ZIP" >/dev/null 2>&1; then
-    echo "[+] ZIP 压缩包 CRC 完整性校验通过"
-  else
-    echo "[!] ZIP 压缩包已损坏，终止刷入！"
-    finish 16
-  fi
+  if "$UNZIP_BIN" -tq "$ZIP" >/dev/null 2>&1; then echo "[+] ZIP 完整性校验通过"
+  else echo "[!] ZIP 已损坏！"; finish 16; fi
 else
   echo "[+] ZIP 魔数头校验通过 (PK)"
 fi
@@ -1043,22 +630,11 @@ echo "[MF_STAGE:installing]"
 echo "------------------------------------------"
 echo "[*] 正在调用 $TARGET_MGR 安装模块，以下为脚本实时输出:"
 echo "------------------------------------------"
-
 case "$TARGET_MGR" in
-  ksu)
-    "$INSTALL_BIN" module install "$ZIP"
-    INST_RC=$?
-    ;;
-  apatch)
-    "$INSTALL_BIN" module install "$ZIP"
-    INST_RC=$?
-    ;;
-  magisk)
-    "$INSTALL_BIN" --install-module "$ZIP"
-    INST_RC=$?
-    ;;
+  ksu) "$INSTALL_BIN" module install "$ZIP"; INST_RC=$? ;;
+  apatch) "$INSTALL_BIN" module install "$ZIP"; INST_RC=$? ;;
+  magisk) "$INSTALL_BIN" --install-module "$ZIP"; INST_RC=$? ;;
 esac
-
 echo "------------------------------------------"
 if [ "$INST_RC" -eq 0 ]; then
   echo "[+] 模块刷入成功 (exit=0)！请重启设备使新版本生效。"
@@ -1088,18 +664,14 @@ export async function startOtaInstall() {
   mirageStore.ota.logs = ['[*] 正在初始化 OTA 刷入环境...'];
   triggerHaptic('medium');
 
-  // 桌面浏览器调试环境模拟流式输出
   if (detectRuntimeEnv() === 'BrowserMock') {
     const mockSteps: Array<{ delay: number; stage: OtaStage; line: string }> = [
       { delay: 400, stage: 'detecting', line: '[*] 选定刷入后端: KernelSU (/data/adb/ksud)' },
       { delay: 900, stage: 'downloading', line: `[*] 正在下载更新包: ${zipUrl}` },
       { delay: 1600, stage: 'downloading', line: '[+] 下载完成，已保存至临时文件 (2.4 MB)' },
       { delay: 2000, stage: 'verifying', line: '[+] ZIP 压缩包 CRC 完整性校验通过' },
-      { delay: 2400, stage: 'installing', line: '- Unzipping files...' },
-      { delay: 2900, stage: 'installing', line: '- Mounting /data/adb/modules_update/mirage_forge' },
-      { delay: 3400, stage: 'installing', line: '- Installing MirageForge v' + (mirageStore.updateInfo.latestVersion || '1.3.0') },
-      { delay: 3900, stage: 'installing', line: '- Setting permissions...' },
-      { delay: 4400, stage: 'success', line: '[+] 模块刷入成功 (exit=0)！请重启设备使新版本生效。' },
+      { delay: 2500, stage: 'installing', line: '- Unzipping & installing MirageForge...' },
+      { delay: 3200, stage: 'success', line: '[+] 模块刷入成功 (exit=0)！请重启设备使新版本生效。' },
     ];
     for (const s of mockSteps) {
       setTimeout(() => {
@@ -1115,7 +687,6 @@ export async function startOtaInstall() {
   }
 
   await detectRootManagerForOta();
-
   const urls = buildDownloadUrlList(zipUrl, mirageStore.ota.mirrorMode);
   const scriptContent = buildOtaInstallScript(
     urls,
@@ -1135,7 +706,6 @@ export async function startOtaInstall() {
     return;
   }
 
-  // 彻底重定向 stdin/stdout/stderr 后后台拉起，避免阻塞 ksu.exec 回调
   const launchRes = await execRootShell(
     `chmod 700 "${OTA_SCRIPT_FILE}" && ( /system/bin/sh "${OTA_SCRIPT_FILE}" </dev/null >/dev/null 2>&1 & )`
   );
@@ -1157,12 +727,8 @@ export async function startOtaInstall() {
       const rawLog = await readFileZeroFork(OTA_LOG_FILE);
       if (rawLog) {
         const parsed = stripAnsiAndParseLogs(rawLog);
-        if (parsed.lines.length > 0) {
-          mirageStore.ota.logs = parsed.lines;
-        }
-        if (parsed.stage) {
-          mirageStore.ota.stage = parsed.stage;
-        }
+        if (parsed.lines.length > 0) mirageStore.ota.logs = parsed.lines;
+        if (parsed.stage) mirageStore.ota.stage = parsed.stage;
       }
 
       const exitRaw = (await readFileZeroFork(OTA_EXIT_FILE)).trim();
@@ -1188,7 +754,7 @@ export async function startOtaInstall() {
         stopOtaPolling();
         mirageStore.ota.running = false;
         mirageStore.ota.stage = 'error';
-        mirageStore.ota.errorMsg = '更新执行超时 (超过 5 分钟)，请检查网络或手动重试';
+        mirageStore.ota.errorMsg = '更新执行超时 (超过 5 分钟)，请重试';
         mirageStore.ota.logs.push(`[!] ${mirageStore.ota.errorMsg}`);
       }
     } finally {
@@ -1203,9 +769,6 @@ export async function rebootDeviceNow() {
   await execRootShell('svc power reboot || reboot');
 }
 
-/**
- * 7. URL-Safe Base64 模板分享码编解码器 (与 Rust CLI mf:// 格式 100% 互通)
- */
 export function encodeTemplateShareCode(tpl: DeviceTemplate): string {
   const normalized = normalizeTemplateVulkanFields(tpl);
   const json = JSON.stringify(normalized);
@@ -1240,16 +803,10 @@ export function decodeTemplateShareCode(rawCode: string): DeviceTemplate | null 
 export function saveCustomHubUrl(url: string) {
   const clean = url.trim();
   mirageStore.hubStatus.customUrl = clean;
-  if (clean) {
-    localStorage.setItem('mirage_hub_url', clean);
-  } else {
-    localStorage.removeItem('mirage_hub_url');
-  }
+  if (clean) localStorage.setItem('mirage_hub_url', clean);
+  else localStorage.removeItem('mirage_hub_url');
 }
 
-/**
- * 8. 在线机型库多通道真联网拉取
- */
 export async function fetchOnlineTemplateHub(forceToast = false) {
   mirageStore.hubLoading = true;
   mirageStore.hubStatus.state = 'loading';
@@ -1263,13 +820,11 @@ export async function fetchOnlineTemplateHub(forceToast = false) {
   sources.push({ label: 'GitHub Raw', url: ONLINE_HUB_URL });
 
   let lastErr = '网络不可用';
-
   for (const src of sources) {
     try {
       const { text, via } = await fetchTextWithFallback(src.url);
       const raw = JSON.parse(text);
       const list = Array.isArray(raw) ? raw : Array.isArray(raw?.templates) ? raw.templates : null;
-
       if (list && list.length > 0) {
         const mergedMap = new Map<string, DeviceTemplate>();
         for (const item of BUILTIN_HUB_TEMPLATES) {
@@ -1308,245 +863,24 @@ export async function fetchOnlineTemplateHub(forceToast = false) {
   mirageStore.hubStatus.remoteCount = 0;
   mirageStore.hubStatus.error = lastErr;
   mirageStore.hubLoading = false;
-  if (forceToast) {
-    showToast(`云端拉取失败，已切换至离线精选库 (${lastErr})`);
-  }
-}
-
-/**
- * 9. TypeScript 内存级微模块 .conf 编译器 (与 Rust CLI compiler.rs 100% 同步)
- */
-function compileModularConfInTs(rawTpl: DeviceTemplate, route: AppRoute): string {
-  const tpl = normalizeTemplateVulkanFields(rawTpl);
-  const lines: string[] = [];
-  const push = (k: string, v: string | number | undefined) => {
-    if (k && v !== undefined && String(v).length > 0) {
-      lines.push(`${k}=${v}`);
-    }
-  };
-
-  const effectiveFps = sanitizeRefreshRate(route.refreshRate);
-
-  push('META:ENABLE_BUILD', route.build ? '1' : '0');
-  push('META:ENABLE_GL', route.gl ? '1' : '0');
-  push('META:ENABLE_VFS', route.vfs ? '1' : '0');
-  push('META:ENABLE_PROBE', route.probe ? '1' : '0');
-  push('META:FORCE_SPOOF_SDK', route.sdkSpoof ? '1' : '0');
-  push('META:ENABLE_MOUNT_NS', route.vfs && route.mountNs ? '1' : '0');
-  if (route.gl && effectiveFps >= 90) {
-    push('META:REFRESH_RATE', effectiveFps);
-  }
-
-  if (route.gl) {
-    push('GLES:VENDOR', tpl.GL_VENDOR);
-    push('GLES:RENDERER', tpl.GL_RENDERER);
-    push('GLES:VERSION', tpl.GL_VERSION);
-    if (effectiveFps >= 90) {
-      push('GLES:REFRESH_RATE', effectiveFps);
-    }
-
-    push('VULKAN:DEVICE_NAME', tpl.VK_DEVICE_NAME);
-    push('VULKAN:VENDOR_ID', tpl.VK_VENDOR_ID);
-    push('VULKAN:DEVICE_ID', tpl.VK_DEVICE_ID);
-    push('VULKAN:API_VERSION', tpl.VK_API_VERSION);
-    push('VULKAN:DRIVER_VERSION', tpl.VK_DRIVER_VERSION);
-    push('VULKAN:DRIVER_NAME', tpl.VK_DRIVER_NAME);
-    push('VULKAN:DRIVER_INFO', tpl.VK_DRIVER_INFO);
-  }
-
-  const ramGb = tpl.RAM_GB > 0 ? tpl.RAM_GB : 16;
-  const ddrType = tpl.DDR_TYPE || 'LPDDR5X';
-  const ddrVendor = tpl.DDR_VENDOR || 'SKhynix';
-
-  if (route.vfs) {
-    push('VFS:CPU_HARDWARE', tpl.CPU_HARDWARE);
-    push('VFS:CPU_ARCH', 'aarch64');
-    push('VFS:CPU_CORES', tpl.CPU_CORES || 8);
-    push('VFS:CPU_MAX_FREQ', tpl.CPU_MAX_FREQ || 4320000);
-    push('VFS:CPU_CLUSTERS', tpl.CPU_CLUSTERS);
-    push('VFS:RAM_GB', ramGb);
-    push('VFS:DDR_TYPE', ddrType);
-    push('VFS:DDR_VENDOR', ddrVendor);
-    push('VFS:SOC_ID', tpl.SOC_ID);
-    push('VFS:SOC_MACHINE', tpl.SOC_MACHINE);
-    push('VFS:KERNEL_RELEASE', tpl.KERNEL_RELEASE);
-    push('VFS:KERNEL_VERSION', tpl.KERNEL_VERSION);
-  }
-
-  if (route.build) {
-    const abis = tpl.SUPPORTED_ABIS || 'arm64-v8a,armeabi-v7a,armeabi';
-    const buildUtc = Math.floor(
-      (parseInt(tpl.BUILD_TIME || '1736899200000', 10) || 1736899200000) / 1000
-    );
-    const displayId = tpl.DISPLAY_ID || `${tpl.BUILD_ID} release-keys`;
-    const incremental = tpl.INCREMENTAL || tpl.BUILD_ID;
-    const host = tpl.BUILD_HOST || 'pangu-build-component-system';
-    const user = tpl.BUILD_USER || 'builder';
-
-    push('BUILD:MODEL', tpl.MODEL);
-    push('BUILD:BRAND', tpl.BRAND);
-    push('BUILD:MANUFACTURER', tpl.MANUFACTURER || tpl.BRAND);
-    push('BUILD:DEVICE', tpl.DEVICE);
-    push('BUILD:PRODUCT', tpl.PRODUCT || tpl.DEVICE);
-    push('BUILD:HARDWARE', tpl.HARDWARE || 'qcom');
-    push('BUILD:BOARD', tpl.BOARD);
-    push('BUILD:BOOTLOADER', tpl.BOOTLOADER || 'unknown');
-    push('BUILD:SOC_MANUFACTURER', tpl.SOC_MANUFACTURER);
-    push('BUILD:SOC_MODEL', tpl.SOC_MODEL);
-    push('BUILD:ID', tpl.BUILD_ID);
-    push('BUILD:DISPLAY', displayId);
-    push('BUILD:HOST', host);
-    push('BUILD:USER', user);
-    push('BUILD:FINGERPRINT', tpl.FINGERPRINT);
-    push('BUILD:SUPPORTED_ABIS', abis);
-    push('BUILD:SUPPORTED_64_BIT_ABIS', 'arm64-v8a');
-    push('BUILD:SUPPORTED_32_BIT_ABIS', 'armeabi-v7a,armeabi');
-    push('BUILD:TAGS', 'release-keys');
-    push('BUILD:TYPE', 'user');
-    push('BUILD:TIME', tpl.BUILD_TIME);
-
-    push('VERSION:INCREMENTAL', incremental);
-    push('VERSION:SECURITY_PATCH', tpl.SECURITY_PATCH);
-    if (route.sdkSpoof) {
-      push('VERSION:CODENAME', 'REL');
-      push('VERSION:PREVIEW_SDK_INT', '0');
-      push('VERSION:RELEASE', tpl.RELEASE);
-      push('VERSION:SDK_INT', tpl.SDK_INT);
-      push('VERSION:DEVICE_INITIAL_SDK_INT', tpl.SDK_INT);
-    }
-
-    for (const part of ['', 'system.', 'vendor.', 'odm.', 'product.', 'system_ext.']) {
-      push(`ro.product.${part}model`, tpl.MODEL);
-      push(`ro.product.${part}brand`, tpl.BRAND);
-      push(`ro.product.${part}manufacturer`, tpl.MANUFACTURER || tpl.BRAND);
-      push(`ro.product.${part}device`, tpl.DEVICE);
-      push(`ro.product.${part}name`, tpl.PRODUCT || tpl.DEVICE);
-      push(`ro.${part}build.id`, tpl.BUILD_ID);
-      push(`ro.${part}build.display.id`, displayId);
-      push(`ro.${part}build.version.incremental`, incremental);
-      push(`ro.${part}build.fingerprint`, tpl.FINGERPRINT);
-    }
-    push('ro.product.build.id', tpl.BUILD_ID);
-    push('ro.product.build.fingerprint', tpl.FINGERPRINT);
-    push('ro.product.build.version.incremental', incremental);
-    push('ro.build.product', tpl.DEVICE);
-    push('ro.product.board', tpl.BOARD);
-    push('ro.board.platform', tpl.BOARD);
-    push('ro.hardware', tpl.HARDWARE);
-    push('ro.boot.hardware', tpl.HARDWARE);
-    push('ro.bootloader', tpl.BOOTLOADER || 'unknown');
-    push('ro.boot.bootloader', tpl.BOOTLOADER || 'unknown');
-    push('ro.soc.manufacturer', tpl.SOC_MANUFACTURER);
-    push('ro.soc.model', tpl.SOC_MODEL);
-    push('ro.product.cpu.abi', 'arm64-v8a');
-    push('ro.product.cpu.abilist', abis);
-    push('ro.product.cpu.abilist64', 'arm64-v8a');
-    push('ro.product.cpu.abilist32', 'armeabi-v7a,armeabi');
-    push('ro.build.date.utc', buildUtc);
-    push('ro.build.host', host);
-    push('ro.build.user', user);
-    push('ro.build.version.security_patch', tpl.SECURITY_PATCH);
-    push('ro.vendor.build.security_patch', tpl.SECURITY_PATCH);
-    push('ro.build.tags', 'release-keys');
-    push('ro.build.type', 'user');
-
-    push('ro.boot.vbmeta.device_state', 'locked');
-    push('ro.boot.vbmeta.avb_version', '1.2');
-    push('ro.boot.vbmeta.hash_alg', 'sha256');
-    push('ro.boot.verifiedbootstate', 'green');
-    push('ro.boot.flash.locked', '1');
-    push('ro.boot.veritymode', 'enforcing');
-    push('ro.boot.warranty_bit', '0');
-    push('ro.warranty_bit', '0');
-    push('ro.build.selinux', '1');
-    push('ro.debuggable', '0');
-    push('ro.secure', '1');
-    push('ro.adb.secure', '1');
-    push('sys.oem_unlock_allowed', '0');
-    push('sys.usb.state', 'none');
-    push('sys.usb.config', 'none');
-    push('init.svc.adbd', 'stopped');
-    push('ro.sys.cloud.magisk', '0');
-    push('persist.sys.cloud.root.global', '0');
-    push('ro.sys.cloud.root.global', '0');
-    push('ro.boot.hardware.sku', tpl.DEVICE);
-    push('ro.boot.product.hardware.sku', tpl.DEVICE);
-
-    if (route.vfs) {
-      const ramStr = `${ramGb}GB`;
-      const ddrFull = `${ramStr},${ddrVendor},${ddrType}`;
-      push('ro.boot.hardware.ddr', ddrFull);
-      push('ro.boot.ddr_size', ramStr);
-      push('ro.boot.ddr_type', ddrType);
-      push('ro.boot.ddr_info', ddrFull);
-      push('ro.boot.ramsize', ramStr);
-      push('ro.boot.memsize', ramStr);
-      push('ro.hardware.ddr', ddrFull);
-      push('ro.vendor.hw.ram', ramStr);
-      push('ro.product.ram', ramStr);
-      push('ro.config.ram_size', ramGb * 1024);
-      push('ro.sys.ram_size', ramStr);
-      push('persist.sys.ram_size', ramStr);
-    }
-
-    if (route.gl) {
-      if (tpl.VK_DEVICE_NAME) {
-        push('persist.sys.cloud.gpu.vk_devicename', tpl.VK_DEVICE_NAME);
-      }
-      if (tpl.GL_RENDERER) {
-        push('persist.sys.cloud.gpu.gl_renderer', tpl.GL_RENDERER);
-        push('persist.sys.gpu.gl_renderer', tpl.GL_RENDERER);
-      }
-      if (tpl.GL_VENDOR) {
-        push('persist.sys.cloud.gpu.gl_vendor', tpl.GL_VENDOR);
-        push('persist.sys.gpu.gl_vendor', tpl.GL_VENDOR);
-      }
-    }
-
-    if (route.sdkSpoof) {
-      for (const part of ['', 'system.', 'vendor.', 'odm.', 'product.', 'system_ext.']) {
-        push(`ro.${part}build.version.release`, tpl.RELEASE);
-        push(`ro.${part}build.version.sdk`, tpl.SDK_INT);
-      }
-    }
-
-    for (const raw of (tpl.CUSTOM_PROPS || '').split(/\r?\n/)) {
-      const tr = raw.trim();
-      if (!tr || tr.startsWith('#')) continue;
-      const eq = tr.indexOf('=');
-      if (eq > 0) {
-        const k = tr.slice(0, eq).trim();
-        if (k.includes('lcd_density') || k.endsWith('.dpi')) continue;
-        if (
-          !route.sdkSpoof &&
-          (k.includes('build.version.sdk') ||
-            k.includes('build.version.release') ||
-            k.includes('first_api_level'))
-        ) {
-          continue;
-        }
-        lines.push(tr);
-      }
-    }
-  }
-
-  return lines.join('\n') + '\n';
+  if (forceToast) showToast(`云端拉取失败，已切换至离线精选库 (${lastErr})`);
 }
 
 async function flushStateZeroFork() {
-  const rLines = [`# MirageForge v${mirageStore.version} Routes Table`];
-  for (const [pkg, r] of Object.entries(mirageStore.appRoutes)) {
+  const rLines = [`# MirageForge v${mirageStore.version} Routes Table (v2 13-col)`];
+  for (const [pkg, rawR] of Object.entries(mirageStore.appRoutes)) {
+    const r = normalizeAppRoute(rawR);
     const tpl = mirageStore.templates[r.tplId];
-    if (!tpl || !(r.build || r.gl || r.vfs || r.probe)) {
+    if (!tpl || !isRouteAnyEnabled(r)) {
       await removeFileZeroFork(`${APPS_DIR_PATH}/${pkg}.conf`);
       delete mirageStore.appRoutes[pkg];
       continue;
     }
-    r.refreshRate = sanitizeRefreshRate(r.refreshRate);
+    mirageStore.appRoutes[pkg] = r;
     const confText = compileModularConfInTs(tpl, r);
     await writeFileZeroFork(`${APPS_DIR_PATH}/${pkg}.conf`, confText);
     rLines.push(
-      `${pkg}|${r.tplId}|${r.build ? 1 : 0}|${r.gl ? 1 : 0}|${r.vfs ? 1 : 0}|${r.probe ? 1 : 0}|${r.sdkSpoof ? 1 : 0}|${r.refreshRate}|${r.mountNs ? 1 : 0}`
+      `${pkg}|${r.tplId}|${r.build ? 1 : 0}|${r.gl ? 1 : 0}|${r.vfs ? 1 : 0}|${r.probe ? 1 : 0}|${r.sdkSpoof ? 1 : 0}|${r.refreshRate}|${r.mountNs ? 1 : 0}|${r.cowProp ? 1 : 0}|${r.cpu ? 1 : 0}|${r.mem ? 1 : 0}|${r.vfsNodes ? 1 : 0}`
     );
   }
   await writeFileZeroFork(ROUTES_DB_FILE, rLines.join('\n') + '\n');
@@ -1570,9 +904,7 @@ async function flushStateZeroFork() {
 function normalizeLoadedTemplates(rawMap: Record<string, any>): Record<string, DeviceTemplate> {
   const out: Record<string, DeviceTemplate> = {};
   for (const [id, tpl] of Object.entries(rawMap || {})) {
-    if (tpl && tpl.MODEL) {
-      out[id] = normalizeTemplateVulkanFields({ ...tpl, id });
-    }
+    if (tpl && tpl.MODEL) out[id] = normalizeTemplateVulkanFields({ ...tpl, id });
   }
   return out;
 }
@@ -1581,16 +913,8 @@ function normalizeLoadedRoutes(rawRoutes: Record<string, any>): Record<string, A
   const out: Record<string, AppRoute> = {};
   for (const [pkg, r] of Object.entries(rawRoutes || {})) {
     if (!r || !r.tplId) continue;
-    out[pkg] = {
-      tplId: String(r.tplId),
-      build: r.build !== false,
-      gl: r.gl !== false,
-      vfs: r.vfs !== false,
-      probe: Boolean(r.probe),
-      sdkSpoof: Boolean(r.sdkSpoof),
-      refreshRate: sanitizeRefreshRate(r.refreshRate),
-      mountNs: Boolean(r.mountNs),
-    };
+    const nr = normalizeAppRoute(r);
+    if (isRouteAnyEnabled(nr)) out[pkg] = nr;
   }
   return out;
 }
@@ -1706,29 +1030,92 @@ export async function updateAppRouteViaCli(
   route: AppRoute | null,
   restart = false
 ) {
+  const shouldRestart = restart || settingsStore.autoRestartOnSave;
+
   if (hasZeroForkIo()) {
-    if (!route || !route.tplId || !(route.build || route.gl || route.vfs || route.probe)) {
+    if (!route || !route.tplId) {
       delete mirageStore.appRoutes[pkg];
       await removeFileZeroFork(`${APPS_DIR_PATH}/${pkg}.conf`);
     } else {
-      mirageStore.appRoutes[pkg] = {
-        ...route,
-        refreshRate: sanitizeRefreshRate(route.refreshRate),
-      };
+      const nr = normalizeAppRoute(route);
+      if (!isRouteAnyEnabled(nr)) {
+        delete mirageStore.appRoutes[pkg];
+        await removeFileZeroFork(`${APPS_DIR_PATH}/${pkg}.conf`);
+      } else {
+        mirageStore.appRoutes[pkg] = nr;
+      }
     }
     await flushStateZeroFork();
-    if (restart) await execRootShell(`am force-stop "${pkg}"`);
+    if (shouldRestart) await execRootShell(`am force-stop "${pkg}"`);
     return;
   }
 
   if (!route || !route.tplId) {
-    await execRootShell(`"${CLI_BIN}" route remove "${pkg}" ${restart ? '--restart' : ''}`);
+    await execRootShell(`"${CLI_BIN}" route remove "${pkg}" ${shouldRestart ? '--restart' : ''}`);
   } else {
-    const fps = sanitizeRefreshRate(route.refreshRate);
-    const cmd = `"${CLI_BIN}" route set "${pkg}" "${route.tplId}" --build ${route.build ? 1 : 0} --gl ${route.gl ? 1 : 0} --vfs ${route.vfs ? 1 : 0} --probe ${route.probe ? 1 : 0} --sdk ${route.sdkSpoof ? 1 : 0} --fps ${fps} --mount-ns ${route.mountNs ? 1 : 0} ${restart ? '--restart' : ''}`;
+    const nr = normalizeAppRoute(route);
+    const cmd = [
+      `"${CLI_BIN}" route set "${pkg}" "${nr.tplId}"`,
+      `--build ${nr.build ? 1 : 0}`,
+      `--cow-prop ${nr.cowProp ? 1 : 0}`,
+      `--gl ${nr.gl ? 1 : 0}`,
+      `--vfs ${nr.vfs ? 1 : 0}`,
+      `--cpu ${nr.cpu ? 1 : 0}`,
+      `--mem ${nr.mem ? 1 : 0}`,
+      `--vfs-nodes ${nr.vfsNodes ? 1 : 0}`,
+      `--probe ${nr.probe ? 1 : 0}`,
+      `--sdk ${nr.sdkSpoof ? 1 : 0}`,
+      `--fps ${nr.refreshRate}`,
+      `--mount-ns ${nr.mountNs ? 1 : 0}`,
+      shouldRestart ? '--restart' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
     await execRootShell(cmd);
   }
   await syncStateFromRustCli();
+}
+
+/**
+ * 在设置页切换全局 MountNS / COW 开关后，一键同步应用到全部已配置应用
+ */
+export async function applyGlobalEngineFlagToAllRoutes(
+  field: 'mountNs' | 'cowProp',
+  enabled: boolean
+) {
+  const entries = Object.entries(mirageStore.appRoutes);
+  if (entries.length === 0) {
+    showToast('当前没有已配置的应用');
+    return;
+  }
+  for (const [pkg, r] of entries) {
+    const next = normalizeAppRoute({
+      ...r,
+      [field]: field === 'mountNs' ? enabled && r.vfs : enabled,
+    });
+    mirageStore.appRoutes[pkg] = next;
+  }
+  if (hasZeroForkIo()) {
+    await flushStateZeroFork();
+  } else {
+    for (const [pkg, r] of Object.entries(mirageStore.appRoutes)) {
+      await updateAppRouteViaCli(pkg, r, false);
+    }
+  }
+  triggerHaptic('success');
+  showToast(`已将 ${field === 'mountNs' ? 'MountNS' : 'COW Prop'} 策略同步至 ${entries.length} 款应用`);
+}
+
+export async function exportDiagnosticBundleViaCli() {
+  triggerHaptic('medium');
+  const outPath = `/sdcard/Download/MirageForge_Diag_${Date.now()}.txt`;
+  const res = await execRootShell(`"${CLI_BIN}" probe bundle "${outPath}"`);
+  if (res.errno === 0 && res.stdout.includes('true')) {
+    triggerHaptic('success');
+    showToast(`诊断包已导出至 ${outPath}`);
+  } else {
+    showToast('导出诊断包失败');
+  }
 }
 
 export async function forceStopApp(pkg: string, label: string) {

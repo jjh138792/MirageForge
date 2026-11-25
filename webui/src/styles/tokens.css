@@ -1,0 +1,127 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Copyright (c) 2025-2026 jjh138792
+ * MirageForge: https://github.com/jjh138792/MirageForge
+ */
+
+:root {
+  --inset-top: var(--window-inset-top, env(safe-area-inset-top, 14px));
+  --inset-bottom: var(--window-inset-bottom, env(safe-area-inset-bottom, 16px));
+  --spring-easing: cubic-bezier(0.22, 1, 0.36, 1);
+  --bounce-easing: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --theme-transition: background-color 0.42s cubic-bezier(0.22, 1, 0.36, 1),
+                      color 0.3s ease,
+                      border-color 0.3s ease,
+                      box-shadow 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+
+  --accent-primary: #8b5cf6;
+  --accent-secondary: #06b6d4;
+  --accent-primary-rgb: 139, 92, 246;
+  --accent-secondary-rgb: 6, 182, 212;
+}
+
+/* 5 套动态主题强调色 */
+:root[data-accent="violet"] {
+  --accent-primary: #8b5cf6;
+  --accent-secondary: #06b6d4;
+  --accent-primary-rgb: 139, 92, 246;
+  --accent-secondary-rgb: 6, 182, 212;
+}
+
+:root[data-accent="cyan"] {
+  --accent-primary: #0ea5e9;
+  --accent-secondary: #22d3ee;
+  --accent-primary-rgb: 14, 165, 233;
+  --accent-secondary-rgb: 34, 211, 238;
+}
+
+:root[data-accent="emerald"] {
+  --accent-primary: #10b981;
+  --accent-secondary: #14b8a6;
+  --accent-primary-rgb: 16, 185, 129;
+  --accent-secondary-rgb: 20, 184, 166;
+}
+
+:root[data-accent="rose"] {
+  --accent-primary: #f43f5e;
+  --accent-secondary: #fb7185;
+  --accent-primary-rgb: 244, 63, 94;
+  --accent-secondary-rgb: 251, 113, 133;
+}
+
+:root[data-accent="amber"] {
+  --accent-primary: #f59e0b;
+  --accent-secondary: #fb923c;
+  --accent-primary-rgb: 245, 158, 11;
+  --accent-secondary-rgb: 251, 146, 60;
+}
+
+/* 深空黑曜主题 */
+:root[data-theme="dark"] {
+  --bg-base: #060913;
+  --bg-gradient: radial-gradient(circle at 50% 0%, #111a30 0%, #060913 72%);
+  --blob-opacity: 0.44;
+
+  --glass-bg: rgba(16, 23, 40, 0.44);
+  --glass-bg-elevated: rgba(20, 29, 50, 0.56);
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-rim-top: rgba(255, 255, 255, 0.44);
+  --glass-rim-bottom: rgba(var(--accent-secondary-rgb), 0.24);
+  --glass-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.56);
+
+  /* 高透光学水滴基底：不再依赖模糊，靠明暗弧面高光与焦散边还原玻璃厚度 */
+  --orb-bg: radial-gradient(
+    130% 120% at 32% 16%,
+    rgba(255, 255, 255, 0.34) 0%,
+    rgba(255, 255, 255, 0.05) 42%,
+    rgba(var(--accent-primary-rgb), 0.14) 76%,
+    rgba(var(--accent-secondary-rgb), 0.24) 100%
+  );
+  --orb-rim: inset 0 2px 3px rgba(255, 255, 255, 0.82),
+             inset 0 -2.5px 5px rgba(var(--accent-secondary-rgb), 0.52),
+             inset 1.5px 0 3px rgba(var(--accent-primary-rgb), 0.32),
+             0 10px 26px -6px rgba(0, 0, 0, 0.55);
+
+  --input-bg: rgba(6, 10, 20, 0.56);
+  --subcard-bg: rgba(255, 255, 255, 0.045);
+  --toggle-off-bg: rgba(148, 163, 184, 0.26);
+
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+}
+
+/* 浅色水琉璃主题 */
+:root[data-theme="light"] {
+  --bg-base: #eef2ff;
+  --bg-gradient: radial-gradient(circle at 50% 0%, #e0e7ff 0%, #f1f5f9 65%, #e2e8f0 100%);
+  --blob-opacity: 0.55;
+
+  --glass-bg: rgba(255, 255, 255, 0.52);
+  --glass-bg-elevated: rgba(255, 255, 255, 0.68);
+  --glass-border: rgba(255, 255, 255, 0.78);
+  --glass-rim-top: rgba(255, 255, 255, 0.98);
+  --glass-rim-bottom: rgba(var(--accent-primary-rgb), 0.22);
+  --glass-shadow: 0 14px 30px -8px rgba(15, 23, 42, 0.10),
+                  0 4px 12px -2px rgba(var(--accent-primary-rgb), 0.08);
+
+  --orb-bg: radial-gradient(
+    130% 120% at 32% 16%,
+    rgba(255, 255, 255, 0.78) 0%,
+    rgba(255, 255, 255, 0.14) 46%,
+    rgba(var(--accent-primary-rgb), 0.13) 78%,
+    rgba(var(--accent-secondary-rgb), 0.22) 100%
+  );
+  --orb-rim: inset 0 2px 4px rgba(255, 255, 255, 0.98),
+             inset 0 -2.5px 5px rgba(var(--accent-primary-rgb), 0.34),
+             inset 1.5px 0 3px rgba(var(--accent-secondary-rgb), 0.28),
+             0 10px 22px -6px rgba(15, 23, 42, 0.18);
+
+  --input-bg: rgba(255, 255, 255, 0.72);
+  --subcard-bg: rgba(15, 23, 42, 0.04);
+  --toggle-off-bg: rgba(100, 116, 139, 0.28);
+
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+}

@@ -1,0 +1,67 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Copyright (c) 2025-2026 jjh138792
+ * MirageForge: https://github.com/jjh138792/MirageForge
+ */
+
+/* 1. 主页签方向性水平滑动转场 (左滑/右滑) */
+.slide-left-enter-active,
+.slide-left-leave-active,
+.slide-right-enter-active,
+.slide-right-leave-active {
+  transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1),
+              opacity 0.24s ease;
+  will-change: transform, opacity;
+}
+
+.slide-left-enter-from {
+  opacity: 0;
+  transform: translate3d(34px, 0, 0) scale(0.99);
+}
+
+.slide-left-leave-to {
+  opacity: 0;
+  transform: translate3d(-28px, 0, 0) scale(0.99);
+}
+
+.slide-right-enter-from {
+  opacity: 0;
+  transform: translate3d(-34px, 0, 0) scale(0.99);
+}
+
+.slide-right-leave-to {
+  opacity: 0;
+  transform: translate3d(28px, 0, 0) scale(0.99);
+}
+
+/* 2. 弹窗与局部浮层液态形变转场 */
+.view-morph-enter-active,
+.view-morph-leave-active {
+  transition: opacity 0.24s var(--spring-easing), transform 0.26s var(--spring-easing);
+}
+
+.view-morph-enter-from {
+  opacity: 0;
+  transform: translateY(10px) scale(0.98);
+}
+
+.view-morph-leave-to {
+  opacity: 0;
+  transform: translateY(-6px) scale(0.99);
+}
+
+/* 3. 次级全屏页进出动效 */
+.page-push-enter-active,
+.page-push-leave-active {
+  transition: transform 0.32s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.26s ease;
+}
+
+.page-push-enter-from {
+  opacity: 0;
+  transform: translate3d(0, 22px, 0) scale(0.975);
+}
+
+.page-push-leave-to {
+  opacity: 0;
+  transform: translate3d(0, 14px, 0) scale(0.985);
+}

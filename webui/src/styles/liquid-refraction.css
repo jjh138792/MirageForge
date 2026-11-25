@@ -1,0 +1,125 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Copyright (c) 2025-2026 jjh138792
+ * MirageForge: https://github.com/jjh138792/MirageForge
+ */
+
+/* 动态极光流体背景画布 */
+.ambient-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  background: var(--bg-gradient);
+  transition: background 0.45s ease;
+}
+
+.aurora-blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(74px);
+  opacity: var(--blob-opacity);
+  will-change: transform;
+  transition: opacity 0.45s ease;
+  animation: aurora-float 18s infinite alternate ease-in-out;
+}
+
+.aurora-blob.blob-1 {
+  width: 360px;
+  height: 360px;
+  background: radial-gradient(circle, var(--accent-primary), transparent 70%);
+  top: -80px;
+  right: -60px;
+}
+
+.aurora-blob.blob-2 {
+  width: 330px;
+  height: 330px;
+  background: radial-gradient(circle, var(--accent-secondary), transparent 70%);
+  bottom: 12%;
+  left: -85px;
+  animation-delay: -6s;
+}
+
+.aurora-blob.blob-3 {
+  width: 260px;
+  height: 260px;
+  background: radial-gradient(circle, #f43f5e, transparent 70%);
+  top: 42%;
+  right: 8%;
+  opacity: calc(var(--blob-opacity) * 0.55);
+  animation-delay: -11s;
+}
+
+@keyframes aurora-float {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(-24px, 26px, 0) scale(1.08); }
+  100% { transform: translate3d(20px, -18px, 0) scale(0.95); }
+}
+
+/* 倒角折射液态玻璃卡片 */
+.liquid-glass {
+  position: relative;
+  background: var(--glass-bg);
+  backdrop-filter: url(#mirage-card-lens) blur(16px) saturate(185%);
+  -webkit-backdrop-filter: url(#mirage-card-lens) blur(16px) saturate(185%);
+  border-radius: 24px;
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    inset 0 1.5px 1.5px 0 var(--glass-rim-top),
+    inset 0 -1.5px 2px 0 var(--glass-rim-bottom),
+    var(--glass-shadow);
+  overflow: hidden;
+  transition: var(--theme-transition), transform 0.3s var(--spring-easing);
+}
+
+:root[data-refraction="off"] .liquid-glass {
+  backdrop-filter: blur(18px) saturate(170%);
+  -webkit-backdrop-filter: blur(18px) saturate(170%);
+}
+
+.liquid-glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    240px circle at var(--px, -200px) var(--py, -200px),
+    rgba(255, 255, 255, 0.2),
+    transparent 65%
+  );
+  opacity: var(--spot-opacity, 0);
+  transition: opacity 0.25s ease;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.liquid-glass > * {
+  position: relative;
+  z-index: 1;
+}
+
+.liquid-glass-elevated {
+  background: var(--glass-bg-elevated);
+  backdrop-filter: url(#mirage-card-lens) blur(22px) saturate(200%);
+  -webkit-backdrop-filter: url(#mirage-card-lens) blur(22px) saturate(200%);
+}
+
+:root[data-refraction="off"] .liquid-glass-elevated {
+  backdrop-filter: blur(22px) saturate(180%);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
+}
+
+/* 真·零模糊水面拉伸液态玻璃球：纯光学位移 + RGB 色散 + 镜面焦散 */
+.liquid-orb-pill {
+  background: var(--orb-bg);
+  backdrop-filter: url(#mirage-orb-lens) contrast(1.06) brightness(1.05);
+  -webkit-backdrop-filter: url(#mirage-orb-lens) contrast(1.06) brightness(1.05);
+  box-shadow: var(--orb-rim);
+  border: 1px solid var(--glass-rim-top);
+  will-change: transform;
+}
+
+:root[data-refraction="off"] .liquid-orb-pill {
+  backdrop-filter: blur(4px) saturate(180%);
+  -webkit-backdrop-filter: blur(4px) saturate(180%);
+}
