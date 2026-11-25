@@ -13,7 +13,7 @@ function clampByte(v: number): number {
 }
 
 /**
- * 1. 底栏全域柱面曲面拉伸法线贴图（不止拉边缘，整条底栏背后全部内容均连续受玻璃曲面拉伸）
+ * 1. 整条底栏全域曲面拉伸贴图（拉伸底栏背后所有滚动内容）
  */
 function buildFullStretchDockMap(cssW: number, cssH: number, cornerRadiusPx: number): string {
   const w = Math.max(40, Math.round(cssW));
@@ -36,13 +36,13 @@ function buildFullStretchDockMap(cssW: number, cssH: number, cornerRadiusPx: num
 
   for (let y = 0; y < h; y++) {
     const py = y + 0.5 - halfH;
-    const ny = py / halfH; // -1..1
+    const ny = py / halfH;
     const ay = Math.abs(py);
     const qy = ay - by;
 
     for (let x = 0; x < w; x++) {
       const px = x + 0.5 - halfW;
-      const nx = px / halfW; // -1..1
+      const nx = px / halfW;
       const ax = Math.abs(px);
       const qx = ax - bx;
 
@@ -55,15 +55,12 @@ function buildFullStretchDockMap(cssW: number, cssH: number, cornerRadiusPx: num
 
       if (sdf < 0) {
         const distFromEdge = -sdf;
-        // 纵向全高度柱面放大拉伸（即使正中心也能看到背后文字被玻璃弧面拉伸）
         const ayNorm = Math.abs(ny);
-        dy = -Math.sign(ny) * (0.48 * ayNorm + 0.52 * Math.pow(ayNorm, 2.0));
-
-        // 横向全域温和拉伸 + 左右圆角端增强折射
         const axNorm = Math.abs(nx);
+
+        dy = -Math.sign(ny) * (0.48 * ayNorm + 0.52 * Math.pow(ayNorm, 2.0));
         dx = -Math.sign(nx) * (0.30 * axNorm + 0.70 * Math.pow(axNorm, 2.4));
 
-        // 最外缘 1.5px 柔顺收边防杂色溢出
         if (distFromEdge < 1.5) {
           const fade = distFromEdge / 1.5;
           dx *= fade;
@@ -84,7 +81,7 @@ function buildFullStretchDockMap(cssW: number, cssH: number, cornerRadiusPx: num
 }
 
 /**
- * 2. 静止态液态玻璃泡：全域凸面水滴法线贴图（从中心到边缘连续拉伸泡背后的所有内容）
+ * 2. 静止态泡（位于图标下方）：全域凸面水滴法线贴图，只拉伸背后的页面背景（绝不触碰图标）
  */
 function buildFullDomeOrbMap(cssW: number, cssH: number): string {
   const w = Math.max(24, Math.round(cssW));
@@ -108,7 +105,6 @@ function buildFullDomeOrbMap(cssW: number, cssH: number): string {
     const py = y + 0.5 - halfH;
     const ny = py / halfH;
     const ay = Math.abs(py);
-    const qy = ay;
 
     for (let x = 0; x < w; x++) {
       const px = x + 0.5 - halfW;
@@ -117,7 +113,7 @@ function buildFullDomeOrbMap(cssW: number, cssH: number): string {
       const qx = ax - bx;
 
       const outX = Math.max(qx, 0);
-      const sdf = Math.hypot(outX, qy) + Math.min(Math.max(qx, qy - r), 0) - r;
+      const sdf = Math.hypot(outX, ay) - r;
 
       let dx = 0;
       let dy = 0;
@@ -125,8 +121,7 @@ function buildFullDomeOrbMap(cssW: number, cssH: number): string {
       if (sdf < 0) {
         const distFromEdge = -sdf;
         const radial = clamp(Math.hypot(nx, ny), 0, 1);
-        // 连续凸透镜球面曲线：整颗水滴内部从中心到外缘都有明显拉伸放大感
-        const domeGain = 0.58 + 0.42 * Math.pow(radial, 1.55);
+        const domeGain = 0.58 + 0.42 * Math.pow(radial, 1.5);
         dx = -nx * domeGain;
         dy = -ny * domeGain;
 
@@ -150,14 +145,14 @@ function buildFullDomeOrbMap(cssW: number, cssH: number): string {
 }
 
 /**
- * 3. 交互态液态玻璃泡：仅拉边缘 Snell 弧壁贴图（中心 56% 严格 0 位移清澈，仅外缘弧壁强力弯曲拉伸）
+ * 3. 交互态泡（位于图标上方）：0 模糊、中心清澈无畸变，仅外圈 Snell 弧壁强力弯曲拉伸
  */
 function buildRimOnlyOrbMap(cssW: number, cssH: number): string {
   const w = Math.max(24, Math.round(cssW));
   const h = Math.max(20, Math.round(cssH));
   const r = h * 0.5;
   const bezelPx = Math.min(22, h * 0.44);
-  const ior = 1.58;
+  const ior = 1.60;
 
   const canvas = document.createElement('canvas');
   canvas.width = w;
@@ -206,7 +201,7 @@ function buildRimOnlyOrbMap(cssW: number, cssH: number): string {
           const thetaI = Math.asin(sinThetaI);
           const thetaT = Math.asin(sinThetaI / ior);
           const height = Math.sqrt(Math.max(0.01, 1 - sinThetaI * sinThetaI));
-          let mag = clamp(Math.tan(thetaI - thetaT) * (1.32 - 0.5 * height) * 1.58, 0, 1);
+          let mag = clamp(Math.tan(thetaI - thetaT) * (1.35 - 0.5 * height) * 1.62, 0, 1);
 
           if (distFromEdge < 1.5) {
             mag *= distFromEdge / 1.5;
@@ -273,8 +268,10 @@ export function updateOrbLensGeometry(width: number, height: number) {
   if (key === lastOrbKey) return;
   lastOrbKey = key;
 
-  setFilterBox('mirage-orb-lens', w, h);
+  setFilterBox('mirage-orb-dome-lens', w, h);
   setFeImage('mirage-orb-dome-map', w, h, buildFullDomeOrbMap(w, h));
+
+  setFilterBox('mirage-orb-rim-lens', w, h);
   setFeImage('mirage-orb-rim-map', w, h, buildRimOnlyOrbMap(w, h));
 }
 
@@ -286,26 +283,11 @@ export function initOpticalLensEngine() {
   updateOrbLensGeometry(108, 52);
 }
 
-/**
- * 连续驱动泡的光学表面变形：
- * - morphToRim = 0：静止态全域凸面拉伸（拉伸背后所有内容）
- * - morphToRim = 1：交互态仅拉边缘（中心清晰无畸变，外圈弧壁强力弯曲拉伸）
- */
-export function setOrbMorphState(morphToRim: number, baseScale: number) {
-  const t = clamp(morphToRim, 0, 1);
-  const morphEl = document.getElementById('mirage-orb-morph');
-  if (morphEl) {
-    morphEl.setAttribute('k2', (1 - t).toFixed(3));
-    morphEl.setAttribute('k3', t.toFixed(3));
-  }
-  setOrbRefractionScale(baseScale);
-}
-
-export function setOrbRefractionScale(baseScale: number) {
-  const eff = Math.max(0, baseScale * refractionMultiplier);
-  const disp = document.getElementById('mirage-orb-disp');
-  if (disp) {
-    disp.setAttribute('scale', eff.toFixed(1));
+export function setOrbRefractionScale(rimScale: number) {
+  const eff = Math.max(0, rimScale * refractionMultiplier);
+  const rimDisp = document.getElementById('mirage-orb-rim-disp');
+  if (rimDisp) {
+    rimDisp.setAttribute('scale', eff.toFixed(1));
   }
 }
 
@@ -314,8 +296,11 @@ export function setRefractionIntensity(level: RefractionLevel) {
 
   const dockDisp = document.getElementById('mirage-dock-disp');
   if (dockDisp) {
-    dockDisp.setAttribute('scale', (26 * refractionMultiplier).toFixed(1));
+    dockDisp.setAttribute('scale', (24 * refractionMultiplier).toFixed(1));
   }
-  // 静止默认处于全域凸面拉伸态 (morph = 0)
-  setOrbMorphState(0, level === 'off' ? 0 : 18);
+  const domeDisp = document.getElementById('mirage-orb-dome-disp');
+  if (domeDisp) {
+    domeDisp.setAttribute('scale', (20 * refractionMultiplier).toFixed(1));
+  }
+  setOrbRefractionScale(level === 'off' ? 0 : 30);
 }

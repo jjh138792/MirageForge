@@ -100,16 +100,16 @@
 }
 
 /* ==========================================================================
-   1. 整条底栏玻璃层：
-   - 液态玻璃模式：极低模糊 + #mirage-dock-lens 全域拉伸背后所有内容
-   - 仅毛玻璃模式：标准通透磨砂虚化（无任何扭曲拉伸）
+   1. 整条底栏玻璃层 (z-index: 0)：
+   - 液态玻璃模式：全域拉伸背后页面 + 柔和模糊 (blur 5px)
+   - 仅毛玻璃模式：标准通透磨砂虚化 (blur 22px)，无拉伸
    ========================================================================== */
 .liquid-dock-glass {
   background: var(--dock-surface-bg);
   border: 1px solid var(--glass-border);
   box-shadow: var(--dock-rim);
-  backdrop-filter: url(#mirage-dock-lens) blur(0.4px) saturate(140%);
-  -webkit-backdrop-filter: url(#mirage-dock-lens) blur(0.4px) saturate(140%);
+  backdrop-filter: url(#mirage-dock-lens) blur(5px) saturate(165%);
+  -webkit-backdrop-filter: url(#mirage-dock-lens) blur(5px) saturate(165%);
 }
 
 :root[data-refraction="off"] .liquid-dock-glass {
@@ -119,23 +119,36 @@
 }
 
 /* ==========================================================================
-   2. 滑块泡：
-   - 液态玻璃模式：常驻等明度晶莹水晶质感 + #mirage-orb-lens（静止全域拉伸 <-> 交互仅拉边缘）
-   - 仅毛玻璃模式：标准真磨砂玻璃药丸（位于图标下层，静止与滑动完全一致）
+   2. 静止态泡 (z-index: 1，位于图标下方)：
+   - 液态模式：只拉伸并柔和模糊背后页面，绝不拉歪上方图标与文字
+   - 仅毛玻璃模式：统一真磨砂玻璃药丸，无静态/活动态差异
    ========================================================================== */
-.liquid-orb-pill {
+.orb-idle-glass {
   background: var(--orb-crystal-bg);
   border: 1px solid var(--glass-rim-top);
   box-shadow: var(--orb-crystal-rim);
-  backdrop-filter: url(#mirage-orb-lens);
-  -webkit-backdrop-filter: url(#mirage-orb-lens);
-  will-change: transform;
+  backdrop-filter: url(#mirage-orb-dome-lens) blur(3.5px) saturate(155%);
+  -webkit-backdrop-filter: url(#mirage-orb-dome-lens) blur(3.5px) saturate(155%);
+  will-change: transform, opacity;
 }
 
-:root[data-refraction="off"] .liquid-orb-pill {
+:root[data-refraction="off"] .orb-idle-glass {
   background: var(--orb-blur-bg);
   border: 1px solid var(--orb-blur-border);
   box-shadow: var(--orb-blur-shadow);
   backdrop-filter: blur(14px) saturate(185%);
   -webkit-backdrop-filter: blur(14px) saturate(185%);
+}
+
+/* ==========================================================================
+   3. 交互态泡 (z-index: 3，位于图标上方)：
+   - 仅液态模式按住/拖动时浮现：0 模糊！中心清澈、仅外圈弧壁强力弯曲拉伸图标与背景
+   ========================================================================== */
+.orb-interactive-glass {
+  background: var(--orb-crystal-bg);
+  border: 1px solid var(--glass-rim-top);
+  box-shadow: var(--orb-crystal-rim);
+  backdrop-filter: url(#mirage-orb-rim-lens);
+  -webkit-backdrop-filter: url(#mirage-orb-rim-lens);
+  will-change: transform, opacity;
 }

@@ -16,14 +16,14 @@ MirageForge: https://github.com/jjh138792/MirageForge
 </head>
 <body>
   <!--
-    三图双态光学引擎 (userSpaceOnUse 1:1 像素对齐 + 无损单通道折射)：
-    1. #mirage-dock-lens：整条底栏全域曲面拉伸（透视并拉伸背后所有内容）
-    2. #mirage-orb-lens：内置 domeMap（静止全域拉伸）与 rimMap（交互仅拉边缘），
-       通过 feComposite(arithmetic) 随弹簧实时连续插值变形，0 闪烁、0 明暗跳变
+    三独立单通道无损折射滤镜 (userSpaceOnUse 1:1 真实 CSS 像素对齐)：
+    1. #mirage-dock-lens：整条底栏全域拉伸背后页面（配合柔焦磨砂）
+    2. #mirage-orb-dome-lens：静止泡（位于图标下层），全域凸面拉伸背后页面（配合柔焦磨砂，绝不拉歪图标）
+    3. #mirage-orb-rim-lens：交互泡（位于图标上层），0 模糊、仅边缘弧壁弯曲拉伸
   -->
   <svg style="position: fixed; width: 0; height: 0; pointer-events: none; z-index: -999;" aria-hidden="true">
     <defs>
-      <!-- 1. 整条底栏全域曲面拉伸滤镜 -->
+      <!-- 1. 整条底栏全域拉伸 -->
       <filter
         id="mirage-dock-lens"
         filterUnits="userSpaceOnUse"
@@ -42,22 +42,22 @@ MirageForge: https://github.com/jjh138792/MirageForge
           width="360"
           height="64"
           preserveAspectRatio="none"
-          result="dockRawMap"
+          result="dockRaw"
         />
-        <feComposite in="dockRawMap" in2="dockNeutral" operator="over" result="dockMap" />
+        <feComposite in="dockRaw" in2="dockNeutral" operator="over" result="dockMap" />
         <feDisplacementMap
           id="mirage-dock-disp"
           in="SourceGraphic"
           in2="dockMap"
-          scale="26"
+          scale="24"
           xChannelSelector="R"
           yChannelSelector="G"
         />
       </filter>
 
-      <!-- 2. 液态玻璃泡双态连续变形滤镜（静止=全域凸面拉伸 <-> 交互=仅拉边缘） -->
+      <!-- 2. 静止态泡（图标下层）：全域凸面拉伸背后所有内容 -->
       <filter
-        id="mirage-orb-lens"
+        id="mirage-orb-dome-lens"
         filterUnits="userSpaceOnUse"
         primitiveUnits="userSpaceOnUse"
         x="0"
@@ -66,9 +66,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
         height="52"
         color-interpolation-filters="sRGB"
       >
-        <feFlood flood-color="rgb(128,128,128)" result="orbNeutral" />
-
-        <!-- 静止态法线图：全域凸面拉伸背后全部内容 -->
+        <feFlood flood-color="rgb(128,128,128)" result="domeNeutral" />
         <feImage
           id="mirage-orb-dome-map"
           x="0"
@@ -78,9 +76,29 @@ MirageForge: https://github.com/jjh138792/MirageForge
           preserveAspectRatio="none"
           result="domeRaw"
         />
-        <feComposite in="domeRaw" in2="orbNeutral" operator="over" result="domeMap" />
+        <feComposite in="domeRaw" in2="domeNeutral" operator="over" result="domeMap" />
+        <feDisplacementMap
+          id="mirage-orb-dome-disp"
+          in="SourceGraphic"
+          in2="domeMap"
+          scale="20"
+          xChannelSelector="R"
+          yChannelSelector="G"
+        />
+      </filter>
 
-        <!-- 交互态法线图：中心 0 畸变清澈，仅边缘弧壁强力弯曲拉伸 -->
+      <!-- 3. 交互态泡（图标上层）：0 模糊，中心清澈、仅外圈弧壁强力弯曲拉伸 -->
+      <filter
+        id="mirage-orb-rim-lens"
+        filterUnits="userSpaceOnUse"
+        primitiveUnits="userSpaceOnUse"
+        x="0"
+        y="0"
+        width="108"
+        height="52"
+        color-interpolation-filters="sRGB"
+      >
+        <feFlood flood-color="rgb(128,128,128)" result="rimNeutral" />
         <feImage
           id="mirage-orb-rim-map"
           x="0"
@@ -90,26 +108,12 @@ MirageForge: https://github.com/jjh138792/MirageForge
           preserveAspectRatio="none"
           result="rimRaw"
         />
-        <feComposite in="rimRaw" in2="orbNeutral" operator="over" result="rimMap" />
-
-        <!-- 实时线性插值混合：k2 = 1 - t (静止全域), k3 = t (交互边缘) -->
-        <feComposite
-          id="mirage-orb-morph"
-          in="domeMap"
-          in2="rimMap"
-          operator="arithmetic"
-          k1="0"
-          k2="1"
-          k3="0"
-          k4="0"
-          result="lensMap"
-        />
-
+        <feComposite in="rimRaw" in2="rimNeutral" operator="over" result="rimMap" />
         <feDisplacementMap
-          id="mirage-orb-disp"
+          id="mirage-orb-rim-disp"
           in="SourceGraphic"
-          in2="lensMap"
-          scale="18"
+          in2="rimMap"
+          scale="30"
           xChannelSelector="R"
           yChannelSelector="G"
         />
