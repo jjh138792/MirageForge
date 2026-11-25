@@ -16,12 +16,12 @@ MirageForge: https://github.com/jjh138792/MirageForge
 </head>
 <body>
   <!--
-    严格 userSpaceOnUse 真实 CSS 像素坐标 + rgb(128,128,128) 中性灰兜底：
-    彻底解决 Android WebView / Chromium 高 DPI 下 backdrop-filter 偏移、缩放错位与直角蓝边切口
+    纯单通道无损 feDisplacementMap + userSpaceOnUse 1:1 真实 CSS 像素坐标：
+    彻底消除 feBlend 半透明 Alpha 叠加导致的发黑发灰，100% 保留晶莹剔透的光学质感
   -->
   <svg style="position: fixed; width: 0; height: 0; pointer-events: none; z-index: -999;" aria-hidden="true">
     <defs>
-      <!-- 1. 整个底栏本体专用：透视底层页面内容并在底栏边缘弧面产生真实玻璃拉伸扭曲 -->
+      <!-- 1. 整条底栏玻璃本体：透视下方页面并在边缘弧面产生拉伸扭曲 -->
       <filter
         id="mirage-dock-lens"
         filterUnits="userSpaceOnUse"
@@ -47,13 +47,13 @@ MirageForge: https://github.com/jjh138792/MirageForge
           id="mirage-dock-disp"
           in="SourceGraphic"
           in2="dockMap"
-          scale="22"
+          scale="24"
           xChannelSelector="R"
           yChannelSelector="G"
         />
       </filter>
 
-      <!-- 2. 液滴滑块泡专用：中心严格 0 位移无重影，外圈弧壁强 Snell 弯曲拉伸 + ±1.2px 边缘微色散 -->
+      <!-- 2. 液滴滑块泡：单通道无损高透折射（中心 0 位移清晰，外圈弧壁强 Snell 弯曲拉伸） -->
       <filter
         id="mirage-orb-lens"
         filterUnits="userSpaceOnUse"
@@ -75,57 +75,14 @@ MirageForge: https://github.com/jjh138792/MirageForge
           result="orbRawMap"
         />
         <feComposite in="orbRawMap" in2="orbNeutral" operator="over" result="lensMap" />
-
-        <feColorMatrix
-          in="SourceGraphic"
-          type="matrix"
-          values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0"
-          result="srcR"
-        />
-        <feColorMatrix
-          in="SourceGraphic"
-          type="matrix"
-          values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0"
-          result="srcG"
-        />
-        <feColorMatrix
-          in="SourceGraphic"
-          type="matrix"
-          values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0"
-          result="srcB"
-        />
-
         <feDisplacementMap
-          id="mirage-orb-disp-r"
-          in="srcR"
+          id="mirage-orb-disp"
+          in="SourceGraphic"
           in2="lensMap"
-          scale="27.2"
+          scale="28"
           xChannelSelector="R"
           yChannelSelector="G"
-          result="dispR"
         />
-        <feDisplacementMap
-          id="mirage-orb-disp-g"
-          in="srcG"
-          in2="lensMap"
-          scale="26"
-          xChannelSelector="R"
-          yChannelSelector="G"
-          result="dispG"
-        />
-        <feDisplacementMap
-          id="mirage-orb-disp-b"
-          in="srcB"
-          in2="lensMap"
-          scale="24.8"
-          xChannelSelector="R"
-          yChannelSelector="G"
-          result="dispB"
-        />
-
-        <feBlend in="dispR" in2="dispG" mode="screen" result="dispRG" />
-        <feBlend in="dispRG" in2="dispB" mode="screen" result="dispRGB" />
-        <feColorMatrix in="dispRGB" type="saturate" values="1.12" />
       </filter>
     </defs>
   </svg>

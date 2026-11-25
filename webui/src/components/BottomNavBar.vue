@@ -58,7 +58,6 @@ const isLiquidLensActive = computed(
     settingsStore.refractionLevel === 'vivid'
 );
 
-// 实时同步底栏与滑块泡的真实 CSS 像素宽高至 SVG userSpaceOnUse 滤镜
 function syncLensGeometries() {
   if (dockRef.value) {
     const dw = dockRef.value.offsetWidth;
@@ -98,10 +97,10 @@ function startPhysicsLoop() {
 
     const activeBoost =
       isOrbPressed.value || isOrbDragging.value ? 1 : Math.min(1, Math.abs(vx) * 0.5);
-    const baseRefraction = settingsStore.refractionLevel === 'vivid' ? 20 : 0;
+    const baseRefraction = settingsStore.refractionLevel === 'vivid' ? 24 : 0;
     const dynamicScale = Math.max(
       baseRefraction,
-      (24 + Math.min(10, Math.abs(vx) * 2.2 + (baseScale - 1) * 30)) * activeBoost
+      (28 + Math.min(10, Math.abs(vx) * 2.2 + (baseScale - 1) * 32)) * activeBoost
     );
     setOrbRefractionScale(dynamicScale);
 
@@ -110,7 +109,7 @@ function startPhysicsLoop() {
     } else {
       rafId = 0;
       isOrbMoving.value = false;
-      setOrbRefractionScale(settingsStore.refractionLevel === 'vivid' ? 20 : 0);
+      setOrbRefractionScale(settingsStore.refractionLevel === 'vivid' ? 24 : 0);
     }
   };
 
@@ -237,9 +236,10 @@ onUnmounted(() => {
 
 <template>
   <nav class="nav-dock-wrap" :class="dockStyle">
+    <!-- 父容器绝不加 backdrop-filter，避免阻断子元素液滴泡的底层穿透 -->
     <div
       ref="dockRef"
-      class="nav-dock-bar liquid-dock-glass"
+      class="nav-dock-bar"
       :class="dockStyle"
       :style="{ gridTemplateColumns: `repeat(${items.length}, 1fr)` }"
       @pointerdown="onDockPointerDown"
@@ -247,6 +247,10 @@ onUnmounted(() => {
       @pointerup="onDockPointerUp"
       @pointercancel="onDockPointerUp"
     >
+      <!-- Layer 0: 独立兄弟玻璃底座（透视页面并在边缘拉伸折射） -->
+      <div class="dock-glass-layer liquid-dock-glass" :class="dockStyle"></div>
+
+      <!-- Layer 1: 图标与文字 -->
       <div
         v-for="(item, idx) in items"
         :key="item.key"
@@ -257,6 +261,7 @@ onUnmounted(() => {
         <span class="dock-label">{{ item.label }}</span>
       </div>
 
+      <!-- Layer 2: 晶莹高透液滴滑块泡（无损穿透页面 + 底座 + 图标） -->
       <div
         ref="orbRef"
         class="dock-liquid-orb liquid-orb-pill"
@@ -303,21 +308,32 @@ onUnmounted(() => {
   transition:
     max-width 0.38s var(--spring-easing),
     border-radius 0.36s var(--spring-easing),
-    padding-bottom 0.36s var(--spring-easing),
-    var(--theme-transition);
+    padding-bottom 0.36s var(--spring-easing);
 }
 
 .nav-dock-bar.docked {
   max-width: 100%;
   border-radius: 22px 22px 0 0;
-  border-bottom: none;
-  border-left: none;
-  border-right: none;
   padding: 6px 6px calc(var(--inset-bottom) + 6px);
 }
 
 .nav-dock-bar:active {
   cursor: grabbing;
+}
+
+.dock-glass-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  transition: border-radius 0.36s var(--spring-easing), var(--theme-transition);
+}
+
+.dock-glass-layer.docked {
+  border-bottom: none;
+  border-left: none;
+  border-right: none;
 }
 
 .dock-slot {
