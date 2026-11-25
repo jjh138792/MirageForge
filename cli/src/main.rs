@@ -4,12 +4,14 @@
 
 mod alchemy;
 mod compiler;
+mod device_info;
 mod fs_atomic;
 mod models;
 mod probe;
 mod store;
 
 use alchemy::parse_build_prop;
+use device_info::{clone_host_as_template, collect_host_device_info};
 use fs_atomic::{is_safe_token, read_file_str, write_file_atomic};
 use models::*;
 use probe::ProbeDoctor;
@@ -22,13 +24,21 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
-fn get_opt<'a>(args: &'a [String], opt: &str, def: &'a str) -> &'a str {
+fn find_opt<'a>(args: &'a [String], opt: &str) -> Option<&'a str> {
     for i in 0..args.len().saturating_sub(1) {
         if args[i] == opt {
-            return &args[i + 1];
+            return Some(&args[i + 1]);
         }
     }
-    def
+    None
+}
+
+fn get_opt<'a>(args: &'a [String], opt: &str, def: &'a str) -> &'a str {
+    find_opt(args, opt).unwrap_or(def)
+}
+
+fn parse_bool_val(s: &str) -> bool {
+    s == "1" || s.eq_ignore_ascii_case("true")
 }
 
 fn read_stdin_all() -> String {
@@ -62,6 +72,23 @@ fn main() {
             process::exit(1);
         }
         print!("{}", content);
+        return;
+    }
+
+    if cmd == "device-info" {
+        let info = collect_host_device_info();
+        if json_mode {
+            println!("{}", serde_json::to_string(&info).unwrap_or_else(|_| "{}".into()));
+        } else {
+            println!("Device  : {} {} ({})", info.brand, info.model, info.device);
+            println!("Android : {} (SDK {})", info.android_release, info.sdk_int);
+            println!("Kernel  : {} ({})", info.kernel_release, info.arch);
+            println!("CPU     : {} ({} cores | {})", info.cpu_hardware, info.cpu_cores, info.cpu_clusters);
+            println!("GPU     : {}", info.gpu_renderer);
+            println!("RAM     : {} GB", info.ram_gb);
+            println!("Root    : {} {}", info.root_manager, info.root_version);
+            println!("Zygisk  : {} {}", info.zygisk_impl, info.zygisk_version);
+        }
         return;
     }
 
@@ -109,16 +136,19 @@ fn main() {
                         .map(|t| t.name.as_str())
                         .unwrap_or(&r.tpl_id);
                     println!(
-                        "  * {} -> [{} | Build:{} GL:{} VFS:{} Probe:{} SDK:{} FPS:{}Hz MountNS:{}]",
+                        "  * {} -> [{} | Build:{} COW:{} GL:{} CPU:{} Mem:{} Nodes:{} MountNS:{} Probe:{} SDK:{} FPS:{}Hz]",
                         r.pkg_name,
                         m_name,
                         r.build as u8,
+                        r.cow_prop as u8,
                         r.gl as u8,
-                        r.vfs as u8,
+                        r.cpu as u8,
+                        r.mem as u8,
+                        r.vfs_nodes as u8,
+                        r.mount_ns as u8,
                         r.probe as u8,
                         r.sdk_spoof as u8,
-                        r.refresh_rate,
-                        r.mount_ns as u8
+                        r.refresh_rate
                     );
                 }
             }
@@ -129,6 +159,19 @@ fn main() {
         "sync" => {
             store.save_all_and_compile();
             println!("{{\"ok\":true}}");
+        }
+        "clone-device" => {
+            let custom_id = get_opt(&args, "--id", "");
+            let cid_opt = if custom_id.is_empty() { None } else { Some(custom_id) };
+            if let Some(tpl) = clone_host_as_template(cid_opt) {
+                if has_flag(&args, "--save") {
+                    store.upsert_template(tpl.clone());
+                }
+                println!("{}", serde_json::to_string(&tpl).unwrap_or_default());
+            } else {
+                println!("{{\"ok\":false,\"error\":\"clone_failed\"}}");
+                process::exit(1);
+            }
         }
         "template" => {
             let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
@@ -234,17 +277,27 @@ fn main() {
             if sub == "set" && args.len() >= 5 {
                 let fps_str = get_opt(&args, "--fps", get_opt(&args, "--refresh-rate", "0"));
                 let mount_ns_str = get_opt(&args, "--mount-ns", get_opt(&args, "--seccomp", "0"));
-                let route = AppRoute {
+                let legacy_vfs = parse_bool_val(get_opt(&args, "--vfs", "1"));
+                let cpu = find_opt(&args, "--cpu").map(parse_bool_val).unwrap_or(legacy_vfs);
+                let mem = find_opt(&args, "--mem").map(parse_bool_val).unwrap_or(legacy_vfs);
+                let vfs_nodes = find_opt(&args, "--vfs-nodes").map(parse_bool_val).unwrap_or(legacy_vfs);
+
+                let mut route = AppRoute {
                     pkg_name: args[3].clone(),
                     tpl_id: args[4].clone(),
-                    build: get_opt(&args, "--build", "1") == "1",
-                    gl: get_opt(&args, "--gl", "1") == "1",
-                    vfs: get_opt(&args, "--vfs", "1") == "1",
-                    probe: get_opt(&args, "--probe", "0") == "1",
-                    sdk_spoof: get_opt(&args, "--sdk", "0") == "1",
+                    build: parse_bool_val(get_opt(&args, "--build", "1")),
+                    cow_prop: parse_bool_val(get_opt(&args, "--cow-prop", "0")),
+                    gl: parse_bool_val(get_opt(&args, "--gl", "1")),
+                    vfs: cpu || mem || vfs_nodes,
+                    cpu,
+                    mem,
+                    vfs_nodes,
+                    probe: parse_bool_val(get_opt(&args, "--probe", "0")),
+                    sdk_spoof: parse_bool_val(get_opt(&args, "--sdk", "0")),
                     refresh_rate: sanitize_refresh_rate(fps_str.parse::<i32>().unwrap_or(0)),
-                    mount_ns: mount_ns_str == "1" || mount_ns_str == "true",
+                    mount_ns: parse_bool_val(mount_ns_str),
                 };
+                route.normalize();
                 let restart = has_flag(&args, "--restart");
                 let ok = store.set_route(route, restart);
                 println!("{{\"ok\":{}}}", ok);
@@ -319,9 +372,20 @@ fn main() {
                     ProbeDoctor::clear_logs();
                     println!("{{\"ok\":true}}");
                 }
+                "clear-crashes" => {
+                    ProbeDoctor::clear_crashes();
+                    println!("{{\"ok\":true}}");
+                }
                 "clear-telemetry" => {
                     ProbeDoctor::clear_telemetry();
                     println!("{{\"ok\":true}}");
+                }
+                "bundle" if args.len() >= 4 => {
+                    let ok = ProbeDoctor::export_diagnostic_bundle(&store, &args[3]);
+                    println!("{{\"ok\":{}}}", ok);
+                    if !ok {
+                        process::exit(1);
+                    }
                 }
                 _ => process::exit(1),
             }

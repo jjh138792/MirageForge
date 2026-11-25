@@ -2,6 +2,7 @@
 // Copyright (c) 2025-2026 jjh138792
 // MirageForge: https://github.com/jjh138792/MirageForge
 
+use crate::device_info::collect_host_device_info;
 use crate::fs_atomic::{is_safe_token, read_file_str, truncate_file, write_file_atomic};
 use crate::models::*;
 use crate::store::StoreEngine;
@@ -27,7 +28,6 @@ impl ProbeDoctor {
         }
     }
 
-    // 从 logcat 缓冲区收割任何漏网的 [PROBE] / [CRASH] 记录并自动持久化追加写入磁盘文件
     fn harvest_logcat_into_files() {
         let output = Command::new("logcat")
             .args(["-d", "-s", "MirageForge:W", "MirageForge:E", "MirageForge:I"])
@@ -208,8 +208,86 @@ impl ProbeDoctor {
         let _ = Command::new("logcat").arg("-c").status();
     }
 
+    pub fn clear_crashes() {
+        truncate_file(CRASH_LOG_FILE);
+    }
+
     pub fn clear_telemetry() {
         let _ = fs::remove_file(LAUNCH_LOG_FILE);
+    }
+
+    pub fn export_diagnostic_bundle(store: &StoreEngine, out_path: &str) -> bool {
+        if out_path.is_empty() || out_path.contains("..") || !out_path.starts_with('/') {
+            return false;
+        }
+        let host = collect_host_device_info();
+        let crashes = Self::query_crash_logs(30);
+        let probes = Self::query_probe_logs("", false, 180);
+        let tele = Self::query_telemetry(30);
+
+        let mut out = String::with_capacity(16384);
+        out.push_str(&format!(
+            "=== MirageForge Diagnostic Bundle v{} (code {}) ===\n\n",
+            store.meta.version, store.meta.version_code
+        ));
+
+        out.push_str("[HOST DEVICE]\n");
+        out.push_str(&format!(
+            "Model: {} ({}) | Brand: {} | Device: {}\n",
+            host.model, host.market_name, host.brand, host.device
+        ));
+        out.push_str(&format!(
+            "Android: {} (SDK {}) | Patch: {}\n",
+            host.android_release, host.sdk_int, host.security_patch
+        ));
+        out.push_str(&format!(
+            "Kernel: {} ({})\n",
+            host.kernel_release, host.arch
+        ));
+        out.push_str(&format!(
+            "CPU: {} ({} cores, clusters={}) | GPU: {} | RAM: {}GB\n",
+            host.cpu_hardware, host.cpu_cores, host.cpu_clusters, host.gpu_renderer, host.ram_gb
+        ));
+        out.push_str(&format!(
+            "Root: {} {} | Zygisk: {} {}\n\n",
+            host.root_manager, host.root_version, host.zygisk_impl, host.zygisk_version
+        ));
+
+        out.push_str(&format!(
+            "[ROUTES ({} active / {} templates)]\n",
+            store.routes.len(),
+            store.templates.len()
+        ));
+        out.push_str(&read_file_str(ROUTES_DB));
+        out.push('\n');
+
+        out.push_str(&format!("[CRASH EVENTS ({})]\n", crashes.len()));
+        for c in &crashes {
+            out.push_str(&format!(
+                "[{}][{}] {} | Stack: {}\n",
+                c.signal, c.pkg, c.detail, c.stack
+            ));
+        }
+        out.push('\n');
+
+        out.push_str(&format!("[LAUNCH TELEMETRY ({})]\n", tele.len()));
+        for tm in &tele {
+            out.push_str(&format!(
+                "ts={} pid={} pkg={} model={} gpu={} ram={}\n",
+                tm.timestamp, tm.pid, tm.pkg, tm.model, tm.gpu, tm.ram
+            ));
+        }
+        out.push('\n');
+
+        out.push_str(&format!("[PROBE EVENTS ({})]\n", probes.len()));
+        for p in &probes {
+            out.push_str(&format!(
+                "[{}][{}] {} => {} @@ {}\n",
+                p.pkg, p.domain, p.key, p.value, p.stack
+            ));
+        }
+
+        write_file_atomic(out_path, &out, 0o644)
     }
 
     fn parse_probe_line(s: &str) -> Option<ProbeEvent> {

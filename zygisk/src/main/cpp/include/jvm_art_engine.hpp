@@ -16,11 +16,10 @@ inline JavaVM *g_jvm = nullptr;
 inline std::atomic<bool> g_post_specialized{false};
 inline std::atomic<bool> g_fps_spoof_applied{false};
 
-// 仅在 postAppSpecialize 之后、且当前已在合法 Java 线程且 DisplayManagerGlobal.sInstance 已存在时修补缓存，
-// 绝不在 Zygote 阶段主动触发 Binder IPC
+// 仅在 postAppSpecialize 之后、且开启系统属性或 GPU 伪装并设置刷新率 >= 90Hz 时懒修补显示模式
 inline void try_lazy_spoof_display_modes() {
     int target_hz = g_cfg.gl.max_refresh_rate;
-    if (!g_cfg.gl.enabled || target_hz < 90 || target_hz > 240 || !g_jvm) return;
+    if ((!g_cfg.build.enabled && !g_cfg.gl.enabled) || target_hz < 90 || target_hz > 240 || !g_jvm) return;
     if (!g_post_specialized.load(std::memory_order_acquire)) return;
     if (g_fps_spoof_applied.load(std::memory_order_relaxed)) return;
 

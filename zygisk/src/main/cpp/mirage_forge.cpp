@@ -115,17 +115,14 @@ public:
             return;
         }
 
-        if (g_cfg.vfs.enabled || g_cfg.build.enabled) {
+        if (g_cfg.vfs.any_enabled() || g_cfg.build.any_prop_enabled()) {
             init_vfs_symbols();
         }
-        if (g_cfg.vfs.enabled) {
+        if (g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_vfs_nodes) {
             init_vfs_clusters_lightweight();
         }
 
-        // 若开启了 MountNS，先尝试私有命名空间挂载：
-        // 成功则 g_vfs_ns_mounted=true，下方 scan_and_commit_plt_hooks 自动关闭传统文件 PLT 引擎；
-        // 失败则自动回退到传统文件 PLT 引擎
-        bool want_mount_ns = (g_cfg.vfs.enabled && g_cfg.vfs.enable_mount_ns);
+        bool want_mount_ns = (g_cfg.vfs.any_enabled() && g_cfg.vfs.enable_mount_ns);
         uint32_t ns_mounted_cnt = 0;
         std::string ns_diag;
         if (want_mount_ns) {
@@ -138,7 +135,6 @@ public:
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
 
-        // 严格 0 改动：仅开启探针时才保留日志 FD，否则当场关闭（0 句柄残留）
         if (g_cfg.probe.enabled && sink_ready == 1) {
             api->exemptFd(fd);
             g_probe_log_fd = fd;
@@ -149,10 +145,24 @@ public:
             close(fd);
         }
 
-        init_linker_symbols();
-        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
+        if (g_cfg.build.any_prop_enabled() || g_cfg.probe.enabled) {
             init_bionic_prop_symbols();
         }
+        if (g_cfg.build.any_prop_enabled()) {
+            prepare_bionic_prop_map_defaults();
+        }
+
+        // COW Prop Spoof：在单线程子进程阶段对命中属性区执行私有 MAP_PRIVATE|MAP_FIXED 原地覆写
+        if (g_cfg.build.cow_prop) {
+            CowSpoofStats cow_st = apply_cow_prop_spoof(orig_system_property_find, orig_fopen, orig_fclose);
+            if (g_cfg.probe.enabled) {
+                emit_probe("COW_PROP", "PrivateCOW_Active",
+                           "patched=" + std::to_string(cow_st.patched_props) +
+                           " vmas=" + std::to_string(cow_st.remapped_vmas) +
+                           " fallback=" + std::to_string(cow_st.skipped_props));
+            }
+        }
+
         if (g_cfg.build.enabled) {
             freeze_bionic_prop_arena();
         }
@@ -164,20 +174,24 @@ public:
         }
 
         g_cfg.active = true;
-        scan_and_commit_plt_hooks();
+
+        // 严格 0 改动：若仅开启了 COW Prop Spoof（无需任何 PLT Hook），直接免扫描、免挂载并卸载自身
+        if (needs_any_plt_hooks()) {
+            init_linker_symbols();
+            scan_and_commit_plt_hooks();
+        } else if (!g_cfg.build.enabled) {
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        }
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
         if (!g_cfg.active) return;
         g_post_specialized.store(true, std::memory_order_release);
 
-        // 仅在 postAppSpecialize 执行一次 Java Build 反射并立即擦除临时映射（避免 pre/post 重复反射）
         if (g_cfg.build.enabled) {
             reflect_java_build_fields(env);
             g_cfg.build.wipe_volatile_reflection_maps();
         }
-        // 严格 0 改动 + 冷启动零拖慢：绝不主动 dlopen("libvulkan.so") / "libhardware.so"，
-        // 改为纯按需由 hook_dlopen / hook_dlsym_all 懒拦截
     }
 
     void preServerSpecialize(ServerSpecializeArgs *) override {
@@ -189,17 +203,32 @@ private:
     JNIEnv *env = nullptr;
 
     void load_modular_config(const std::vector<std::pair<std::string, std::string>> &raw_kvs) {
+        bool legacy_vfs_on = false;
+        bool has_granular_vfs = false;
+
         for (const auto &kv : raw_kvs) {
             const std::string &k = kv.first;
             const std::string &v = kv.second;
-            if (k == "META:ENABLE_BUILD")         g_cfg.build.enabled = (v == "1");
-            else if (k == "META:ENABLE_GL")       g_cfg.gl.enabled = (v == "1");
-            else if (k == "META:ENABLE_VFS")      g_cfg.vfs.enabled = (v == "1");
-            else if (k == "META:ENABLE_PROBE")    g_cfg.probe.enabled = (v == "1");
-            else if (k == "META:FORCE_SPOOF_SDK") g_cfg.build.force_spoof_sdk = (v == "1");
-            else if (k == "META:REFRESH_RATE")    g_cfg.gl.max_refresh_rate = std::atoi(v.c_str());
-            else if (k == "META:ENABLE_MOUNT_NS") g_cfg.vfs.enable_mount_ns = (v == "1");
+            if (k == "META:ENABLE_BUILD")          g_cfg.build.enabled = (v == "1");
+            else if (k == "META:ENABLE_COW_PROP")  g_cfg.build.cow_prop = (v == "1");
+            else if (k == "META:ENABLE_GL")        g_cfg.gl.enabled = (v == "1");
+            else if (k == "META:ENABLE_VFS")       legacy_vfs_on = (v == "1");
+            else if (k == "META:ENABLE_CPU")       { g_cfg.vfs.enable_cpu = (v == "1"); has_granular_vfs = true; }
+            else if (k == "META:ENABLE_MEM")       { g_cfg.vfs.enable_mem = (v == "1"); has_granular_vfs = true; }
+            else if (k == "META:ENABLE_VFS_NODES") { g_cfg.vfs.enable_vfs_nodes = (v == "1"); has_granular_vfs = true; }
+            else if (k == "META:ENABLE_PROBE")     g_cfg.probe.enabled = (v == "1");
+            else if (k == "META:FORCE_SPOOF_SDK")  g_cfg.build.force_spoof_sdk = (v == "1");
+            else if (k == "META:REFRESH_RATE")     g_cfg.gl.max_refresh_rate = std::atoi(v.c_str());
+            else if (k == "META:ENABLE_MOUNT_NS")  g_cfg.vfs.enable_mount_ns = (v == "1");
         }
+
+        // 向下兼容 1.2.x 旧版 .conf：若未出现新细粒度键，自动继承 META:ENABLE_VFS
+        if (!has_granular_vfs && legacy_vfs_on) {
+            g_cfg.vfs.enable_cpu = true;
+            g_cfg.vfs.enable_mem = true;
+            g_cfg.vfs.enable_vfs_nodes = true;
+        }
+        g_cfg.vfs.enabled = g_cfg.vfs.any_enabled();
 
         for (const auto &kv : raw_kvs) {
             const std::string &k = kv.first;
@@ -207,16 +236,13 @@ private:
             if (k.rfind("META:", 0) == 0) continue;
 
             if (k.rfind("GLES:", 0) == 0) {
-                if (!g_cfg.gl.enabled) continue;
-                if (k == "GLES:VENDOR") {
-                    g_cfg.gl.gl_vendor = v;
-                } else if (k == "GLES:RENDERER") {
-                    g_cfg.gl.gl_renderer = v;
-                } else if (k == "GLES:VERSION") {
-                    g_cfg.gl.gl_version = v;
-                } else if (k == "GLES:REFRESH_RATE" && g_cfg.gl.max_refresh_rate == 0) {
+                if (k == "GLES:REFRESH_RATE" && (g_cfg.build.enabled || g_cfg.gl.enabled) && g_cfg.gl.max_refresh_rate == 0) {
                     g_cfg.gl.max_refresh_rate = std::atoi(v.c_str());
                 }
+                if (!g_cfg.gl.enabled) continue;
+                if (k == "GLES:VENDOR")        g_cfg.gl.gl_vendor = v;
+                else if (k == "GLES:RENDERER") g_cfg.gl.gl_renderer = v;
+                else if (k == "GLES:VERSION")  g_cfg.gl.gl_version = v;
                 continue;
             }
 
@@ -243,7 +269,7 @@ private:
             }
 
             if (k.rfind("VFS:", 0) == 0) {
-                if (!g_cfg.vfs.enabled) continue;
+                if (!g_cfg.vfs.any_enabled()) continue;
                 if (k == "VFS:CPU_HARDWARE")        g_cfg.vfs.cpu_hardware = v;
                 else if (k == "VFS:CPU_ARCH")       g_cfg.vfs.cpu_arch = v;
                 else if (k == "VFS:CPU_CORES")      g_cfg.vfs.cpu_cores = std::atoi(v.c_str());
@@ -259,9 +285,10 @@ private:
                 continue;
             }
 
-            if (!g_cfg.build.enabled) continue;
+            if (!g_cfg.build.any_prop_enabled()) continue;
 
             if (k.rfind("BUILD:", 0) == 0) {
+                if (!g_cfg.build.enabled) continue;
                 std::string b_field = k.substr(6);
                 g_cfg.build.build_map[b_field] = v;
                 if (b_field == "DEVICE") {
@@ -269,6 +296,7 @@ private:
                     g_cfg.build.build_map["ODM_SKU"] = v;
                 }
             } else if (k.rfind("VERSION:", 0) == 0) {
+                if (!g_cfg.build.enabled) continue;
                 std::string v_field = k.substr(8);
                 if (!g_cfg.build.force_spoof_sdk &&
                     (v_field == "SDK_INT" || v_field == "DEVICE_INITIAL_SDK_INT" ||
@@ -470,12 +498,21 @@ static void companion_handler(int fd) {
         version_snapshot = g_companion_cache.cached_version;
     }
 
-    bool build_on = (entries.count("META:ENABLE_BUILD") && entries.at("META:ENABLE_BUILD") == "1");
-    bool gl_on    = (entries.count("META:ENABLE_GL")    && entries.at("META:ENABLE_GL") == "1");
-    bool vfs_on   = (entries.count("META:ENABLE_VFS")   && entries.at("META:ENABLE_VFS") == "1");
-    bool probe_on = (entries.count("META:ENABLE_PROBE") && entries.at("META:ENABLE_PROBE") == "1");
+    auto flag_on = [&](const char *k) -> bool {
+        auto it = entries.find(k);
+        return it != entries.end() && it->second == "1";
+    };
 
-    if (!build_on && !gl_on && !vfs_on && !probe_on) {
+    bool any_on = flag_on("META:ENABLE_BUILD") ||
+                  flag_on("META:ENABLE_COW_PROP") ||
+                  flag_on("META:ENABLE_GL") ||
+                  flag_on("META:ENABLE_VFS") ||
+                  flag_on("META:ENABLE_CPU") ||
+                  flag_on("META:ENABLE_MEM") ||
+                  flag_on("META:ENABLE_VFS_NODES") ||
+                  flag_on("META:ENABLE_PROBE");
+
+    if (!any_on) {
         uint8_t zero = 0;
         write_full(fd, &zero, sizeof(zero));
         return;
@@ -497,6 +534,7 @@ static void companion_handler(int fd) {
     std::string model = entries.count("BUILD:MODEL") ? entries.at("BUILD:MODEL") : "Custom";
     std::string gpu   = entries.count("GLES:RENDERER") ? entries.at("GLES:RENDERER") : "DefaultGPU";
     int ram_gb        = entries.count("VFS:RAM_GB") ? std::atoi(entries.at("VFS:RAM_GB").c_str()) : 16;
+    bool probe_on     = flag_on("META:ENABLE_PROBE");
 
     if (probe_on) {
         mkdir(DATA_ROOT_DIR, 0700);

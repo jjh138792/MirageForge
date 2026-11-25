@@ -32,7 +32,6 @@ constexpr const char *ROUTES_DB_PATH   = "/data/adb/mirage_forge/routes.db";
 constexpr const char *APPS_CONF_DIR    = "/data/adb/mirage_forge/apps";
 constexpr const char *LAUNCH_LOG_PATH  = "/data/adb/mirage_forge/launch_history.log";
 
-// 从 module.prop 动态读取版本号
 inline std::string read_module_prop_version() {
     std::ifstream ifs(MODULE_PROP_PATH);
     if (!ifs.is_open()) return "dynamic";
@@ -48,7 +47,6 @@ inline std::string read_module_prop_version() {
     return "dynamic";
 }
 
-// 易失性内存擦除工具
 inline void volatile_scrub_string(std::string &s) noexcept {
     if (s.empty()) return;
     volatile char *p = const_cast<volatile char *>(s.data());
@@ -66,14 +64,12 @@ inline void volatile_scrub_map(std::unordered_map<std::string, std::string> &m) 
     m.clear();
 }
 
-// 严格保护线程 errno 的守卫器
 struct ErrnoRestorer {
     int saved_errno;
     inline ErrnoRestorer() noexcept : saved_errno(errno) {}
     inline ~ErrnoRestorer() noexcept { errno = saved_errno; }
 };
 
-// 线程局部重入保护器（自动附带 errno 保护）
 inline thread_local bool g_tls_in_hook = false;
 inline void (*g_on_vulkan_prop_hit)() = nullptr;
 
@@ -110,7 +106,6 @@ inline uint64_t hash_str(const std::string &s) noexcept {
     return fnv1a_64(s.data(), s.size());
 }
 
-// 解析 0x 开头的十六进制或十进制 uint32_t（兼容 Vulkan VendorID / DeviceID）
 inline uint32_t parse_vk_u32(const std::string &raw) noexcept {
     if (raw.empty()) return 0;
     const char *s = raw.c_str();
@@ -128,7 +123,6 @@ inline uint32_t parse_vk_u32(const std::string &raw) noexcept {
     return static_cast<uint32_t>(std::strtoul(s, nullptr, base));
 }
 
-// 按 Vulkan 标准位布局打包版本号：支持 "1.3.295"、"512.800.0" 或原始十六进制 "0x80320000"
 inline uint32_t pack_vk_version_str(const std::string &raw) noexcept {
     if (raw.empty()) return 0;
     if (raw.find('.') == std::string::npos) {
@@ -141,14 +135,19 @@ inline uint32_t pack_vk_version_str(const std::string &raw) noexcept {
 }
 
 // ============================================================================
-// 微模块 1：Build 反射与受限属性区配置
+// 微模块 1：系统属性（Java Build + Bionic PLT）与 COW Prop Spoof 配置
 // ============================================================================
 struct BuildModuleConfig {
-    bool enabled = false;
+    bool enabled = false;        // 伪装系统属性 (Java Build 反射 + PLT 属性 Hook + build.prop)
+    bool cow_prop = false;       // COW Prop Spoof (私有写时复制 /dev/__properties__/* 原地覆写)
     bool force_spoof_sdk = false;
     std::unordered_map<std::string, std::string> prop_map;
     std::unordered_map<std::string, std::string> build_map;
     std::unordered_map<std::string, std::string> version_map;
+
+    inline bool any_prop_enabled() const noexcept {
+        return enabled || cow_prop;
+    }
 
     void wipe_volatile_reflection_maps() noexcept {
         volatile_scrub_map(build_map);
@@ -235,7 +234,7 @@ struct GraphicsModuleConfig {
 };
 
 // ============================================================================
-// 微模块 3：VFS 硬件拓扑与可选私有 Mount NS 引擎配置
+// 微模块 3：细粒度硬件与文件节点伪装配置 (CPU / 内存 / CPU&GPU节点 / MountNS)
 // ============================================================================
 struct CpuClusterSpec {
     int first_core = 0;
@@ -248,8 +247,12 @@ struct CpuClusterSpec {
 };
 
 struct VfsModuleConfig {
-    bool enabled = false;
-    bool enable_mount_ns = false; // false = 传统 PLT VFS 引擎；true = 启用私有 Mount NS 内核级挂载引擎
+    bool enabled = false;          // 聚合标志：等价于 enable_cpu || enable_mem || enable_vfs_nodes
+    bool enable_cpu = false;       // 伪装 CPU (/proc/cpuinfo, 核数, uname)
+    bool enable_mem = false;       // 伪装内存信息 (/proc/meminfo, sysinfo, DDR)
+    bool enable_vfs_nodes = false; // 伪装 CPU/GPU 文件节点 (/sys/devices/system/cpu/*, soc0, kgsl)
+    bool enable_mount_ns = false;  // 是否使用私有挂载命名空间方式伪装已启用的文件节点
+
     std::string cpu_hardware;
     std::string cpu_arch = "aarch64";
     std::string soc_id;
@@ -257,14 +260,18 @@ struct VfsModuleConfig {
     std::string soc_machine;
     std::string cpu_midr_el1 = "0x00000000511f8000";
     std::string cpu_clusters_spec;
-    int cpu_cores = 8;
+    int cpu_cores = 0;
     int cpu_max_freq_khz = 4320000;
-    int ram_gb = 16;
+    int ram_gb = 0;
     std::string ddr_type = "LPDDR5X";
     std::string ddr_vendor = "SKhynix";
     std::string kernel_release;
     std::string kernel_version;
     std::vector<CpuClusterSpec> clusters;
+
+    inline bool any_enabled() const noexcept {
+        return enable_cpu || enable_mem || enable_vfs_nodes;
+    }
 };
 
 // ============================================================================
@@ -285,7 +292,7 @@ struct ModularConfig {
     ProbeModuleConfig    probe;
 
     inline bool is_any_enabled() const noexcept {
-        return build.enabled || gl.enabled || vfs.enabled || probe.enabled;
+        return build.any_prop_enabled() || gl.enabled || vfs.any_enabled() || probe.enabled;
     }
 };
 

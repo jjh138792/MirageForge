@@ -36,10 +36,6 @@ struct MountNsChildReport {
     uint8_t results[256];
 };
 
-// ============================================================================
-// App 侧 (preAppSpecialize 阶段，处 u:r:zygote:s0)：
-// 收集并按 realpath 去重硬件节点（消除同簇 policy 叠挂），在子进程 unshare(CLONE_NEWNS) 后同步挂载
-// ============================================================================
 inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *out_diag) {
     auto send_skip = [&](const std::string &reason) -> uint32_t {
         uint8_t zero = 0;
@@ -48,11 +44,10 @@ inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *
         return 0;
     };
 
-    if (fd < 0 || !g_cfg.vfs.enabled || !g_cfg.vfs.enable_mount_ns) {
+    if (fd < 0 || !g_cfg.vfs.any_enabled() || !g_cfg.vfs.enable_mount_ns) {
         return send_skip("disabled");
     }
 
-    // 绝对 0 改动安全闸门 0：父进程必须是 Zygote (>1)，绝不允许在 Zygote 本体执行 unshare
     pid_t ppid = getppid();
     if (ppid <= 1) {
         return send_skip("skip=ppid_is_init");
@@ -63,62 +58,66 @@ inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *
     jobs.reserve(48);
 
     auto add_node = [&](const std::string &path) {
-        // 目标节点明确不存在 (ENOENT) 时提前跳过，减少无效 IPC 传输
+        // 先检查开关是否允许合成该节点，未开启的开关 0 次文件系统探测
+        std::string content;
+        int dyn = -1;
+        if (!synthesize_vfs_node_on_demand(path, &content, &dyn) || content.empty()) {
+            return;
+        }
         if (access(path.c_str(), F_OK) != 0 && errno == ENOENT) {
             return;
         }
-        // 通过 realpath 对软链接目标去重（例如同簇 cpu0..cpu5/cpufreq 都指向 policy0，只挂载 1 次）
         char resolved[PATH_MAX];
         std::string canonical = (realpath(path.c_str(), resolved) != nullptr) ? std::string(resolved) : path;
         if (!seen_real_paths.insert(canonical).second) {
             return;
         }
+        jobs.emplace_back(std::move(canonical), std::move(content));
+    };
 
-        std::string content;
-        int dyn = -1;
-        if (synthesize_vfs_node_on_demand(path, &content, &dyn) && !content.empty()) {
-            jobs.emplace_back(std::move(canonical), std::move(content));
+    if (g_cfg.vfs.enable_cpu) {
+        add_node("/proc/cpuinfo");
+    }
+    if (g_cfg.vfs.enable_mem) {
+        add_node("/proc/meminfo");
+        add_node("/proc/ddr_info");
+        add_node("/sys/devices/system/chip-info/ddr_info");
+        add_node("/sys/devices/system/chip-info/ddr_type");
+        add_node("/sys/devices/system/chip-info/ddr_size");
+        add_node("/sys/firmware/devicetree/base/memory/ddr_device_type");
+    }
+    if (g_cfg.vfs.enable_vfs_nodes) {
+        static const char *const kSysNodes[] = {
+            "/proc/version",
+            "/proc/sys/kernel/osrelease",
+            "/sys/class/kgsl/kgsl-3d0/gpu_model",
+            "/sys/devices/soc0/soc_id",
+            "/sys/devices/soc0/family",
+            "/sys/devices/soc0/machine",
+            "/sys/devices/system/cpu/present",
+            "/sys/devices/system/cpu/possible",
+            "/sys/devices/system/cpu/online",
+            "/sys/devices/system/cpu/offline",
+            "/sys/devices/system/cpu/kernel_max",
+        };
+        for (const char *p : kSysNodes) add_node(p);
+
+        int cores = (g_cfg.vfs.cpu_cores > 0 && g_cfg.vfs.cpu_cores <= 16) ? g_cfg.vfs.cpu_cores : 0;
+        for (int i = 0; i < cores; ++i) {
+            std::string pfx = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/";
+            add_node(pfx + "online");
+            add_node(pfx + "cpu_capacity");
+            add_node(pfx + "regs/identification/midr_el1");
+            add_node(pfx + "topology/core_cpus_list");
+            add_node(pfx + "cpufreq/scaling_cur_freq");
+            add_node(pfx + "cpufreq/cpuinfo_cur_freq");
+            add_node(pfx + "cpufreq/cpuinfo_max_freq");
+            add_node(pfx + "cpufreq/cpuinfo_min_freq");
+            add_node(pfx + "cpufreq/scaling_max_freq");
+            add_node(pfx + "cpufreq/scaling_min_freq");
+            add_node(pfx + "cpufreq/scaling_governor");
+            add_node(pfx + "cpufreq/scaling_driver");
         }
-    };
-
-    static const char *const kStaticNodes[] = {
-        "/proc/cpuinfo",
-        "/proc/meminfo",
-        "/proc/version",
-        "/proc/ddr_info",
-        "/proc/sys/kernel/osrelease",
-        "/sys/class/kgsl/kgsl-3d0/gpu_model",
-        "/sys/devices/soc0/soc_id",
-        "/sys/devices/soc0/family",
-        "/sys/devices/soc0/machine",
-        "/sys/devices/system/chip-info/ddr_info",
-        "/sys/devices/system/chip-info/ddr_type",
-        "/sys/devices/system/chip-info/ddr_size",
-        "/sys/firmware/devicetree/base/memory/ddr_device_type",
-        "/sys/devices/system/cpu/present",
-        "/sys/devices/system/cpu/possible",
-        "/sys/devices/system/cpu/online",
-        "/sys/devices/system/cpu/offline",
-        "/sys/devices/system/cpu/kernel_max",
-    };
-    for (const char *p : kStaticNodes) add_node(p);
-
-    int cores = (g_cfg.vfs.cpu_cores > 0 && g_cfg.vfs.cpu_cores <= 16) ? g_cfg.vfs.cpu_cores : 0;
-    for (int i = 0; i < cores; ++i) {
-        std::string pfx = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/";
-        add_node(pfx + "online");
-        add_node(pfx + "cpu_capacity");
-        add_node(pfx + "regs/identification/midr_el1");
-        add_node(pfx + "topology/core_cpus_list");
-        // 关闭传统 PLT 引擎后，同时挂载 cur_freq 防止暴露真机当前频率
-        add_node(pfx + "cpufreq/scaling_cur_freq");
-        add_node(pfx + "cpufreq/cpuinfo_cur_freq");
-        add_node(pfx + "cpufreq/cpuinfo_max_freq");
-        add_node(pfx + "cpufreq/cpuinfo_min_freq");
-        add_node(pfx + "cpufreq/scaling_max_freq");
-        add_node(pfx + "cpufreq/scaling_min_freq");
-        add_node(pfx + "cpufreq/scaling_governor");
-        add_node(pfx + "cpufreq/scaling_driver");
     }
 
     if (jobs.empty()) {
@@ -168,9 +167,6 @@ inline uint32_t request_private_mount_ns_in_pre_specialize(int fd, std::string *
     return ok_cnt;
 }
 
-// ============================================================================
-// Root Companion 侧：节流清理已退出进程的遗留暂存目录（最多每 60 秒 1 次，不拖慢启动）
-// ============================================================================
 inline void cleanup_stale_mnt_stage_dirs_throttled() {
     static std::atomic<int64_t> s_last_clean_sec{0};
     int64_t now = static_cast<int64_t>(std::time(nullptr));
@@ -202,10 +198,6 @@ inline void cleanup_stale_mnt_stage_dirs_throttled() {
     closedir(dir);
 }
 
-// ============================================================================
-// Root Companion 侧：在 companion_handler 中同步处理 Mount NS 请求
-// 三级自适应策略：tmpfs-ctx -> tmpfs-xattr -> data-xattr
-// ============================================================================
 inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::string *out_diag) {
     uint8_t want_ns = 0;
     if (!read_full(fd, &want_ns, sizeof(want_ns)) || want_ns == 0) {
@@ -232,7 +224,6 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
 
     std::vector<uint8_t> results(count, 0);
 
-    // 绝对 0 改动安全闸门 1：确认目标进程确实处于独立 Mount Namespace（与 Zygote / init 完全隔离）
     char app_ns_path[64], ppid_ns_path[64];
     char app_ns_id[64] = {0}, ppid_ns_id[64] = {0}, init_ns_id[64] = {0};
     std::snprintf(app_ns_path, sizeof(app_ns_path), "/proc/%d/ns/mnt", app_pid);
@@ -282,7 +273,7 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
     pid_t worker = fork();
     if (worker == 0) {
         close(res_pipe[0]);
-        umask(0); // 配合 open(..., 0444) 一步到位，省掉循环内冗余 chmod/chown 调用
+        umask(0);
         MountNsChildReport rep{};
 
         int ns_fd = open(app_ns_path, O_RDONLY | O_CLOEXEC);
@@ -296,7 +287,6 @@ inline uint32_t companion_handle_mount_ns_sync(int fd, int32_t app_pid, std::str
         } else {
             close(ns_fd);
 
-            // 绝对 0 改动安全闸门 2：先将整棵挂载树设为 MS_REC | MS_SLAVE，再将 /proc 与 /sys 设为 MS_REC | MS_PRIVATE
             bool root_slave = (mount(nullptr, "/", nullptr, MS_REC | MS_SLAVE, nullptr) == 0);
             bool proc_priv  = (mount(nullptr, "/proc", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0);
             bool sys_priv   = (mount(nullptr, "/sys", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0);

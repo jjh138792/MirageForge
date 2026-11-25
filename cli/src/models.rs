@@ -157,7 +157,7 @@ pub struct DeviceTemplate {
     #[serde(rename = "GL_VERSION", default = "default_gl_version")]
     pub gl_version: String,
 
-    // Vulkan 独立渲染层参数（与 OpenGL ES 彻底解耦）
+    // Vulkan 独立渲染层参数
     #[serde(rename = "VK_DEVICE_NAME", default)]
     pub vk_device_name: String,
     #[serde(rename = "VK_VENDOR_ID", default)]
@@ -204,7 +204,6 @@ pub struct DeviceTemplate {
 }
 
 impl DeviceTemplate {
-    /// 智能补齐缺失的独立 Vulkan 字段，兼容旧版模板并杜绝厂商/驱动名串台
     pub fn normalize_vulkan_fields(&mut self) {
         if self.vk_device_name.trim().is_empty() {
             self.vk_device_name = self.gl_renderer.clone();
@@ -287,31 +286,95 @@ impl DeviceTemplate {
     }
 }
 
+// 中间反序列化结构：确保 1.2.x 旧版 config.json 自动把 vfs 字段继承给 cpu/mem/vfsNodes
+#[derive(Deserialize)]
+struct AppRouteDe {
+    #[serde(rename = "tplId")]
+    tpl_id: String,
+    #[serde(default = "default_true")]
+    build: bool,
+    #[serde(rename = "cowProp", default)]
+    cow_prop: bool,
+    #[serde(default = "default_true")]
+    gl: bool,
+    #[serde(default = "default_true")]
+    vfs: bool,
+    #[serde(default)]
+    cpu: Option<bool>,
+    #[serde(default)]
+    mem: Option<bool>,
+    #[serde(rename = "vfsNodes", default)]
+    vfs_nodes: Option<bool>,
+    #[serde(default)]
+    probe: bool,
+    #[serde(rename = "sdkSpoof", default)]
+    sdk_spoof: bool,
+    #[serde(rename = "refreshRate", default, deserialize_with = "de_i32_flex")]
+    refresh_rate: i32,
+    #[serde(rename = "mountNs", alias = "seccomp", default)]
+    mount_ns: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "AppRouteDe")]
 pub struct AppRoute {
-    #[serde(skip_deserializing, skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub pkg_name: String,
     #[serde(rename = "tplId")]
     pub tpl_id: String,
-    #[serde(default = "default_true")]
     pub build: bool,
-    #[serde(default = "default_true")]
+    #[serde(rename = "cowProp")]
+    pub cow_prop: bool,
     pub gl: bool,
-    #[serde(default = "default_true")]
-    pub vfs: bool,
-    #[serde(default)]
+    pub vfs: bool, // 兼容聚合位：cpu || mem || vfs_nodes
+    pub cpu: bool,
+    pub mem: bool,
+    #[serde(rename = "vfsNodes")]
+    pub vfs_nodes: bool,
     pub probe: bool,
-    #[serde(rename = "sdkSpoof", default)]
+    #[serde(rename = "sdkSpoof")]
     pub sdk_spoof: bool,
-    #[serde(rename = "refreshRate", default, deserialize_with = "de_i32_flex")]
+    #[serde(rename = "refreshRate")]
     pub refresh_rate: i32,
-    #[serde(rename = "mountNs", default)]
+    #[serde(rename = "mountNs")]
     pub mount_ns: bool,
 }
 
+impl From<AppRouteDe> for AppRoute {
+    fn from(raw: AppRouteDe) -> Self {
+        let cpu = raw.cpu.unwrap_or(raw.vfs);
+        let mem = raw.mem.unwrap_or(raw.vfs);
+        let vfs_nodes = raw.vfs_nodes.unwrap_or(raw.vfs);
+        let vfs = cpu || mem || vfs_nodes;
+        Self {
+            pkg_name: String::new(),
+            tpl_id: raw.tpl_id,
+            build: raw.build,
+            cow_prop: raw.cow_prop,
+            gl: raw.gl,
+            vfs,
+            cpu,
+            mem,
+            vfs_nodes,
+            probe: raw.probe,
+            sdk_spoof: raw.sdk_spoof,
+            refresh_rate: sanitize_refresh_rate(raw.refresh_rate),
+            mount_ns: raw.mount_ns && vfs,
+        }
+    }
+}
+
 impl AppRoute {
+    pub fn normalize(&mut self) {
+        self.vfs = self.cpu || self.mem || self.vfs_nodes;
+        if !self.vfs {
+            self.mount_ns = false;
+        }
+        self.refresh_rate = sanitize_refresh_rate(self.refresh_rate);
+    }
+
     pub fn is_any_enabled(&self) -> bool {
-        self.build || self.gl || self.vfs || self.probe
+        self.build || self.cow_prop || self.gl || self.cpu || self.mem || self.vfs_nodes || self.probe
     }
 }
 
@@ -418,6 +481,46 @@ pub struct FullStateExport {
     pub templates: BTreeMap<String, DeviceTemplate>,
     #[serde(rename = "appRoutes")]
     pub app_routes: BTreeMap<String, AppRoute>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HostDeviceInfo {
+    pub model: String,
+    pub brand: String,
+    #[serde(rename = "marketName")]
+    pub market_name: String,
+    pub device: String,
+    #[serde(rename = "androidRelease")]
+    pub android_release: String,
+    #[serde(rename = "sdkInt")]
+    pub sdk_int: String,
+    #[serde(rename = "securityPatch")]
+    pub security_patch: String,
+    #[serde(rename = "kernelRelease")]
+    pub kernel_release: String,
+    pub arch: String,
+    #[serde(rename = "socModel")]
+    pub soc_model: String,
+    #[serde(rename = "cpuHardware")]
+    pub cpu_hardware: String,
+    #[serde(rename = "cpuCores")]
+    pub cpu_cores: i32,
+    #[serde(rename = "cpuMaxFreq")]
+    pub cpu_max_freq: i32,
+    #[serde(rename = "cpuClusters")]
+    pub cpu_clusters: String,
+    #[serde(rename = "gpuRenderer")]
+    pub gpu_renderer: String,
+    #[serde(rename = "ramGb")]
+    pub ram_gb: i32,
+    #[serde(rename = "rootManager")]
+    pub root_manager: String,
+    #[serde(rename = "rootVersion")]
+    pub root_version: String,
+    #[serde(rename = "zygiskImpl")]
+    pub zygisk_impl: String,
+    #[serde(rename = "zygiskVersion")]
+    pub zygisk_version: String,
 }
 
 #[derive(Debug, Serialize)]

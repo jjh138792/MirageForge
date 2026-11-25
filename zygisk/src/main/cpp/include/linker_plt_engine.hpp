@@ -39,9 +39,14 @@ inline PFN_loader_android_dlopen_ext orig_loader_android_dlopen_ext = nullptr;
 
 inline void scan_and_commit_plt_hooks();
 
-// 是否启用传统 PLT 文件 Hook 引擎：仅当 VFS 开启且私有 Mount NS 未激活（关闭或挂载失败回退）时启用
+// 仅当有任意文件节点开关开启且 MountNS 未激活时，才启用传统 PLT 文件 Hook 引擎
 inline bool should_use_legacy_vfs_plt() noexcept {
-    return g_cfg.vfs.enabled && !g_vfs_ns_mounted.load(std::memory_order_acquire);
+    return (g_cfg.vfs.any_enabled() || g_cfg.build.enabled) &&
+           !g_vfs_ns_mounted.load(std::memory_order_acquire);
+}
+
+inline bool needs_any_plt_hooks() noexcept {
+    return g_cfg.build.enabled || g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || g_cfg.probe.enabled;
 }
 
 inline void init_linker_symbols() {
@@ -78,7 +83,6 @@ inline bool ends_with_ext(const char *path, size_t path_len, const char *ext) no
 inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
     if (path[0] != '/') return false;
 
-    // 豁免本模块自身、/data/adb 与反篡改核心虚拟机 (libpairipcore.so)
     if (std::strstr(path, "mirage_forge") != nullptr ||
         std::strncmp(path, "/data/adb/", 10) == 0 ||
         std::strstr(path, "libpairipcore") != nullptr) {
@@ -190,19 +194,22 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
         }
     }
 
-    if (g_cfg.vfs.enabled) {
-        // 仅当回退传统 PLT 引擎时才经由 dlsym 拦截文件 I/O
-        if (should_use_legacy_vfs_plt()) {
-            if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
-            if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
-            if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
-            if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
-            if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
-            if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
-        }
-        if (std::strcmp(symbol, "sysinfo") == 0) return reinterpret_cast<void *>(hook_sysinfo);
-        if (std::strcmp(symbol, "sysconf") == 0) return reinterpret_cast<void *>(hook_sysconf);
-        if (std::strcmp(symbol, "uname") == 0) return reinterpret_cast<void *>(hook_uname);
+    if (should_use_legacy_vfs_plt()) {
+        if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
+        if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
+        if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
+        if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
+        if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
+        if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
+    }
+    if (g_cfg.vfs.enable_mem && std::strcmp(symbol, "sysinfo") == 0) {
+        return reinterpret_cast<void *>(hook_sysinfo);
+    }
+    if ((g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_mem) && std::strcmp(symbol, "sysconf") == 0) {
+        return reinterpret_cast<void *>(hook_sysconf);
+    }
+    if ((g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_vfs_nodes) && std::strcmp(symbol, "uname") == 0) {
+        return reinterpret_cast<void *>(hook_uname);
     }
 
     return real_sym;
@@ -211,7 +218,6 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
 inline bool should_rescan_on_dlopen(const char *filename) noexcept {
     if (!filename) return false;
     if (std::strstr(filename, "libpairipcore") != nullptr) return false;
-    // 开启 GPU 伪装时，应用按需加载 libvulkan / libhardware / GLES 时触发增量挂钩
     if (g_cfg.gl.enabled &&
         (std::strstr(filename, "vulkan") != nullptr ||
          std::strstr(filename, "libhardware") != nullptr ||
@@ -237,7 +243,7 @@ inline void *hook_dlopen(const char *filename, int flags) {
         if (guard) {
             emit_probe("DLOPEN", filename, "Incremental PLT Hook");
             scan_and_commit_plt_hooks();
-            if (g_cfg.gl.enabled && g_cfg.gl.max_refresh_rate >= 90) {
+            if ((g_cfg.build.enabled || g_cfg.gl.enabled) && g_cfg.gl.max_refresh_rate >= 90) {
                 try_lazy_spoof_display_modes();
             }
         }
@@ -255,7 +261,7 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
         if (guard) {
             emit_probe("DLOPEN_EXT", filename, "Incremental PLT Hook");
             scan_and_commit_plt_hooks();
-            if (g_cfg.gl.enabled && g_cfg.gl.max_refresh_rate >= 90) {
+            if ((g_cfg.build.enabled || g_cfg.gl.enabled) && g_cfg.gl.max_refresh_rate >= 90) {
                 try_lazy_spoof_display_modes();
             }
         }
@@ -264,7 +270,8 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
 }
 
 inline void scan_and_commit_plt_hooks() {
-    if (!g_zygisk_api) return;
+    // 严格 0 改动：如果用户只开了 COW Prop Spoof（其他所有需要 PLT 的开关全关），0 PLT Hook！
+    if (!g_zygisk_api || !needs_any_plt_hooks()) return;
     ErrnoRestorer errno_guard;
     if (!g_maps_mtx.try_lock()) return;
 
@@ -279,7 +286,6 @@ inline void scan_and_commit_plt_hooks() {
     bool dirty = false;
 
     while (std::fgets(line, sizeof(line), fp)) {
-        // 极速预过滤：跳过 85%+ 的非可执行段，避免逐行执行重型 sscanf
         const char *sp = std::strchr(line, ' ');
         if (!sp || sp[1] == '\0' || sp[2] == '\0' || sp[3] != 'x') {
             continue;
@@ -303,7 +309,6 @@ inline void scan_and_commit_plt_hooks() {
             continue;
         }
 
-        // 先按 (dev, inode) 去重，再做路径字符串匹配
         auto elf_id = std::make_pair(dev, inode);
         if (g_hooked_elves.find(elf_id) != g_hooked_elves.end()) {
             continue;
@@ -330,7 +335,7 @@ inline void scan_and_commit_plt_hooks() {
 
         reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
         reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
-        if (g_cfg.gl.enabled || g_cfg.vfs.enabled) {
+        if (g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || use_legacy_vfs) {
             reg("dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym));
         }
 
@@ -346,7 +351,6 @@ inline void scan_and_commit_plt_hooks() {
             reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
         }
 
-        // 传统文件 I/O PLT 引擎：MountNS 成功后完全关闭（0 文件 Hook）；仅未开 MountNS 或挂载失败回退时才启用
         if (use_legacy_vfs) {
             reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
             reg("open64", reinterpret_cast<void *>(hook_open64), reinterpret_cast<void **>(&orig_open64));
@@ -377,10 +381,13 @@ inline void scan_and_commit_plt_hooks() {
             reg("readlinkat", reinterpret_cast<void *>(hook_readlinkat), reinterpret_cast<void **>(&orig_readlinkat));
         }
 
-        // 非文件类系统调用（不走 VFS 路径，独立于 MountNS）
-        if (g_cfg.vfs.enabled) {
+        if (g_cfg.vfs.enable_mem) {
             reg("sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo));
+        }
+        if (g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_mem) {
             reg("sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf));
+        }
+        if (g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_vfs_nodes) {
             reg("uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname));
         }
 

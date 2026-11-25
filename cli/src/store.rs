@@ -70,8 +70,10 @@ impl StoreEngine {
                 }
                 for (pkg, mut r) in parsed.app_routes {
                     r.pkg_name = pkg.clone();
-                    r.refresh_rate = sanitize_refresh_rate(r.refresh_rate);
-                    self.routes.insert(pkg, r);
+                    r.normalize();
+                    if r.is_any_enabled() {
+                        self.routes.insert(pkg, r);
+                    }
                 }
             }
         }
@@ -85,17 +87,34 @@ impl StoreEngine {
             let parts: Vec<&str> = tr.split('|').collect();
             if parts.len() >= 6 && is_safe_token(parts[0]) && !parts[1].is_empty() {
                 let raw_col7 = parts.get(7).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-                let r = AppRoute {
+                let legacy_vfs = parts[4] == "1";
+                let (cow_prop, cpu, mem, vfs_nodes) = if parts.len() >= 13 {
+                    (
+                        parts[9] == "1",
+                        parts[10] == "1",
+                        parts[11] == "1",
+                        parts[12] == "1",
+                    )
+                } else {
+                    (false, legacy_vfs, legacy_vfs, legacy_vfs)
+                };
+
+                let mut r = AppRoute {
                     pkg_name: parts[0].to_string(),
                     tpl_id: parts[1].to_string(),
                     build: parts[2] == "1",
+                    cow_prop,
                     gl: parts[3] == "1",
-                    vfs: parts[4] == "1",
+                    vfs: cpu || mem || vfs_nodes,
+                    cpu,
+                    mem,
+                    vfs_nodes,
                     probe: parts[5] == "1",
                     sdk_spoof: parts.get(6).copied() == Some("1"),
                     refresh_rate: sanitize_refresh_rate(raw_col7),
                     mount_ns: parts.get(8).copied() == Some("1"),
                 };
+                r.normalize();
                 if r.is_any_enabled() {
                     self.routes.insert(r.pkg_name.clone(), r);
                 }
@@ -115,6 +134,9 @@ impl StoreEngine {
         }
 
         let mut valid_confs: HashSet<String> = HashSet::new();
+        for r in self.routes.values_mut() {
+            r.normalize();
+        }
         self.routes
             .retain(|_, r| self.templates.contains_key(&r.tpl_id) && r.is_any_enabled());
 
@@ -142,10 +164,10 @@ impl StoreEngine {
         }
 
         let mut r_lines = Vec::with_capacity(self.routes.len() + 1);
-        r_lines.push(format!("# MirageForge v{} Routes Table", self.meta.version));
+        r_lines.push(format!("# MirageForge v{} Routes Table (v2 13-col)", self.meta.version));
         for r in self.routes.values() {
             r_lines.push(format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.pkg_name,
                 r.tpl_id,
                 if r.build { "1" } else { "0" },
@@ -154,7 +176,11 @@ impl StoreEngine {
                 if r.probe { "1" } else { "0" },
                 if r.sdk_spoof { "1" } else { "0" },
                 sanitize_refresh_rate(r.refresh_rate),
-                if r.mount_ns { "1" } else { "0" }
+                if r.mount_ns { "1" } else { "0" },
+                if r.cow_prop { "1" } else { "0" },
+                if r.cpu { "1" } else { "0" },
+                if r.mem { "1" } else { "0" },
+                if r.vfs_nodes { "1" } else { "0" }
             ));
         }
         write_file_atomic(ROUTES_DB, &(r_lines.join("\n") + "\n"), 0o600);
@@ -200,7 +226,7 @@ impl StoreEngine {
         if !is_safe_token(&route.pkg_name) || !self.templates.contains_key(&route.tpl_id) {
             return false;
         }
-        route.refresh_rate = sanitize_refresh_rate(route.refresh_rate);
+        route.normalize();
         let pkg = route.pkg_name.clone();
         if route.is_any_enabled() {
             self.routes.insert(pkg.clone(), route);

@@ -16,19 +16,30 @@
 namespace mirage {
 
 inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *out_content, int *out_dyn_core = nullptr) {
-    if (!g_cfg.vfs.enabled || norm.empty() || !out_content) return false;
+    if (norm.empty() || !out_content) return false;
+    if (!g_cfg.vfs.any_enabled() && !g_cfg.build.enabled) return false;
     if (out_dyn_core) *out_dyn_core = -1;
 
-    if (synthesize_cpu_vfs_node(norm, out_content, out_dyn_core)) return true;
-    if (synthesize_mem_soc_vfs_node(norm, out_content)) return true;
-    if (norm.rfind("/proc/", 0) == 0 && sanitize_live_proc_file(norm, out_content)) return true;
-    if (synthesize_build_prop_vfs_node(norm, out_content)) return true;
+    if ((g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_vfs_nodes) &&
+        synthesize_cpu_vfs_node(norm, out_content, out_dyn_core)) {
+        return true;
+    }
+    if ((g_cfg.vfs.enable_mem || g_cfg.vfs.enable_vfs_nodes) &&
+        synthesize_mem_soc_vfs_node(norm, out_content)) {
+        return true;
+    }
+    if (g_cfg.vfs.any_enabled() && norm.rfind("/proc/", 0) == 0 &&
+        sanitize_live_proc_file(norm, out_content)) {
+        return true;
+    }
+    if (g_cfg.build.enabled && synthesize_build_prop_vfs_node(norm, out_content)) {
+        return true;
+    }
     return false;
 }
 
 inline int open_cloaked_vfs_fd_norm(const std::string &norm) {
-    if (norm.empty() || !g_cfg.vfs.enabled) return -1;
-    // 若该节点已由私有 Mount NS 在内核层完成只读 Bind-Mount，直接透传原生 openat，0 memfd 痕迹！
+    if (norm.empty() || (!g_cfg.vfs.any_enabled() && !g_cfg.build.enabled)) return -1;
     if (is_ns_mounted_path(norm)) {
         emit_probe("VFS_MOUNT_NS", norm, "Served by Kernel Bind-Mount");
         return -1;
@@ -59,9 +70,6 @@ inline int open_cloaked_vfs_fd(const char *raw_path) {
     return open_cloaked_vfs_fd_norm(normalize_vfs_path(raw_path));
 }
 
-// ============================================================================
-// Bionic I/O & Fortify 全家族极速 Hook 实现
-// ============================================================================
 inline int hook_open(const char *pathname, int flags, mode_t mode) {
     if (__builtin_expect(is_vfs_candidate_prefix(pathname), 0)) {
         ScopedHookGuard guard;

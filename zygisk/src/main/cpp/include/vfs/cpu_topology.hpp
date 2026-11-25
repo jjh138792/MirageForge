@@ -32,7 +32,7 @@ inline std::vector<int> build_opp_steps(int min_khz, int max_khz) {
 }
 
 inline void init_vfs_clusters_lightweight() {
-    if (!g_cfg.vfs.enabled) return;
+    if (!g_cfg.vfs.enable_cpu && !g_cfg.vfs.enable_vfs_nodes) return;
     g_cfg.vfs.clusters.clear();
 
     if (!g_cfg.vfs.cpu_clusters_spec.empty()) {
@@ -170,7 +170,9 @@ inline bool synthesize_cpufreq_leaf(int core_id, const char *leaf, std::string *
 }
 
 inline bool synthesize_cpu_vfs_node(const std::string &norm, std::string *out_content, int *out_dyn_core) {
+    // 严格 0 改动：/proc/cpuinfo 仅由「伪装 CPU」开关控制
     if (norm == "/proc/cpuinfo") {
+        if (!g_cfg.vfs.enable_cpu) return false;
         int cores = (g_cfg.vfs.cpu_cores > 0 && g_cfg.vfs.cpu_cores <= 16) ? g_cfg.vfs.cpu_cores : 8;
         std::ostringstream ss;
         ss << "Processor\t: AArch64 Processor rev 1 (aarch64)\n";
@@ -190,6 +192,9 @@ inline bool synthesize_cpu_vfs_node(const std::string &norm, std::string *out_co
         *out_content = ss.str();
         return true;
     }
+
+    // 严格 0 改动：/sys/devices/system/cpu/* 与 /sys/bus/cpu/devices/* 仅由「伪装 CPU/GPU 文件节点」控制
+    if (!g_cfg.vfs.enable_vfs_nodes) return false;
 
     const char *cpu_sub = nullptr;
     if (norm.rfind("/sys/devices/system/cpu/", 0) == 0) {

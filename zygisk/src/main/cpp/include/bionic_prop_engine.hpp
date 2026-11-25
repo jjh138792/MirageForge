@@ -12,6 +12,7 @@
 #include <sys/system_properties.h>
 #include "mirage_config.hpp"
 #include "mirage_logger.hpp"
+#include "bionic/cow_prop_engine.hpp"
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
@@ -68,7 +69,7 @@ public:
     }
 
     inline const prop_info *find_lockfree(const char *name, const std::string **out_val = nullptr) const noexcept {
-        if (!name) return nullptr;
+        if (!name || !arena_base_) return nullptr;
         auto it = by_name_.find(name);
         if (it == by_name_.end()) return nullptr;
         if (out_val) {
@@ -123,9 +124,9 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
-// 严格 0 改动隔离：仅当 build 开关明确开启时，才分配只读属性区并注入受限属性
-inline void freeze_bionic_prop_arena() {
-    if (!g_cfg.build.enabled) return;
+// 预处理属性表默认项（供 COW Prop Spoof 与 Bionic 只读属性区共用，严格按对应子开关门控）
+inline void prepare_bionic_prop_map_defaults() {
+    if (!g_cfg.build.any_prop_enabled()) return;
 
     auto set_default_restricted = [&](const char *k, const std::string &v) {
         if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
@@ -153,7 +154,6 @@ inline void freeze_bionic_prop_arena() {
     set_default_restricted("persist.sys.cloud.root.global", "0");
     set_default_restricted("ro.sys.cloud.root.global", "0");
 
-    // 仅当 build 与 gl 双开关同时开启时，才同步注入图形辅助属性
     if (g_cfg.gl.enabled) {
         const std::string &vk_name = g_cfg.gl.effective_vk_device_name();
         if (!vk_name.empty()) {
@@ -180,13 +180,14 @@ inline void freeze_bionic_prop_arena() {
             g_cfg.build.prop_map["persist.sys.cloud.gpu.gl_version"] = g_cfg.gl.gl_version;
             g_cfg.build.prop_map["persist.sys.gpu.gl_version"] = g_cfg.gl.gl_version;
         }
-        if (g_cfg.gl.max_refresh_rate >= 90) {
-            std::string fps_s = std::to_string(g_cfg.gl.max_refresh_rate);
-            set_default_restricted("ro.vendor.display.default_fps", fps_s);
-            set_default_restricted("persist.vendor.dfps.level", fps_s);
-            set_default_restricted("persist.sys.peak_refresh_rate", fps_s);
-            set_default_restricted("persist.sys.min_refresh_rate", fps_s);
-        }
+    }
+
+    if (g_cfg.gl.max_refresh_rate >= 90) {
+        std::string fps_s = std::to_string(g_cfg.gl.max_refresh_rate);
+        set_default_restricted("ro.vendor.display.default_fps", fps_s);
+        set_default_restricted("persist.vendor.dfps.level", fps_s);
+        set_default_restricted("persist.sys.peak_refresh_rate", fps_s);
+        set_default_restricted("persist.sys.min_refresh_rate", fps_s);
     }
 
     if (!g_cfg.build.force_spoof_sdk) {
@@ -203,8 +204,16 @@ inline void freeze_bionic_prop_arena() {
             }
         }
     }
+}
+
+// 仅当「伪装系统属性 (build)」开启时构建只读属性区，且自动跳过已由 COW 覆写的属性
+inline void freeze_bionic_prop_arena() {
+    if (!g_cfg.build.enabled) return;
 
     for (const auto &kv : g_cfg.build.prop_map) {
+        if (is_cow_patched_key(kv.first.c_str())) {
+            continue;
+        }
         g_prop_arena.insert_before_freeze(kv.first, kv.second);
     }
 
@@ -223,6 +232,16 @@ inline bool is_interesting_unmapped_prop(const char *name) noexcept {
 
 inline const prop_info *hook_system_property_find(const char *name) {
     if (name) {
+        if (is_cow_patched_key(name)) {
+            if (__builtin_expect(g_cfg.probe.enabled, 0)) {
+                ScopedHookGuard guard;
+                if (guard) {
+                    auto it = g_cfg.build.prop_map.find(name);
+                    if (it != g_cfg.build.prop_map.end()) emit_probe("COW_PROP", name, it->second);
+                }
+            }
+            return orig_system_property_find ? orig_system_property_find(name) : nullptr;
+        }
         if (g_cfg.build.enabled) {
             const std::string *syn_val = nullptr;
             if (const prop_info *syn = g_prop_arena.find_lockfree(name, &syn_val)) {
@@ -253,6 +272,14 @@ inline void internal_read_cb_bridge(void *cookie, const char *name, const char *
     if (!ctx || !ctx->user_cb) return;
 
     if (name) {
+        if (is_cow_patched_key(name)) {
+            if (__builtin_expect(g_cfg.probe.enabled, 0)) {
+                ScopedHookGuard guard;
+                if (guard) emit_probe("COW_PROP", name, value ? value : "");
+            }
+            ctx->user_cb(ctx->user_cookie, name, value, serial);
+            return;
+        }
         if (g_cfg.build.enabled) {
             auto it = g_cfg.build.prop_map.find(name);
             if (it != g_cfg.build.prop_map.end()) {
@@ -322,7 +349,7 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 
     if (!orig_system_property_read) return 0;
     int ret = orig_system_property_read(pi, name, value);
-    if (name && value && g_cfg.build.enabled) {
+    if (name && value && g_cfg.build.enabled && !is_cow_patched_key(name)) {
         auto it = g_cfg.build.prop_map.find(name);
         if (it != g_cfg.build.prop_map.end()) {
             if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -339,6 +366,14 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 
 inline int hook_system_property_get(const char *name, char *value) {
     if (name && value) {
+        if (is_cow_patched_key(name)) {
+            int cow_len = orig_system_property_get ? orig_system_property_get(name, value) : 0;
+            if (__builtin_expect(g_cfg.probe.enabled, 0)) {
+                ScopedHookGuard guard;
+                if (guard) emit_probe("COW_PROP", name, cow_len > 0 ? value : "<empty>");
+            }
+            return cow_len;
+        }
         if (g_cfg.build.enabled) {
             auto it = g_cfg.build.prop_map.find(name);
             if (it != g_cfg.build.prop_map.end()) {
@@ -381,9 +416,11 @@ inline void internal_foreach_cb(const prop_info *pi, void *cookie) {
         orig_system_property_read_callback(pi, key_extractor, &key);
         if (!key.empty()) {
             ctx->seen_keys.insert(key);
-            if (const prop_info *syn = g_prop_arena.find_lockfree(key.c_str())) {
-                ctx->user_fn(syn, ctx->user_cookie);
-                return;
+            if (!is_cow_patched_key(key.c_str())) {
+                if (const prop_info *syn = g_prop_arena.find_lockfree(key.c_str())) {
+                    ctx->user_fn(syn, ctx->user_cookie);
+                    return;
+                }
             }
         }
     }
@@ -421,7 +458,7 @@ inline const prop_info *hook_system_property_find_nth(unsigned n) {
             if (name) *static_cast<std::string *>(c) = name;
         };
         orig_system_property_read_callback(real_pi, key_extractor, &key);
-        if (!key.empty()) {
+        if (!key.empty() && !is_cow_patched_key(key.c_str())) {
             if (const prop_info *syn = g_prop_arena.find_lockfree(key.c_str())) {
                 return syn;
             }
