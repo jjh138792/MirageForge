@@ -8,7 +8,11 @@ MirageForge: https://github.com/jjh138792/MirageForge
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import type { Component } from 'vue';
 import { SpringSolver, triggerHaptic } from '../bridge/ksu-io';
-import { setOrbRefractionScale, updateOrbLensGeometry } from '../utils/lensEngine';
+import {
+  setOrbRefractionScale,
+  updateDockLensGeometry,
+  updateOrbLensGeometry,
+} from '../utils/lensEngine';
 import { settingsStore } from '../store/settingsStore';
 import type { DockStyle } from '../store/types';
 
@@ -46,7 +50,6 @@ let longPressTimer: any = null;
 let pointerStartX = 0;
 let resizeObserver: ResizeObserver | null = null;
 
-// 按住、拖拽或滑行动画进行中时激活水晶液滴折射态；静止落位后回归干净温润药丸态
 const isLiquidLensActive = computed(
   () =>
     isOrbPressed.value ||
@@ -55,12 +58,21 @@ const isLiquidLensActive = computed(
     settingsStore.refractionLevel === 'vivid'
 );
 
-function syncOrbGeometry() {
-  if (!orbRef.value) return;
-  const w = orbRef.value.offsetWidth;
-  const h = orbRef.value.offsetHeight;
-  if (w > 10 && h > 10) {
-    updateOrbLensGeometry(w, h);
+// 实时同步底栏与滑块泡的真实 CSS 像素宽高至 SVG userSpaceOnUse 滤镜
+function syncLensGeometries() {
+  if (dockRef.value) {
+    const dw = dockRef.value.offsetWidth;
+    const dh = dockRef.value.offsetHeight;
+    if (dw > 40 && dh > 24) {
+      updateDockLensGeometry(dw, dh, props.dockStyle === 'docked');
+    }
+  }
+  if (orbRef.value) {
+    const ow = orbRef.value.offsetWidth;
+    const oh = orbRef.value.offsetHeight;
+    if (ow > 24 && oh > 20) {
+      updateOrbLensGeometry(ow, oh);
+    }
   }
 }
 
@@ -77,7 +89,6 @@ function startPhysicsLoop() {
     const baseScale = springScale.step(dt);
     const vx = springX.vel;
 
-    // 速度越快，水滴沿水平方向自然拉伸、垂直微扁
     const speedStretch = Math.min(0.24, Math.abs(vx) * 0.042);
     const speedSquash = Math.min(0.11, Math.abs(vx) * 0.018);
 
@@ -85,12 +96,12 @@ function startPhysicsLoop() {
     orbScaleX.value = baseScale + speedStretch;
     orbScaleY.value = baseScale - speedSquash;
 
-    // 根据按压膨胀与滑行速度动态调制液滴边缘折弯幅度 (16 ~ 28px，绝不越界撕裂)
-    const activeBoost = isOrbPressed.value || isOrbDragging.value ? 1 : Math.min(1, Math.abs(vx) * 0.45);
-    const baseRefraction = settingsStore.refractionLevel === 'vivid' ? 14 : 0;
+    const activeBoost =
+      isOrbPressed.value || isOrbDragging.value ? 1 : Math.min(1, Math.abs(vx) * 0.5);
+    const baseRefraction = settingsStore.refractionLevel === 'vivid' ? 20 : 0;
     const dynamicScale = Math.max(
       baseRefraction,
-      (19 + Math.min(9, Math.abs(vx) * 1.8 + (baseScale - 1) * 28)) * activeBoost
+      (24 + Math.min(10, Math.abs(vx) * 2.2 + (baseScale - 1) * 30)) * activeBoost
     );
     setOrbRefractionScale(dynamicScale);
 
@@ -99,7 +110,7 @@ function startPhysicsLoop() {
     } else {
       rafId = 0;
       isOrbMoving.value = false;
-      setOrbRefractionScale(settingsStore.refractionLevel === 'vivid' ? 14 : 0);
+      setOrbRefractionScale(settingsStore.refractionLevel === 'vivid' ? 20 : 0);
     }
   };
 
@@ -121,14 +132,14 @@ watch(
 watch(
   () => props.dockStyle,
   () => {
-    requestAnimationFrame(() => syncOrbGeometry());
+    setTimeout(() => syncLensGeometries(), 380);
   }
 );
 
 function onDockPointerDown(e: PointerEvent) {
   if (!dockRef.value) return;
   (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-  syncOrbGeometry();
+  syncLensGeometries();
 
   isOrbPressed.value = true;
   isOrbDragging.value = false;
@@ -140,7 +151,6 @@ function onDockPointerDown(e: PointerEvent) {
   const slotW = (rect.width - pad * 2) / count;
   const clickIdx = Math.max(0, Math.min(count - 1, (e.clientX - rect.left - pad) / slotW - 0.5));
 
-  // 轻触即微幅膨胀并激活液态光学边缘；长按进一步放大成水晶放大镜
   springScale.target = 1.12;
   startPhysicsLoop();
 
@@ -172,7 +182,6 @@ function onDockPointerMove(e: PointerEvent) {
     const slotW = (rect.width - pad * 2) / count;
     let rawIdx = (e.clientX - rect.left - pad) / slotW - 0.5;
 
-    // 两端橡皮筋阻尼
     if (rawIdx < 0) rawIdx = rawIdx * 0.25;
     if (rawIdx > maxIdx) rawIdx = maxIdx + (rawIdx - maxIdx) * 0.25;
 
@@ -211,10 +220,11 @@ function onDockPointerUp(e: PointerEvent) {
 }
 
 onMounted(() => {
-  requestAnimationFrame(() => syncOrbGeometry());
-  if (typeof ResizeObserver !== 'undefined' && orbRef.value) {
-    resizeObserver = new ResizeObserver(() => syncOrbGeometry());
-    resizeObserver.observe(orbRef.value);
+  requestAnimationFrame(() => syncLensGeometries());
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => syncLensGeometries());
+    if (dockRef.value) resizeObserver.observe(dockRef.value);
+    if (orbRef.value) resizeObserver.observe(orbRef.value);
   }
 });
 
@@ -229,7 +239,7 @@ onUnmounted(() => {
   <nav class="nav-dock-wrap" :class="dockStyle">
     <div
       ref="dockRef"
-      class="nav-dock-bar"
+      class="nav-dock-bar liquid-dock-glass"
       :class="dockStyle"
       :style="{ gridTemplateColumns: `repeat(${items.length}, 1fr)` }"
       @pointerdown="onDockPointerDown"
@@ -237,7 +247,6 @@ onUnmounted(() => {
       @pointerup="onDockPointerUp"
       @pointercancel="onDockPointerUp"
     >
-      <!-- 底层图标与文字 (z-index: 1)：清晰干净，被上方交互液滴球精确折射 -->
       <div
         v-for="(item, idx) in items"
         :key="item.key"
@@ -248,7 +257,6 @@ onUnmounted(() => {
         <span class="dock-label">{{ item.label }}</span>
       </div>
 
-      <!-- 顶层双态液态玻璃球 (z-index: 2)：静止=干净药丸，按住/滑动=晶莹曲面折射液滴 -->
       <div
         ref="orbRef"
         class="dock-liquid-orb liquid-orb-pill"
@@ -281,7 +289,6 @@ onUnmounted(() => {
   padding: 0;
 }
 
-/* 干净柔和的底栏底座（彻底虚化页面底部背景文字，避免杂乱底字透入玻璃球） */
 .nav-dock-bar {
   pointer-events: auto;
   position: relative;
@@ -290,13 +297,6 @@ onUnmounted(() => {
   max-width: 460px;
   padding: 6px;
   border-radius: 999px;
-  background: var(--dock-surface-bg);
-  backdrop-filter: blur(28px) saturate(190%);
-  -webkit-backdrop-filter: blur(28px) saturate(190%);
-  border: 1px solid var(--glass-border);
-  box-shadow:
-    inset 0 1px 1px var(--glass-rim-top),
-    0 12px 32px -8px rgba(0, 0, 0, 0.22);
   touch-action: none;
   cursor: grab;
   overflow: visible;

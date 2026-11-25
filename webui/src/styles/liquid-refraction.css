@@ -4,7 +4,6 @@
  * MirageForge: https://github.com/jjh138792/MirageForge
  */
 
-/* 动态极光流体背景画布 */
 .ambient-canvas {
   position: fixed;
   inset: 0;
@@ -57,7 +56,7 @@
   100% { transform: translate3d(20px, -18px, 0) scale(0.95); }
 }
 
-/* 干净通透的液态毛玻璃卡片（锁定 flex-shrink: 0 杜绝滚动容器挤压） */
+/* 液态毛玻璃卡片（锁定 flex-shrink: 0 防挤压） */
 .liquid-glass {
   position: relative;
   flex-shrink: 0;
@@ -101,7 +100,24 @@
 }
 
 /* ==========================================================================
-   底部液态玻璃球：双态物理材质（静止 = 温润药丸，按住/滑动 = 晶莹曲面折射液滴）
+   1. 整条底栏液态玻璃本体：直接透视下方页面内容，边缘弧面产生真实玻璃拉伸扭曲
+   ========================================================================== */
+.liquid-dock-glass {
+  background: var(--dock-surface-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--dock-rim);
+  /* 极低模糊 (1.8px) 保留底层物体可辨识度，同时通过 #mirage-dock-lens 实现边缘拉伸折射 */
+  backdrop-filter: url(#mirage-dock-lens) blur(1.8px) saturate(175%);
+  -webkit-backdrop-filter: url(#mirage-dock-lens) blur(1.8px) saturate(175%);
+}
+
+:root[data-refraction="off"] .liquid-dock-glass {
+  backdrop-filter: blur(22px) saturate(175%);
+  -webkit-backdrop-filter: blur(22px) saturate(175%);
+}
+
+/* ==========================================================================
+   2. 液滴滑块泡：静止 = 干净温润药丸，按住/滑动 = 高曲率 Snell 水滴折射放大镜
    ========================================================================== */
 .liquid-orb-pill {
   background: var(--orb-idle-bg);
@@ -116,16 +132,14 @@
     box-shadow 0.24s ease;
 }
 
-/* 交互液滴态（按住、拖拽、滑行中）激活 1:1 胶囊 SDF 物理边缘拉伸折射 */
 .liquid-orb-pill.orb-liquid-active {
   background: var(--orb-liquid-bg);
   border: 1px solid var(--glass-rim-top);
   box-shadow: var(--orb-liquid-rim);
-  backdrop-filter: url(#mirage-orb-lens) brightness(1.03) contrast(1.03);
-  -webkit-backdrop-filter: url(#mirage-orb-lens) brightness(1.03) contrast(1.03);
+  backdrop-filter: url(#mirage-orb-lens) brightness(1.03) contrast(1.04);
+  -webkit-backdrop-filter: url(#mirage-orb-lens) brightness(1.03) contrast(1.04);
 }
 
-/* 「强水面拉伸」模式下，静止态也保留清透水滴边缘质感 */
 :root[data-refraction="vivid"] .liquid-orb-pill {
   background: var(--orb-liquid-bg);
   border: 1px solid var(--glass-rim-top);
@@ -134,7 +148,6 @@
   -webkit-backdrop-filter: url(#mirage-orb-lens) brightness(1.02);
 }
 
-/* 「仅毛玻璃」模式下彻底关闭 SVG 位移，仅用柔和模糊 */
 :root[data-refraction="off"] .liquid-orb-pill.orb-liquid-active {
   backdrop-filter: blur(6px) saturate(170%);
   -webkit-backdrop-filter: blur(6px) saturate(170%);

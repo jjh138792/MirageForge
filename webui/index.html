@@ -15,28 +15,67 @@ MirageForge: https://github.com/jjh138792/MirageForge
   <link rel="stylesheet" type="text/css" href="https://mui.kernelsu.org/internal/colors.css" />
 </head>
 <body>
-  <!-- 精确 1:1 坐标对齐的物理液态玻璃折射引擎（x/y=0% 根治偏移与底边撕裂，R/G/B 仅 ±1.6px 边缘微色散） -->
+  <!--
+    严格 userSpaceOnUse 真实 CSS 像素坐标 + rgb(128,128,128) 中性灰兜底：
+    彻底解决 Android WebView / Chromium 高 DPI 下 backdrop-filter 偏移、缩放错位与直角蓝边切口
+  -->
   <svg style="position: fixed; width: 0; height: 0; pointer-events: none; z-index: -999;" aria-hidden="true">
     <defs>
+      <!-- 1. 整个底栏本体专用：透视底层页面内容并在底栏边缘弧面产生真实玻璃拉伸扭曲 -->
       <filter
-        id="mirage-orb-lens"
-        x="0%"
-        y="0%"
-        width="100%"
-        height="100%"
+        id="mirage-dock-lens"
+        filterUnits="userSpaceOnUse"
+        primitiveUnits="userSpaceOnUse"
+        x="0"
+        y="0"
+        width="360"
+        height="64"
         color-interpolation-filters="sRGB"
       >
+        <feFlood flood-color="rgb(128,128,128)" result="dockNeutral" />
+        <feImage
+          id="mirage-dock-map"
+          x="0"
+          y="0"
+          width="360"
+          height="64"
+          preserveAspectRatio="none"
+          result="dockRawMap"
+        />
+        <feComposite in="dockRawMap" in2="dockNeutral" operator="over" result="dockMap" />
+        <feDisplacementMap
+          id="mirage-dock-disp"
+          in="SourceGraphic"
+          in2="dockMap"
+          scale="22"
+          xChannelSelector="R"
+          yChannelSelector="G"
+        />
+      </filter>
+
+      <!-- 2. 液滴滑块泡专用：中心严格 0 位移无重影，外圈弧壁强 Snell 弯曲拉伸 + ±1.2px 边缘微色散 -->
+      <filter
+        id="mirage-orb-lens"
+        filterUnits="userSpaceOnUse"
+        primitiveUnits="userSpaceOnUse"
+        x="0"
+        y="0"
+        width="108"
+        height="52"
+        color-interpolation-filters="sRGB"
+      >
+        <feFlood flood-color="rgb(128,128,128)" result="orbNeutral" />
         <feImage
           id="mirage-spherical-map"
-          x="0%"
-          y="0%"
-          width="100%"
-          height="100%"
+          x="0"
+          y="0"
+          width="108"
+          height="52"
           preserveAspectRatio="none"
-          result="lensMap"
+          result="orbRawMap"
         />
+        <feComposite in="orbRawMap" in2="orbNeutral" operator="over" result="lensMap" />
 
-        <!-- 拆分 R / G / B 通道，仅在外缘高曲率处产生细腻棱镜微色散，中心位移为 0 故完全无重影 -->
         <feColorMatrix
           in="SourceGraphic"
           type="matrix"
@@ -60,7 +99,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
           id="mirage-orb-disp-r"
           in="srcR"
           in2="lensMap"
-          scale="23.6"
+          scale="27.2"
           xChannelSelector="R"
           yChannelSelector="G"
           result="dispR"
@@ -69,7 +108,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
           id="mirage-orb-disp-g"
           in="srcG"
           in2="lensMap"
-          scale="22"
+          scale="26"
           xChannelSelector="R"
           yChannelSelector="G"
           result="dispG"
@@ -78,7 +117,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
           id="mirage-orb-disp-b"
           in="srcB"
           in2="lensMap"
-          scale="20.4"
+          scale="24.8"
           xChannelSelector="R"
           yChannelSelector="G"
           result="dispB"
@@ -86,7 +125,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
 
         <feBlend in="dispR" in2="dispG" mode="screen" result="dispRG" />
         <feBlend in="dispRG" in2="dispB" mode="screen" result="dispRGB" />
-        <feColorMatrix in="dispRGB" type="saturate" values="1.15" />
+        <feColorMatrix in="dispRGB" type="saturate" values="1.12" />
       </filter>
     </defs>
   </svg>
