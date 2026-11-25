@@ -96,14 +96,12 @@ function openRepo() {
       </div>
     </div>
 
-    <!-- 1. 外观与液态玻璃设置 -->
     <div class="settings-group liquid-glass" v-touch-glass>
       <div class="group-title">
         <Palette :size="15" />
         <span>{{ t('settings.secAppearance') }}</span>
       </div>
 
-      <!-- 主题模式 -->
       <div class="setting-block">
         <div class="setting-label">{{ t('settings.themeLabel') }}</div>
         <div class="segmented-row">
@@ -114,13 +112,12 @@ function openRepo() {
             :class="{ active: settingsStore.themeMode === opt.key }"
             @click="applyThemeMode(opt.key)"
           >
-            <component :is="opt.icon" :size="14" />
+            <component :is="opt.icon" :size="13" />
             <span>{{ t(opt.labelKey) }}</span>
           </button>
         </div>
       </div>
 
-      <!-- 主题强调色 -->
       <div class="setting-block">
         <div class="setting-label">{{ t('settings.accentLabel') }}</div>
         <div class="swatch-row">
@@ -135,7 +132,6 @@ function openRepo() {
         </div>
       </div>
 
-      <!-- 底部导航栏样式：悬浮栏 / 贴底栏 -->
       <div class="setting-block">
         <div class="setting-label">
           <PanelBottom :size="13" />
@@ -154,7 +150,6 @@ function openRepo() {
         </div>
       </div>
 
-      <!-- 液态玻璃折射质感 -->
       <div class="setting-block">
         <div class="setting-label">{{ t('settings.refractionLabel') }}</div>
         <div class="segmented-row">
@@ -170,7 +165,6 @@ function openRepo() {
         </div>
       </div>
 
-      <!-- 显示语言 -->
       <div class="setting-block">
         <div class="setting-label">
           <Globe :size="13" />
@@ -190,14 +184,12 @@ function openRepo() {
       </div>
     </div>
 
-    <!-- 2. 底层引擎策略设置（含 MountNS 与 COW Prop 总控） -->
     <div class="settings-group liquid-glass" v-touch-glass>
       <div class="group-title">
         <Sliders :size="15" />
         <span>{{ t('settings.secEngine') }}</span>
       </div>
 
-      <!-- CPU/GPU 文件节点是否使用挂载命名空间 -->
       <div class="switch-card">
         <div
           class="switch-row tactile-press"
@@ -222,7 +214,6 @@ function openRepo() {
         </div>
       </div>
 
-      <!-- COW Prop Spoof 默认策略 -->
       <div class="switch-card">
         <div
           class="switch-row tactile-press"
@@ -247,7 +238,6 @@ function openRepo() {
         </div>
       </div>
 
-      <!-- 保存配置自动重启目标应用 -->
       <div class="switch-card">
         <div
           class="switch-row tactile-press"
@@ -264,7 +254,6 @@ function openRepo() {
       </div>
     </div>
 
-    <!-- 3. 诊断工具、OTA 与开源关于 -->
     <div class="settings-group liquid-glass" v-touch-glass>
       <div class="group-title">
         <Radar :size="15" />
@@ -333,7 +322,7 @@ function openRepo() {
 }
 
 .settings-group {
-  padding: 16px;
+  padding: 15px;
   display: flex;
   flex-direction: column;
   gap: 13px;
@@ -365,8 +354,8 @@ function openRepo() {
 
 .segmented-row {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 7px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
   padding: 4px;
   border-radius: 14px;
   background: var(--subcard-bg);
@@ -374,21 +363,24 @@ function openRepo() {
 }
 
 .segmented-row.two-col {
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .seg-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  padding: 8px 6px;
+  gap: 4px;
+  padding: 8px 4px;
   border-radius: 10px;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 700;
   color: var(--text-secondary);
   background: transparent;
   border: 1px solid transparent;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .seg-btn.active {
@@ -401,6 +393,7 @@ function openRepo() {
 .swatch-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 4px 2px;
 }
@@ -527,6 +520,7 @@ function openRepo() {
 .row-title {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 7px;
   font-size: 13px;
   font-weight: 700;
@@ -551,5 +545,12 @@ function openRepo() {
 .row-arrow {
   color: var(--text-muted);
   flex-shrink: 0;
+}
+
+@media (max-width: 360px) {
+  .seg-btn {
+    font-size: 10.5px;
+    padding: 7px 3px;
+  }
 }
 </style>

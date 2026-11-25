@@ -52,18 +52,13 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 
-// 分类全屏编辑器状态
 const editingTemplate = ref<DeviceTemplate | null>(null);
 const editingIsNew = ref(false);
-
-// 生效应用弹窗状态
 const activeAppsTemplate = ref<DeviceTemplate | null>(null);
 
-// 在线模板库弹窗状态
 const showOnlineHubModal = ref(false);
 const customHubInput = ref(mirageStore.hubStatus.customUrl);
 
-// 统一导入/导出中心弹窗（mf:// 口令、build.prop 属性炼金、一键克隆本机、备份导出）
 const showTransferModal = ref(false);
 const transferTab = ref<'share' | 'alchemy' | 'backup'>('share');
 const shareCodeInput = ref('');
@@ -240,7 +235,6 @@ async function handleExportBackup() {
 
 <template>
   <section class="templates-view">
-    <!-- 1. 顶部大标题：模板 + 3 大核心快捷按钮 -->
     <div class="page-large-header">
       <h1 class="page-large-title">{{ t('nav.templates') }}</h1>
     </div>
@@ -260,7 +254,6 @@ async function handleExportBackup() {
       </button>
     </div>
 
-    <!-- 2. 模板卡片网格 -->
     <div class="template-grid">
       <article
         v-for="tpl in Object.values(mirageStore.templates)"
@@ -314,7 +307,6 @@ async function handleExportBackup() {
           </div>
         </div>
 
-        <!-- 卡片底部操作区：新增「生效应用」按钮 -->
         <div class="tpl-card-footer">
           <button class="foot-pill active-apps tactile-press" @click="openActiveApps(tpl)">
             <Layers :size="13" />
@@ -338,7 +330,6 @@ async function handleExportBackup() {
       </article>
     </div>
 
-    <!-- 3. 分类全屏展开编辑器 -->
     <TemplateCategoryEditor
       :template="editingTemplate"
       :is-new="editingIsNew"
@@ -346,190 +337,190 @@ async function handleExportBackup() {
       @open-active-apps="(tpl) => (activeAppsTemplate = tpl)"
     />
 
-    <!-- 4. 生效应用管理面板 -->
     <TemplateActiveAppsSheet
       :template="activeAppsTemplate"
       @close="activeAppsTemplate = null"
       @jump-to-apps="emit('jump-to-apps')"
     />
 
-    <!-- 5. 统一导入 / 导出中心（mf:// 分享码 + 属性炼金 + 克隆本机 + 备份） -->
-    <Transition name="view-morph">
-      <div v-if="showTransferModal" class="modal-overlay" @click.self="showTransferModal = false">
-        <div class="modal-sheet liquid-glass liquid-glass-elevated">
-          <div class="modal-header">
-            <h3>导入 / 导出与真机提取</h3>
-            <button class="icon-close tactile-press" @click="showTransferModal = false">
-              <X :size="18" />
-            </button>
-          </div>
-
-          <div class="transfer-tabs">
-            <button
-              class="t-tab tactile-press"
-              :class="{ active: transferTab === 'share' }"
-              @click="transferTab = 'share'"
-            >
-              mf:// 口令
-            </button>
-            <button
-              class="t-tab tactile-press"
-              :class="{ active: transferTab === 'alchemy' }"
-              @click="transferTab = 'alchemy'"
-            >
-              属性炼金
-            </button>
-            <button
-              class="t-tab tactile-press"
-              :class="{ active: transferTab === 'backup' }"
-              @click="transferTab = 'backup'"
-            >
-              克隆与备份
-            </button>
-          </div>
-
-          <div class="modal-body">
-            <!-- Tab 1: mf:// 分享码导入 -->
-            <div v-if="transferTab === 'share'" class="transfer-pane">
-              <p class="pane-desc">粘贴 <code>mf://</code> 开头的模板分享码或完整模板 JSON，解析后可二次精细微调。</p>
-              <textarea
-                v-model="shareCodeInput"
-                rows="6"
-                class="liquid-textarea mono-area"
-                :placeholder="t('templates.sharePlaceholder')"
-              ></textarea>
-              <button class="btn-liquid tactile-press full-w" @click="handleConfirmShareImport">
-                <Check :size="15" />
-                <span>{{ t('templates.shareConfirm') }}</span>
-              </button>
-            </div>
-
-            <!-- Tab 2: build.prop 属性炼金 -->
-            <div v-else-if="transferTab === 'alchemy'" class="transfer-pane">
-              <input
-                ref="propFileInputRef"
-                type="file"
-                accept=".prop,.txt,.conf,*/*"
-                hidden
-                @change="handlePropFileChange"
-              />
-              <button class="drop-btn tactile-press" @click="propFileInputRef?.click()">
-                <FileUp :size="18" />
-                <span>点击导入本地 build.prop 文件</span>
-              </button>
-              <textarea
-                v-model="rawPropText"
-                rows="6"
-                class="liquid-textarea mono-area"
-                placeholder="或直接粘贴 ro.product.model=... / ro.soc.model=... 属性内容"
-              ></textarea>
-              <button class="btn-liquid tactile-press full-w" @click="runPropAlchemy">
-                <Sparkles :size="15" />
-                <span>{{ t('alchemy.parseBtn') }}</span>
-              </button>
-            </div>
-
-            <!-- Tab 3: 一键克隆本机 & 导出备份 -->
-            <div v-else class="transfer-pane">
-              <div class="tool-card">
-                <div class="tool-copy">
-                  <div class="tool-title">一键克隆当前真机为模板</div>
-                  <div class="tool-desc">
-                    直接采集本机真实 getprop、每簇 cpufreq 频点表、内存规格与 GPU 渲染器，一键铸造完整模板并生成分享码。
-                  </div>
-                </div>
-                <button
-                  class="btn-liquid tactile-press"
-                  :disabled="cloningHost"
-                  @click="handleCloneHostDevice"
-                >
-                  <Smartphone :size="15" />
-                  <span>{{ cloningHost ? '正在提取...' : '立即克隆' }}</span>
-                </button>
-              </div>
-
-              <div class="tool-card">
-                <div class="tool-copy">
-                  <div class="tool-title">导出全部模板与路由备份</div>
-                  <div class="tool-desc">
-                    导出完整 JSON 配置至 /sdcard/Download 目录，便于刷机换机后快速恢复。
-                  </div>
-                </div>
-                <button class="btn-liquid-ghost tactile-press" @click="handleExportBackup">
-                  <Download :size="15" />
-                  <span>导出 JSON</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </Transition>
-
-    <!-- 6. 在线模板库弹窗 -->
-    <Transition name="view-morph">
-      <div v-if="showOnlineHubModal" class="modal-overlay" @click.self="showOnlineHubModal = false">
-        <div class="modal-sheet liquid-glass liquid-glass-elevated">
-          <div class="modal-header">
-            <h3>🌐 {{ t('templates.hubModalTitle') }}</h3>
-            <div class="hub-head-actions">
-              <button
-                class="btn-liquid-ghost tactile-press"
-                :disabled="mirageStore.hubLoading"
-                @click="fetchOnlineTemplateHub(true)"
-              >
-                <RefreshCw :size="14" :class="{ spinning: mirageStore.hubLoading }" />
-                <span>{{ t('templates.hubRefreshBtn') }}</span>
-              </button>
-              <button class="icon-close tactile-press" @click="showOnlineHubModal = false">
+    <!-- 统一导入 / 导出中心 -->
+    <Teleport to="body">
+      <Transition name="view-morph">
+        <div v-if="showTransferModal" class="modal-overlay" @click.self="showTransferModal = false">
+          <div class="modal-sheet liquid-glass liquid-glass-elevated">
+            <div class="modal-header">
+              <h3>导入 / 导出与真机提取</h3>
+              <button class="icon-close tactile-press" @click="showTransferModal = false">
                 <X :size="18" />
               </button>
             </div>
-          </div>
 
-          <div class="hub-status-bar">
-            <div class="hub-status-line">
-              <span class="status-dot" :class="mirageStore.hubStatus.state"></span>
-              <span v-if="mirageStore.hubStatus.state === 'loading'">{{ t('templates.hubSyncing') }}</span>
-              <span v-else-if="mirageStore.hubStatus.state === 'online'">
-                {{ t('templates.hubOnline', { src: mirageStore.hubStatus.source, count: mirageStore.hubStatus.remoteCount }) }}
-              </span>
-              <span v-else>
-                {{ t('templates.hubOffline', { err: mirageStore.hubStatus.error || '离线模式' }) }}
-              </span>
-            </div>
-
-            <div class="hub-custom-row">
-              <Globe :size="14" class="spec-icon" />
-              <input
-                v-model="customHubInput"
-                class="liquid-input hub-url-input"
-                :placeholder="t('templates.hubCustomPlaceholder')"
-              />
-              <button class="btn-liquid-ghost tactile-press" @click="applyCustomHubSource">
-                {{ t('templates.hubApplyUrl') }}
+            <div class="transfer-tabs">
+              <button
+                class="t-tab tactile-press"
+                :class="{ active: transferTab === 'share' }"
+                @click="transferTab = 'share'"
+              >
+                mf:// 口令
+              </button>
+              <button
+                class="t-tab tactile-press"
+                :class="{ active: transferTab === 'alchemy' }"
+                @click="transferTab = 'alchemy'"
+              >
+                属性炼金
+              </button>
+              <button
+                class="t-tab tactile-press"
+                :class="{ active: transferTab === 'backup' }"
+                @click="transferTab = 'backup'"
+              >
+                克隆与备份
               </button>
             </div>
-          </div>
 
-          <div class="modal-body hub-list">
-            <div v-for="item in mirageStore.hubTemplates" :key="item.id" class="hub-item">
-              <div class="hub-info">
-                <div class="hub-name">{{ item.name }}</div>
-                <div class="hub-meta">
-                  {{ item.BRAND }} {{ item.MODEL }} · {{ item.VK_DEVICE_NAME || item.GL_RENDERER }} · {{ item.RAM_GB }}GB {{ item.DDR_TYPE }} · {{ item.MAX_REFRESH_RATE || 120 }}Hz
+            <div class="modal-body">
+              <div v-if="transferTab === 'share'" class="transfer-pane">
+                <p class="pane-desc">粘贴 <code>mf://</code> 开头的模板分享码或完整模板 JSON，解析后可二次精细微调。</p>
+                <textarea
+                  v-model="shareCodeInput"
+                  rows="6"
+                  class="liquid-textarea mono-area"
+                  :placeholder="t('templates.sharePlaceholder')"
+                ></textarea>
+                <button class="btn-liquid tactile-press full-w" @click="handleConfirmShareImport">
+                  <Check :size="15" />
+                  <span>{{ t('templates.shareConfirm') }}</span>
+                </button>
+              </div>
+
+              <div v-else-if="transferTab === 'alchemy'" class="transfer-pane">
+                <input
+                  ref="propFileInputRef"
+                  type="file"
+                  accept=".prop,.txt,.conf,*/*"
+                  hidden
+                  @change="handlePropFileChange"
+                />
+                <button class="drop-btn tactile-press" @click="propFileInputRef?.click()">
+                  <FileUp :size="18" />
+                  <span>点击导入本地 build.prop 文件</span>
+                </button>
+                <textarea
+                  v-model="rawPropText"
+                  rows="6"
+                  class="liquid-textarea mono-area"
+                  placeholder="或直接粘贴 ro.product.model=... / ro.soc.model=... 属性内容"
+                ></textarea>
+                <button class="btn-liquid tactile-press full-w" @click="runPropAlchemy">
+                  <Sparkles :size="15" />
+                  <span>{{ t('alchemy.parseBtn') }}</span>
+                </button>
+              </div>
+
+              <div v-else class="transfer-pane">
+                <div class="tool-card">
+                  <div class="tool-copy">
+                    <div class="tool-title">一键克隆当前真机为模板</div>
+                    <div class="tool-desc">
+                      直接采集本机真实 getprop、每簇 cpufreq 频点表、内存规格与 GPU 渲染器，一键铸造完整模板并生成分享码。
+                    </div>
+                  </div>
+                  <button
+                    class="btn-liquid tactile-press"
+                    :disabled="cloningHost"
+                    @click="handleCloneHostDevice"
+                  >
+                    <Smartphone :size="15" />
+                    <span>{{ cloningHost ? '正在提取...' : '立即克隆' }}</span>
+                  </button>
+                </div>
+
+                <div class="tool-card">
+                  <div class="tool-copy">
+                    <div class="tool-title">导出全部模板与路由备份</div>
+                    <div class="tool-desc">
+                      导出完整 JSON 配置至 /sdcard/Download 目录，便于刷机换机后快速恢复。
+                    </div>
+                  </div>
+                  <button class="btn-liquid-ghost tactile-press" @click="handleExportBackup">
+                    <Download :size="15" />
+                    <span>导出 JSON</span>
+                  </button>
                 </div>
               </div>
-              <button class="btn-liquid tactile-press" @click="importFromHub(item)">
-                <Check v-if="mirageStore.templates[item.id]" :size="14" />
-                <CloudDownload v-else :size="14" />
-                <span>{{ mirageStore.templates[item.id] ? '已入库' : t('templates.hubImportBtn') }}</span>
-              </button>
             </div>
           </div>
         </div>
-      </div>
-    </Transition>
+      </Transition>
+    </Teleport>
+
+    <!-- 在线模板库弹窗 -->
+    <Teleport to="body">
+      <Transition name="view-morph">
+        <div v-if="showOnlineHubModal" class="modal-overlay" @click.self="showOnlineHubModal = false">
+          <div class="modal-sheet liquid-glass liquid-glass-elevated">
+            <div class="modal-header">
+              <h3>🌐 {{ t('templates.hubModalTitle') }}</h3>
+              <div class="hub-head-actions">
+                <button
+                  class="btn-liquid-ghost tactile-press"
+                  :disabled="mirageStore.hubLoading"
+                  @click="fetchOnlineTemplateHub(true)"
+                >
+                  <RefreshCw :size="14" :class="{ spinning: mirageStore.hubLoading }" />
+                  <span>{{ t('templates.hubRefreshBtn') }}</span>
+                </button>
+                <button class="icon-close tactile-press" @click="showOnlineHubModal = false">
+                  <X :size="18" />
+                </button>
+              </div>
+            </div>
+
+            <div class="hub-status-bar">
+              <div class="hub-status-line">
+                <span class="status-dot" :class="mirageStore.hubStatus.state"></span>
+                <span v-if="mirageStore.hubStatus.state === 'loading'">{{ t('templates.hubSyncing') }}</span>
+                <span v-else-if="mirageStore.hubStatus.state === 'online'">
+                  {{ t('templates.hubOnline', { src: mirageStore.hubStatus.source, count: mirageStore.hubStatus.remoteCount }) }}
+                </span>
+                <span v-else>
+                  {{ t('templates.hubOffline', { err: mirageStore.hubStatus.error || '离线模式' }) }}
+                </span>
+              </div>
+
+              <div class="hub-custom-row">
+                <Globe :size="14" class="spec-icon" />
+                <input
+                  v-model="customHubInput"
+                  class="liquid-input hub-url-input"
+                  :placeholder="t('templates.hubCustomPlaceholder')"
+                />
+                <button class="btn-liquid-ghost tactile-press" @click="applyCustomHubSource">
+                  {{ t('templates.hubApplyUrl') }}
+                </button>
+              </div>
+            </div>
+
+            <div class="modal-body hub-list">
+              <div v-for="item in mirageStore.hubTemplates" :key="item.id" class="hub-item">
+                <div class="hub-info">
+                  <div class="hub-name">{{ item.name }}</div>
+                  <div class="hub-meta">
+                    {{ item.BRAND }} {{ item.MODEL }} · {{ item.VK_DEVICE_NAME || item.GL_RENDERER }} · {{ item.RAM_GB }}GB {{ item.DDR_TYPE }} · {{ item.MAX_REFRESH_RATE || 120 }}Hz
+                  </div>
+                </div>
+                <button class="btn-liquid tactile-press" @click="importFromHub(item)">
+                  <Check v-if="mirageStore.templates[item.id]" :size="14" />
+                  <CloudDownload v-else :size="14" />
+                  <span>{{ mirageStore.templates[item.id] ? '已入库' : t('templates.hubImportBtn') }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </section>
 </template>
 
@@ -542,9 +533,9 @@ async function handleExportBackup() {
 
 .top-action-bar {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-  padding: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  padding: 7px;
   border-radius: 20px;
 }
 
@@ -552,14 +543,17 @@ async function handleExportBackup() {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 9px 8px;
+  gap: 5px;
+  padding: 9px 6px;
   border-radius: 13px;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 700;
   color: var(--text-primary);
   background: var(--subcard-bg);
   border: 1px solid var(--glass-border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .bar-action.primary {
@@ -569,12 +563,12 @@ async function handleExportBackup() {
   box-shadow: 0 6px 16px -4px rgba(var(--accent-primary-rgb), 0.45);
 }
 
-.ico-cyan { color: var(--accent-secondary); }
-.ico-violet { color: var(--accent-primary); }
+.ico-cyan { color: var(--accent-secondary); flex-shrink: 0; }
+.ico-violet { color: var(--accent-primary); flex-shrink: 0; }
 
 .template-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
   gap: 13px;
 }
 
@@ -590,10 +584,12 @@ async function handleExportBackup() {
   justify-content: space-between;
   align-items: flex-start;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .tpl-title-wrap {
-  min-width: 0;
+  flex: 1;
+  min-width: 160px;
 }
 
 .tpl-name {
@@ -604,6 +600,7 @@ async function handleExportBackup() {
 .tpl-sub {
   font-size: 11px;
   color: var(--text-secondary);
+  word-break: break-word;
 }
 
 .gpu-pill {
@@ -619,8 +616,14 @@ async function handleExportBackup() {
 
 .spec-chips {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
+}
+
+@media (max-width: 360px) {
+  .spec-chips {
+    grid-template-columns: 1fr;
+  }
 }
 
 .spec-item {
@@ -668,6 +671,7 @@ async function handleExportBackup() {
 .bar-label {
   display: flex;
   justify-content: space-between;
+  gap: 8px;
   font-size: 10.5px;
   color: var(--text-secondary);
   margin-bottom: 2px;
@@ -675,6 +679,7 @@ async function handleExportBackup() {
 
 .bar-label b {
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .bar-track {
@@ -694,6 +699,7 @@ async function handleExportBackup() {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding-top: 6px;
   border-top: 1px dashed var(--glass-border);
@@ -743,7 +749,6 @@ async function handleExportBackup() {
   border-color: rgba(244, 63, 94, 0.3);
 }
 
-/* 弹窗通用样式 */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -759,7 +764,7 @@ async function handleExportBackup() {
 .modal-sheet {
   width: 100%;
   max-width: 580px;
-  max-height: 85vh;
+  max-height: 85%;
   display: flex;
   flex-direction: column;
   padding: 18px;
@@ -768,6 +773,7 @@ async function handleExportBackup() {
 }
 
 .modal-header {
+  flex: 0 0 auto;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -792,11 +798,13 @@ async function handleExportBackup() {
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
 
 .transfer-tabs {
+  flex: 0 0 auto;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
   border-radius: 14px;
@@ -820,8 +828,11 @@ async function handleExportBackup() {
 }
 
 .modal-body {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 .transfer-pane {
@@ -863,6 +874,7 @@ async function handleExportBackup() {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 13px;
   border-radius: 16px;
@@ -872,7 +884,7 @@ async function handleExportBackup() {
 
 .tool-copy {
   flex: 1;
-  min-width: 0;
+  min-width: 180px;
 }
 
 .tool-title {
@@ -888,6 +900,7 @@ async function handleExportBackup() {
 }
 
 .hub-status-bar {
+  flex: 0 0 auto;
   padding: 10px 12px;
   border-radius: 14px;
   background: var(--subcard-bg);
@@ -926,6 +939,7 @@ async function handleExportBackup() {
 
 .hub-url-input {
   flex: 1;
+  min-width: 0;
   padding: 6px 10px;
   font-size: 11.5px;
 }
@@ -937,14 +951,20 @@ async function handleExportBackup() {
 }
 
 .hub-item {
+  flex: 0 0 auto;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   padding: 11px 13px;
   border-radius: 15px;
   background: var(--subcard-bg);
   border: 1px solid var(--glass-border);
+}
+
+.hub-info {
+  flex: 1;
+  min-width: 0;
 }
 
 .hub-name {
@@ -956,6 +976,7 @@ async function handleExportBackup() {
   font-size: 11px;
   color: var(--text-secondary);
   margin-top: 2px;
+  word-break: break-word;
 }
 
 .spinning {

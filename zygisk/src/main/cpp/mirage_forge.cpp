@@ -229,6 +229,10 @@ private:
             g_cfg.vfs.enable_vfs_nodes = true;
         }
         g_cfg.vfs.enabled = g_cfg.vfs.any_enabled();
+        if (!g_cfg.build.enabled) {
+            g_cfg.build.cow_prop = false;
+            g_cfg.build.force_spoof_sdk = false;
+        }
 
         for (const auto &kv : raw_kvs) {
             const std::string &k = kv.first;

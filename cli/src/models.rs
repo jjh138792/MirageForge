@@ -350,14 +350,14 @@ impl From<AppRouteDe> for AppRoute {
             pkg_name: String::new(),
             tpl_id: raw.tpl_id,
             build: raw.build,
-            cow_prop: raw.cow_prop,
+            cow_prop: raw.cow_prop && raw.build,
             gl: raw.gl,
             vfs,
             cpu,
             mem,
             vfs_nodes,
             probe: raw.probe,
-            sdk_spoof: raw.sdk_spoof,
+            sdk_spoof: raw.sdk_spoof && raw.build,
             refresh_rate: sanitize_refresh_rate(raw.refresh_rate),
             mount_ns: raw.mount_ns && vfs,
         }
@@ -366,6 +366,10 @@ impl From<AppRouteDe> for AppRoute {
 
 impl AppRoute {
     pub fn normalize(&mut self) {
+        if !self.build {
+            self.cow_prop = false;
+            self.sdk_spoof = false;
+        }
         self.vfs = self.cpu || self.mem || self.vfs_nodes;
         if !self.vfs {
             self.mount_ns = false;

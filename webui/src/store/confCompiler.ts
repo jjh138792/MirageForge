@@ -61,6 +61,7 @@ export function normalizeTemplateVulkanFields(raw: Partial<DeviceTemplate>): Dev
 }
 
 export function normalizeAppRoute(raw: Partial<AppRoute> & { tplId: string }): AppRoute {
+  const build = raw.build !== false;
   const legacyVfs = raw.vfs !== false;
   const cpu = typeof raw.cpu === 'boolean' ? raw.cpu : legacyVfs;
   const mem = typeof raw.mem === 'boolean' ? raw.mem : legacyVfs;
@@ -68,15 +69,15 @@ export function normalizeAppRoute(raw: Partial<AppRoute> & { tplId: string }): A
   const vfs = cpu || mem || vfsNodes;
   return {
     tplId: String(raw.tplId),
-    build: raw.build !== false,
-    cowProp: Boolean(raw.cowProp),
+    build,
+    cowProp: Boolean(raw.cowProp) && build,
     gl: raw.gl !== false,
     vfs,
     cpu,
     mem,
     vfsNodes,
     probe: Boolean(raw.probe),
-    sdkSpoof: Boolean(raw.sdkSpoof),
+    sdkSpoof: Boolean(raw.sdkSpoof) && build,
     refreshRate: sanitizeRefreshRate(raw.refreshRate),
     mountNs: Boolean(raw.mountNs) && vfs,
   };
@@ -86,9 +87,6 @@ export function isRouteAnyEnabled(r: AppRoute): boolean {
   return Boolean(r.build || r.cowProp || r.gl || r.cpu || r.mem || r.vfsNodes || r.probe);
 }
 
-/**
- * 与 Rust CLI compiler.rs 100% 同步的细粒度零改动 .conf 编译器
- */
 export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRoute): string {
   const tpl = normalizeTemplateVulkanFields(rawTpl);
   const route = normalizeAppRoute(rawRoute);
@@ -99,12 +97,12 @@ export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRout
     }
   };
 
-  const anyProp = route.build || route.cowProp;
+  const anyProp = route.build;
   const anyVfs = route.cpu || route.mem || route.vfsNodes;
   const effectiveFps = sanitizeRefreshRate(route.refreshRate);
 
   push('META:ENABLE_BUILD', route.build ? '1' : '0');
-  push('META:ENABLE_COW_PROP', route.cowProp ? '1' : '0');
+  push('META:ENABLE_COW_PROP', route.build && route.cowProp ? '1' : '0');
   push('META:ENABLE_GL', route.gl ? '1' : '0');
   push('META:ENABLE_VFS', anyVfs ? '1' : '0');
   push('META:ENABLE_CPU', route.cpu ? '1' : '0');
@@ -112,7 +110,7 @@ export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRout
   push('META:ENABLE_VFS_NODES', route.vfsNodes ? '1' : '0');
   push('META:ENABLE_MOUNT_NS', anyVfs && route.mountNs ? '1' : '0');
   push('META:ENABLE_PROBE', route.probe ? '1' : '0');
-  push('META:FORCE_SPOOF_SDK', route.sdkSpoof ? '1' : '0');
+  push('META:FORCE_SPOOF_SDK', route.build && route.sdkSpoof ? '1' : '0');
   if ((route.build || route.gl) && effectiveFps >= 90) {
     push('META:REFRESH_RATE', effectiveFps);
   }
@@ -166,38 +164,36 @@ export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRout
     const host = tpl.BUILD_HOST || 'pangu-build-component-system';
     const user = tpl.BUILD_USER || 'builder';
 
-    if (route.build) {
-      push('BUILD:MODEL', tpl.MODEL);
-      push('BUILD:BRAND', tpl.BRAND);
-      push('BUILD:MANUFACTURER', tpl.MANUFACTURER || tpl.BRAND);
-      push('BUILD:DEVICE', tpl.DEVICE);
-      push('BUILD:PRODUCT', tpl.PRODUCT || tpl.DEVICE);
-      push('BUILD:HARDWARE', tpl.HARDWARE || 'qcom');
-      push('BUILD:BOARD', tpl.BOARD);
-      push('BUILD:BOOTLOADER', tpl.BOOTLOADER || 'unknown');
-      push('BUILD:SOC_MANUFACTURER', tpl.SOC_MANUFACTURER);
-      push('BUILD:SOC_MODEL', tpl.SOC_MODEL);
-      push('BUILD:ID', tpl.BUILD_ID);
-      push('BUILD:DISPLAY', displayId);
-      push('BUILD:HOST', host);
-      push('BUILD:USER', user);
-      push('BUILD:FINGERPRINT', tpl.FINGERPRINT);
-      push('BUILD:SUPPORTED_ABIS', abis);
-      push('BUILD:SUPPORTED_64_BIT_ABIS', 'arm64-v8a');
-      push('BUILD:SUPPORTED_32_BIT_ABIS', 'armeabi-v7a,armeabi');
-      push('BUILD:TAGS', 'release-keys');
-      push('BUILD:TYPE', 'user');
-      push('BUILD:TIME', tpl.BUILD_TIME);
+    push('BUILD:MODEL', tpl.MODEL);
+    push('BUILD:BRAND', tpl.BRAND);
+    push('BUILD:MANUFACTURER', tpl.MANUFACTURER || tpl.BRAND);
+    push('BUILD:DEVICE', tpl.DEVICE);
+    push('BUILD:PRODUCT', tpl.PRODUCT || tpl.DEVICE);
+    push('BUILD:HARDWARE', tpl.HARDWARE || 'qcom');
+    push('BUILD:BOARD', tpl.BOARD);
+    push('BUILD:BOOTLOADER', tpl.BOOTLOADER || 'unknown');
+    push('BUILD:SOC_MANUFACTURER', tpl.SOC_MANUFACTURER);
+    push('BUILD:SOC_MODEL', tpl.SOC_MODEL);
+    push('BUILD:ID', tpl.BUILD_ID);
+    push('BUILD:DISPLAY', displayId);
+    push('BUILD:HOST', host);
+    push('BUILD:USER', user);
+    push('BUILD:FINGERPRINT', tpl.FINGERPRINT);
+    push('BUILD:SUPPORTED_ABIS', abis);
+    push('BUILD:SUPPORTED_64_BIT_ABIS', 'arm64-v8a');
+    push('BUILD:SUPPORTED_32_BIT_ABIS', 'armeabi-v7a,armeabi');
+    push('BUILD:TAGS', 'release-keys');
+    push('BUILD:TYPE', 'user');
+    push('BUILD:TIME', tpl.BUILD_TIME);
 
-      push('VERSION:INCREMENTAL', incremental);
-      push('VERSION:SECURITY_PATCH', tpl.SECURITY_PATCH);
-      if (route.sdkSpoof) {
-        push('VERSION:CODENAME', 'REL');
-        push('VERSION:PREVIEW_SDK_INT', '0');
-        push('VERSION:RELEASE', tpl.RELEASE);
-        push('VERSION:SDK_INT', tpl.SDK_INT);
-        push('VERSION:DEVICE_INITIAL_SDK_INT', tpl.SDK_INT);
-      }
+    push('VERSION:INCREMENTAL', incremental);
+    push('VERSION:SECURITY_PATCH', tpl.SECURITY_PATCH);
+    if (route.sdkSpoof) {
+      push('VERSION:CODENAME', 'REL');
+      push('VERSION:PREVIEW_SDK_INT', '0');
+      push('VERSION:RELEASE', tpl.RELEASE);
+      push('VERSION:SDK_INT', tpl.SDK_INT);
+      push('VERSION:DEVICE_INITIAL_SDK_INT', tpl.SDK_INT);
     }
 
     for (const part of ['', 'system.', 'vendor.', 'odm.', 'product.', 'system_ext.']) {

@@ -57,9 +57,10 @@
   100% { transform: translate3d(20px, -18px, 0) scale(0.95); }
 }
 
-/* 倒角折射液态玻璃卡片 */
+/* 倒角折射液态玻璃卡片：锁定 flex-shrink: 0 彻底杜绝纵向 Flex 滚动容器内的挤压裁切 */
 .liquid-glass {
   position: relative;
+  flex-shrink: 0;
   background: var(--glass-bg);
   backdrop-filter: url(#mirage-card-lens) blur(16px) saturate(185%);
   -webkit-backdrop-filter: url(#mirage-card-lens) blur(16px) saturate(185%);
