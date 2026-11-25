@@ -9,9 +9,9 @@ import { ref, computed, onMounted } from 'vue';
 import { Home, Cpu, Layers, Settings, ArrowLeft } from 'lucide-vue-next';
 
 import HomeView from './views/HomeView.vue';
+import TemplatesView from './views/TemplatesView.vue';
+import AppsView from './views/AppsView.vue';
 import SettingsView from './views/SettingsView.vue';
-import TemplateForgeView from './components/TemplateForgeView.vue';
-import AppMatrixView from './components/AppMatrixView.vue';
 import ProbeRadarView from './components/ProbeRadarView.vue';
 import BottomNavBar, { type NavBarItem } from './components/BottomNavBar.vue';
 import OtaChangelogModal from './components/OtaChangelogModal.vue';
@@ -28,7 +28,6 @@ import {
   reloadAppList,
   refreshAllProbeData,
   fetchHostDeviceInfo,
-  type DeviceTemplate,
 } from './store/mirageStore';
 
 type TabKey = 'home' | 'templates' | 'apps' | 'settings';
@@ -42,7 +41,6 @@ const slideTransitionName = ref<'slide-left' | 'slide-right'>('slide-left');
 const subPage = ref<SubPageKey>(null);
 const showChangelogModal = ref(false);
 const otaAutoStart = ref(false);
-const pendingIncomingTemplate = ref<DeviceTemplate | null>(null);
 
 const activeTabIndex = computed(() => tabOrder.indexOf(currentTab.value));
 
@@ -114,10 +112,10 @@ onMounted(async () => {
       <div class="aurora-blob blob-3"></div>
     </div>
 
-    <!-- 2. 主内容视图区（支持次级全屏页 + 4 主页水平滑动切换） -->
+    <!-- 2. 主内容视图区（次级全屏页 + 4 主页方向性水平滑动） -->
     <main class="viewport-stage">
       <Transition name="page-push" mode="out-in">
-        <!-- 次级全屏页 A：独立 OTA 更新页 -->
+        <!-- 次级全屏页 A：独立 OTA 在线更新页 -->
         <OtaUpdateView
           v-if="subPage === 'ota'"
           key="sub-ota"
@@ -125,7 +123,7 @@ onMounted(async () => {
           @back="leaveSubPage"
         />
 
-        <!-- 次级全屏页 B：独立幻境探针与崩溃日志页 -->
+        <!-- 次级全屏页 B：独立幻境探针与崩溃捕获页 -->
         <section v-else-if="subPage === 'probe'" key="sub-probe" class="subpage-wrap">
           <div class="subpage-topbar liquid-glass" v-touch-glass>
             <button class="btn-liquid-ghost tactile-press" @click="leaveSubPage">
@@ -137,7 +135,7 @@ onMounted(async () => {
           <ProbeRadarView />
         </section>
 
-        <!-- 主导航 4 页签（方向性左滑 / 右滑过渡） -->
+        <!-- 4 主页签（方向性左滑 / 右滑过渡） -->
         <div v-else key="main-tabs" class="tabs-stage">
           <Transition :name="slideTransitionName" mode="out-in">
             <HomeView
@@ -148,22 +146,16 @@ onMounted(async () => {
               @check-update="handleCheckOrOpenUpdate"
             />
 
-            <div v-else-if="currentTab === 'templates'" key="tab-templates">
-              <div class="page-large-header">
-                <h1 class="page-large-title">{{ t('nav.templates') }}</h1>
-              </div>
-              <TemplateForgeView
-                :incoming-template="pendingIncomingTemplate"
-                @clear-incoming="pendingIncomingTemplate = null"
-              />
-            </div>
+            <TemplatesView
+              v-else-if="currentTab === 'templates'"
+              key="tab-templates"
+              @jump-to-apps="switchTabByKey('apps')"
+            />
 
-            <div v-else-if="currentTab === 'apps'" key="tab-apps">
-              <div class="page-large-header">
-                <h1 class="page-large-title">{{ t('nav.apps') }}</h1>
-              </div>
-              <AppMatrixView />
-            </div>
+            <AppsView
+              v-else-if="currentTab === 'apps'"
+              key="tab-apps"
+            />
 
             <SettingsView
               v-else
@@ -191,7 +183,7 @@ onMounted(async () => {
       </div>
     </Transition>
 
-    <!-- 5. 底部双态液态玻璃导航栏（悬浮岛 / 贴底栏） -->
+    <!-- 5. 底部双态光学液态玻璃导航栏 -->
     <Transition name="view-morph">
       <BottomNavBar
         v-if="!subPage"
@@ -250,7 +242,7 @@ onMounted(async () => {
   gap: 9px;
   font-size: 13px;
   font-weight: 700;
-  z-index: 200;
+  z-index: 220;
   white-space: nowrap;
 }
 

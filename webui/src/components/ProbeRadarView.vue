@@ -6,7 +6,14 @@ MirageForge: https://github.com/jjh138792/MirageForge
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { RefreshCw, Trash2, PlusCircle, AlertTriangle, Activity } from 'lucide-vue-next';
+import {
+  RefreshCw,
+  Trash2,
+  PlusCircle,
+  AlertTriangle,
+  Activity,
+  FileArchive,
+} from 'lucide-vue-next';
 import { useI18n } from '../i18n';
 import { execRootShell, showToast, triggerHaptic } from '../bridge/ksu-io';
 import {
@@ -14,6 +21,7 @@ import {
   mirageStore,
   refreshAllProbeData,
   captureUnmappedPropViaCli,
+  exportDiagnosticBundleViaCli,
 } from '../store/mirageStore';
 
 const { t } = useI18n();
@@ -26,11 +34,18 @@ async function handleRefresh() {
   await refreshAllProbeData(filterQuery.value, unmappedOnly.value);
 }
 
+async function handleClearCrashesOnly() {
+  triggerHaptic('medium');
+  await execRootShell(`"${CLI_BIN}" probe clear-crashes`);
+  await handleRefresh();
+  showToast('已仅清空崩溃日志');
+}
+
 async function handleClearProbe() {
   triggerHaptic('medium');
   await execRootShell(`"${CLI_BIN}" probe clear`);
   await handleRefresh();
-  showToast('已清空探针与崩溃日志');
+  showToast('已清空全部探针与崩溃日志');
 }
 
 async function handleClearTelemetry() {
@@ -64,13 +79,29 @@ onMounted(() => {
 
 <template>
   <section class="probe-stage">
-    <!-- 1. Native 崩溃信号现场诊断卡片 -->
+    <!-- 顶部一键导出排障诊断包条 -->
+    <div class="diag-banner liquid-glass" v-touch-glass>
+      <div class="diag-copy">
+        <div class="diag-title">一键排障诊断包</div>
+        <div class="diag-sub">打包设备环境、路由配置、近期探针与崩溃堆栈至 Download 目录</div>
+      </div>
+      <button class="btn-liquid tactile-press" @click="exportDiagnosticBundleViaCli()">
+        <FileArchive :size="14" />
+        <span>导出</span>
+      </button>
+    </div>
+
+    <!-- 1. Native 崩溃信号现场诊断卡片（新增独立清空崩溃按钮） -->
     <div class="probe-card crash-border liquid-glass" v-touch-glass>
       <div class="card-head">
         <div class="head-title">
           <AlertTriangle :size="16" class="text-danger" />
           <h2>{{ t('probe.crashTitle') }}</h2>
         </div>
+        <button class="btn-liquid-danger tactile-press" @click="handleClearCrashesOnly">
+          <Trash2 :size="13" />
+          <span>清空崩溃</span>
+        </button>
       </div>
 
       <div v-if="mirageStore.crashEvents.length === 0" class="empty-box">
@@ -158,7 +189,7 @@ onMounted(() => {
       </div>
 
       <div v-if="mirageStore.probeEvents.length === 0" class="empty-box">
-        暂无匹配的探针记录。请先在「分流矩阵」中为目标应用开启 [📡 探针与调用栈] 并运行应用。
+        暂无匹配的探针记录。请先在「应用」编辑页的「高阶选项」中开启「探针与调用栈（trace）」并运行应用。
       </div>
       <div v-else class="event-scroll">
         <div v-for="(ev, idx) in mirageStore.probeEvents" :key="idx" class="event-item">
@@ -209,7 +240,26 @@ onMounted(() => {
 .probe-stage {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 13px;
+}
+
+.diag-banner {
+  padding: 13px 15px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.diag-title {
+  font-size: 13.5px;
+  font-weight: 800;
+}
+
+.diag-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 2px;
 }
 
 .probe-card {
@@ -224,6 +274,7 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   margin-bottom: 10px;
 }
 
@@ -234,7 +285,7 @@ onMounted(() => {
 }
 
 .card-head h2 {
-  font-size: 15px;
+  font-size: 14.5px;
   font-weight: 800;
 }
 
@@ -310,7 +361,7 @@ onMounted(() => {
   border-radius: 6px;
   font-size: 10px;
   font-weight: 800;
-  background: rgba(139, 92, 246, 0.22);
+  background: rgba(var(--accent-primary-rgb), 0.22);
   color: var(--accent-primary);
 }
 
@@ -365,7 +416,7 @@ onMounted(() => {
 .stack-box {
   font-size: 10.5px;
   color: var(--accent-secondary);
-  background: rgba(6, 182, 212, 0.09);
+  background: rgba(var(--accent-secondary-rgb), 0.09);
   border-left: 2.5px solid var(--accent-secondary);
   padding: 5px 9px;
   border-radius: 0 8px 8px 0;
@@ -409,7 +460,7 @@ onMounted(() => {
   align-items: center;
   justify-content: center;
   padding: 16px;
-  z-index: 160;
+  z-index: 190;
 }
 
 .capture-dialog {
