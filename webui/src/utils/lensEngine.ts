@@ -14,7 +14,7 @@ function clampByte(v: number): number {
 
 /**
  * 物理 Snell 折射曲线：
- * - 中心平坦区 (distFromEdge >= bezelPx)：严格返回 0 (R=128, G=128)，清晰端正无畸变
+ * - 中心平坦区 (distFromEdge >= bezelPx)：严格返回 0 (R=128, G=128)，清晰无畸变
  * - 边缘弧壁区 (distFromEdge < bezelPx)：沿真实外法线陡峭递增，使底层内容顺着玻璃圆弧弯曲拉伸
  */
 function snellBezelDisplacement(distFromEdge: number, bezelPx: number, ior = 1.54): number {
@@ -35,9 +35,6 @@ function snellBezelDisplacement(distFromEdge: number, bezelPx: number, ior = 1.5
   return mag;
 }
 
-/**
- * 精确像素级圆角矩形 SDF 法线贴图生成器
- */
 function buildPixelRoundedRectSdfMap(
   cssW: number,
   cssH: number,
@@ -181,13 +178,14 @@ export function initOpticalLensEngine() {
 }
 
 export function setRefractionIntensity(level: RefractionLevel) {
-  refractionMultiplier = level === 'off' ? 0 : level === 'vivid' ? 1.35 : 1.0;
+  refractionMultiplier = level === 'off' ? 0 : level === 'vivid' ? 1.32 : 1.0;
 
   const dockDisp = document.getElementById('mirage-dock-disp');
   if (dockDisp) {
     dockDisp.setAttribute('scale', (24 * refractionMultiplier).toFixed(1));
   }
-  setOrbRefractionScale(28);
+  // 静止初态：standard=0（柔和清澈），vivid=20（常驻晶莹液滴），off=0（纯毛玻璃）
+  setOrbRefractionScale(level === 'vivid' ? 20 : 0);
 }
 
 export function setOrbRefractionScale(baseScale: number) {

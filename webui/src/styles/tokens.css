@@ -64,41 +64,35 @@
   --glass-bg: rgba(16, 23, 40, 0.56);
   --glass-bg-elevated: rgba(20, 28, 46, 0.72);
 
-  /* 清澈通透的玻璃底栏：透出下方页面并在边缘弧面拉伸折射 */
-  --dock-surface-bg: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.12) 0%,
-    rgba(16, 23, 40, 0.28) 55%,
-    rgba(255, 255, 255, 0.08) 100%
-  );
+  /* 清澈通透的液态玻璃底栏基底 */
+  --dock-surface-bg: rgba(18, 25, 42, 0.36);
+  --dock-surface-blur-bg: rgba(20, 28, 46, 0.72);
   --dock-rim:
-    inset 0 1px 1.5px rgba(255, 255, 255, 0.36),
-    inset 0 -1px 2px rgba(255, 255, 255, 0.10),
-    0 12px 30px -8px rgba(0, 0, 0, 0.50);
+    inset 0 1px 1.2px rgba(255, 255, 255, 0.30),
+    inset 0 -1px 1.5px rgba(255, 255, 255, 0.08),
+    0 12px 30px -8px rgba(0, 0, 0, 0.48);
 
   --glass-border: rgba(255, 255, 255, 0.14);
   --glass-rim-top: rgba(255, 255, 255, 0.36);
   --glass-rim-bottom: rgba(var(--accent-secondary-rgb), 0.18);
   --glass-shadow: 0 14px 34px -8px rgba(0, 0, 0, 0.55);
 
-  /* 静止态药丸 */
-  --orb-idle-bg: rgba(255, 255, 255, 0.13);
-  --orb-idle-border: rgba(255, 255, 255, 0.14);
-  --orb-idle-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  /* 液态玻璃静止底色（克制柔和，与晶莹态明暗连贯无跳变） */
+  --orb-idle-bg: rgba(255, 255, 255, 0.095);
+  --orb-idle-border: rgba(255, 255, 255, 0.12);
 
-  /* 交互液滴态：晶莹通透的水晶球，绝不发黑 */
-  --orb-liquid-bg: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.22) 0%,
-    rgba(255, 255, 255, 0.03) 48%,
-    rgba(255, 255, 255, 0.14) 100%
-  );
-  --orb-liquid-rim:
-    inset 0 1.4px 2px rgba(255, 255, 255, 0.72),
-    inset 0 -1.2px 2px rgba(255, 255, 255, 0.24),
-    inset 1.2px 0 2px rgba(147, 197, 253, 0.30),
-    inset -1.2px 0 2px rgba(196, 181, 253, 0.30),
-    0 10px 26px -6px rgba(0, 0, 0, 0.48);
+  /* 液态玻璃晶莹态（纯透明玻璃本体 + 细腻光学描边，绝不提亮发白） */
+  --orb-crystal-bg: rgba(255, 255, 255, 0.03);
+  --orb-crystal-rim:
+    inset 0 1.2px 1.8px rgba(255, 255, 255, 0.62),
+    inset 0 -1.2px 1.8px rgba(255, 255, 255, 0.18),
+    inset 1px 0 1.8px rgba(147, 197, 253, 0.24),
+    inset -1px 0 1.8px rgba(196, 181, 253, 0.24),
+    0 8px 22px -6px rgba(0, 0, 0, 0.45);
+
+  /* 仅毛玻璃模式下的统一滑块样式（静止/滑动完全一致） */
+  --orb-blur-bg: rgba(255, 255, 255, 0.13);
+  --orb-blur-border: rgba(255, 255, 255, 0.14);
 
   --input-bg: rgba(6, 10, 20, 0.58);
   --subcard-bg: rgba(255, 255, 255, 0.045);
@@ -118,16 +112,12 @@
   --glass-bg: rgba(255, 255, 255, 0.66);
   --glass-bg-elevated: rgba(255, 255, 255, 0.80);
 
-  /* 晶莹通透的纯白液态玻璃底栏：清晰透出下方内容并在边缘产生玻璃拉伸 */
-  --dock-surface-bg: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.48) 0%,
-    rgba(255, 255, 255, 0.22) 55%,
-    rgba(255, 255, 255, 0.38) 100%
-  );
+  /* 清澈通透的浅色玻璃底栏基底 */
+  --dock-surface-bg: rgba(255, 255, 255, 0.34);
+  --dock-surface-blur-bg: rgba(255, 255, 255, 0.78);
   --dock-rim:
-    inset 0 1.4px 2px rgba(255, 255, 255, 0.96),
-    inset 0 -1px 2px rgba(15, 23, 42, 0.05),
+    inset 0 1.2px 1.6px rgba(255, 255, 255, 0.92),
+    inset 0 -1px 1.5px rgba(15, 23, 42, 0.05),
     0 10px 26px -8px rgba(15, 23, 42, 0.14);
 
   --glass-border: rgba(255, 255, 255, 0.85);
@@ -136,24 +126,22 @@
   --glass-shadow: 0 12px 28px -8px rgba(15, 23, 42, 0.10),
                   0 4px 10px -2px rgba(15, 23, 42, 0.05);
 
-  /* 静止态温润浅灰药丸 */
-  --orb-idle-bg: rgba(15, 23, 42, 0.08);
+  /* 液态玻璃静止底色（极柔和浅雾，退清成晶莹态时无明暗突变） */
+  --orb-idle-bg: rgba(15, 23, 42, 0.055);
   --orb-idle-border: rgba(15, 23, 42, 0.04);
-  --orb-idle-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
 
-  /* 交互液滴态：高透晶莹水滴，明亮清澈 */
-  --orb-liquid-bg: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.40) 0%,
-    rgba(255, 255, 255, 0.04) 50%,
-    rgba(255, 255, 255, 0.24) 100%
-  );
-  --orb-liquid-rim:
-    inset 0 1.6px 2.2px rgba(255, 255, 255, 0.98),
-    inset 0 -1.4px 2.2px rgba(255, 255, 255, 0.72),
-    inset 1.4px 0 2.4px rgba(59, 130, 246, 0.18),
-    inset -1.4px 0 2.4px rgba(139, 92, 246, 0.16),
-    0 8px 22px -6px rgba(15, 23, 42, 0.15);
+  /* 液态玻璃晶莹态（纯透明水晶本体，只显现清晰玻璃折光轮廓，绝不闪白） */
+  --orb-crystal-bg: rgba(255, 255, 255, 0.04);
+  --orb-crystal-rim:
+    inset 0 1.4px 2px rgba(255, 255, 255, 0.95),
+    inset 0 -1.2px 1.8px rgba(15, 23, 42, 0.06),
+    inset 1.2px 0 2px rgba(59, 130, 246, 0.16),
+    inset -1.2px 0 2px rgba(139, 92, 246, 0.15),
+    0 8px 20px -6px rgba(15, 23, 42, 0.14);
+
+  /* 仅毛玻璃模式下的统一滑块样式（静止/滑动完全一致） */
+  --orb-blur-bg: rgba(15, 23, 42, 0.08);
+  --orb-blur-border: rgba(15, 23, 42, 0.05);
 
   --input-bg: rgba(255, 255, 255, 0.78);
   --subcard-bg: rgba(15, 23, 42, 0.042);

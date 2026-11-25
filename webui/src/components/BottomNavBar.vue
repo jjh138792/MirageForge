@@ -34,29 +34,30 @@ const emit = defineEmits<{
 
 const dockRef = ref<HTMLElement | null>(null);
 const orbRef = ref<HTMLElement | null>(null);
+
+const isBlurOnly = computed(() => settingsStore.refractionLevel === 'off');
+const restingLiquidLevel = computed(() =>
+  settingsStore.refractionLevel === 'vivid' ? 0.85 : 0
+);
+
 const orbX = ref(props.activeIndex);
 const orbScaleX = ref(1);
 const orbScaleY = ref(1);
+// 0 = 柔和静止态，1 = 晶莹剔透液滴态；由弹簧连续插值，杜绝任何突兀明暗跳变
+const liquidFactor = ref(restingLiquidLevel.value);
+
 const isOrbPressed = ref(false);
 const isOrbDragging = ref(false);
-const isOrbMoving = ref(false);
 
 const springX = new SpringSolver(props.activeIndex, 260, 22);
-const springScale = new SpringSolver(1, 340, 20);
+const springScale = new SpringSolver(1, 300, 22);
+const springLiquid = new SpringSolver(restingLiquidLevel.value, 180, 24);
 
 let rafId = 0;
 let lastFrameTime = performance.now();
 let longPressTimer: any = null;
 let pointerStartX = 0;
 let resizeObserver: ResizeObserver | null = null;
-
-const isLiquidLensActive = computed(
-  () =>
-    isOrbPressed.value ||
-    isOrbDragging.value ||
-    isOrbMoving.value ||
-    settingsStore.refractionLevel === 'vivid'
-);
 
 function syncLensGeometries() {
   if (dockRef.value) {
@@ -78,38 +79,54 @@ function syncLensGeometries() {
 function startPhysicsLoop() {
   if (rafId) return;
   lastFrameTime = performance.now();
-  isOrbMoving.value = true;
 
   const tick = (now: number) => {
     const dt = (now - lastFrameTime) / 1000;
     lastFrameTime = now;
 
     const curX = springX.step(dt);
-    const baseScale = springScale.step(dt);
     const vx = springX.vel;
-
-    const speedStretch = Math.min(0.24, Math.abs(vx) * 0.042);
-    const speedSquash = Math.min(0.11, Math.abs(vx) * 0.018);
-
     orbX.value = curX;
+
+    if (isBlurOnly.value) {
+      // 「仅毛玻璃」模式：严格锁死无膨胀、无拉伸形变、无静态/活动态差异
+      orbScaleX.value = 1;
+      orbScaleY.value = 1;
+      liquidFactor.value = 0;
+      setOrbRefractionScale(0);
+
+      if (!springX.isSettled()) {
+        rafId = requestAnimationFrame(tick);
+      } else {
+        rafId = 0;
+      }
+      return;
+    }
+
+    const baseScale = springScale.step(dt);
+    const liq = Math.max(0, Math.min(1, springLiquid.step(dt)));
+
+    const speedStretch = Math.min(0.22, Math.abs(vx) * 0.038);
+    const speedSquash = Math.min(0.10, Math.abs(vx) * 0.016);
+
     orbScaleX.value = baseScale + speedStretch;
     orbScaleY.value = baseScale - speedSquash;
+    liquidFactor.value = liq;
 
-    const activeBoost =
-      isOrbPressed.value || isOrbDragging.value ? 1 : Math.min(1, Math.abs(vx) * 0.5);
-    const baseRefraction = settingsStore.refractionLevel === 'vivid' ? 24 : 0;
-    const dynamicScale = Math.max(
-      baseRefraction,
-      (28 + Math.min(10, Math.abs(vx) * 2.2 + (baseScale - 1) * 32)) * activeBoost
-    );
-    setOrbRefractionScale(dynamicScale);
+    // 连续平滑调节 SVG Snell 折射强度：静止(0) <-> 晶莹液滴(26+速度微调)，零帧跳变
+    const velocityBoost = Math.min(8, Math.abs(vx) * 1.8);
+    setOrbRefractionScale(liq * 26 + velocityBoost * liq);
 
-    if (!springX.isSettled() || !springScale.isSettled() || isOrbPressed.value) {
+    if (
+      !springX.isSettled() ||
+      !springScale.isSettled() ||
+      !springLiquid.isSettled() ||
+      isOrbPressed.value
+    ) {
       rafId = requestAnimationFrame(tick);
     } else {
       rafId = 0;
-      isOrbMoving.value = false;
-      setOrbRefractionScale(settingsStore.refractionLevel === 'vivid' ? 24 : 0);
+      setOrbRefractionScale(restingLiquidLevel.value * 26);
     }
   };
 
@@ -129,6 +146,27 @@ watch(
 );
 
 watch(
+  () => settingsStore.refractionLevel,
+  () => {
+    if (isBlurOnly.value) {
+      springScale.pos = 1;
+      springScale.target = 1;
+      springScale.vel = 0;
+      springLiquid.pos = 0;
+      springLiquid.target = 0;
+      springLiquid.vel = 0;
+      orbScaleX.value = 1;
+      orbScaleY.value = 1;
+      liquidFactor.value = 0;
+      setOrbRefractionScale(0);
+    } else {
+      springLiquid.target = restingLiquidLevel.value;
+      startPhysicsLoop();
+    }
+  }
+);
+
+watch(
   () => props.dockStyle,
   () => {
     setTimeout(() => syncLensGeometries(), 380);
@@ -138,11 +176,17 @@ watch(
 function onDockPointerDown(e: PointerEvent) {
   if (!dockRef.value) return;
   (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-  syncLensGeometries();
 
   isOrbPressed.value = true;
   isOrbDragging.value = false;
   pointerStartX = e.clientX;
+
+  if (isBlurOnly.value) {
+    // 仅毛玻璃模式下按下不做液滴膨胀或材质变亮
+    return;
+  }
+
+  syncLensGeometries();
 
   const count = props.items.length;
   const rect = dockRef.value.getBoundingClientRect();
@@ -150,18 +194,22 @@ function onDockPointerDown(e: PointerEvent) {
   const slotW = (rect.width - pad * 2) / count;
   const clickIdx = Math.max(0, Math.min(count - 1, (e.clientX - rect.left - pad) / slotW - 0.5));
 
-  springScale.target = 1.12;
+  // 轻触即丝滑过渡到晶莹剔透态（无明暗闪烁）
+  springLiquid.stiffness = 210;
+  springLiquid.damping = 24;
+  springLiquid.target = 1;
+  springScale.target = 1.09;
   startPhysicsLoop();
 
   if (longPressTimer) clearTimeout(longPressTimer);
   longPressTimer = setTimeout(() => {
-    if (isOrbPressed.value) {
+    if (isOrbPressed.value && !isBlurOnly.value) {
       triggerHaptic('medium');
-      springScale.target = 1.24;
+      springScale.target = 1.22;
       springX.target = clickIdx;
       startPhysicsLoop();
     }
-  }, 130);
+  }, 135);
 }
 
 function onDockPointerMove(e: PointerEvent) {
@@ -170,7 +218,10 @@ function onDockPointerMove(e: PointerEvent) {
   const deltaX = e.clientX - pointerStartX;
   if (Math.abs(deltaX) > 5 && !isOrbDragging.value) {
     isOrbDragging.value = true;
-    springScale.target = 1.22;
+    if (!isBlurOnly.value) {
+      springLiquid.target = 1;
+      springScale.target = 1.20;
+    }
   }
 
   if (isOrbDragging.value) {
@@ -196,7 +247,6 @@ function onDockPointerUp(e: PointerEvent) {
   if (longPressTimer) clearTimeout(longPressTimer);
 
   isOrbPressed.value = false;
-  springScale.target = 1.0;
 
   const count = props.items.length;
   const rect = dockRef.value.getBoundingClientRect();
@@ -209,6 +259,15 @@ function onDockPointerUp(e: PointerEvent) {
   springX.stiffness = isOrbDragging.value ? 300 : 250;
   springX.damping = isOrbDragging.value ? 23 : 21;
   springX.target = releaseIdx;
+
+  if (!isBlurOnly.value) {
+    springScale.target = 1.0;
+    // 松手后使用更柔和的阻尼慢慢溶回静止态，绝不突兀回弹闪烁
+    springLiquid.stiffness = 135;
+    springLiquid.damping = 22;
+    springLiquid.target = restingLiquidLevel.value;
+  }
+
   startPhysicsLoop();
 
   if (releaseIdx !== props.activeIndex) {
@@ -236,7 +295,6 @@ onUnmounted(() => {
 
 <template>
   <nav class="nav-dock-wrap" :class="dockStyle">
-    <!-- 父容器绝不加 backdrop-filter，避免阻断子元素液滴泡的底层穿透 -->
     <div
       ref="dockRef"
       class="nav-dock-bar"
@@ -247,7 +305,7 @@ onUnmounted(() => {
       @pointerup="onDockPointerUp"
       @pointercancel="onDockPointerUp"
     >
-      <!-- Layer 0: 独立兄弟玻璃底座（透视页面并在边缘拉伸折射） -->
+      <!-- Layer 0: 独立兄弟玻璃底座 -->
       <div class="dock-glass-layer liquid-dock-glass" :class="dockStyle"></div>
 
       <!-- Layer 1: 图标与文字 -->
@@ -261,16 +319,28 @@ onUnmounted(() => {
         <span class="dock-label">{{ item.label }}</span>
       </div>
 
-      <!-- Layer 2: 晶莹高透液滴滑块泡（无损穿透页面 + 底座 + 图标） -->
+      <!-- Layer 2: 滑块泡（液态模式下双层等明度无缝溶变；仅毛玻璃模式下单一纯净磨砂药丸） -->
       <div
         ref="orbRef"
         class="dock-liquid-orb liquid-orb-pill"
-        :class="{ 'orb-liquid-active': isLiquidLensActive }"
         :style="{
           width: `calc((100% - 12px) / ${items.length})`,
           transform: `translate3d(${orbX * 100}%, 0, 0) scale(${orbScaleX}, ${orbScaleY})`,
         }"
-      ></div>
+      >
+        <template v-if="!isBlurOnly">
+          <!-- 静止柔和层：随 liquidFactor 平滑淡出至完全透明 -->
+          <div
+            class="orb-layer orb-idle-layer"
+            :style="{ opacity: Math.max(0, 1 - liquidFactor) }"
+          ></div>
+          <!-- 晶莹水晶边缘折光层：随 liquidFactor 平滑淡入，不改变整体明暗 -->
+          <div
+            class="orb-layer orb-crystal-layer"
+            :style="{ opacity: liquidFactor }"
+          ></div>
+        </template>
+      </div>
     </div>
   </nav>
 </template>
@@ -379,5 +449,23 @@ onUnmounted(() => {
 
 .nav-dock-bar.docked .dock-liquid-orb {
   bottom: calc(var(--inset-bottom) + 5px);
+}
+
+.orb-layer {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.orb-idle-layer {
+  background: var(--orb-idle-bg);
+  border: 1px solid var(--orb-idle-border);
+}
+
+.orb-crystal-layer {
+  background: var(--orb-crystal-bg);
+  border: 1px solid var(--glass-rim-top);
+  box-shadow: var(--orb-crystal-rim);
 }
 </style>
