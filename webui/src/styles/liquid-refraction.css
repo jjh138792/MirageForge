@@ -100,39 +100,42 @@
 }
 
 /* ==========================================================================
-   1. 整条底栏独立玻璃层：液态模式下透视边缘拉伸；仅毛玻璃模式下纯磨砂
+   1. 整条底栏玻璃层：
+   - 液态玻璃模式：极低模糊 + #mirage-dock-lens 全域拉伸背后所有内容
+   - 仅毛玻璃模式：标准通透磨砂虚化（无任何扭曲拉伸）
    ========================================================================== */
 .liquid-dock-glass {
   background: var(--dock-surface-bg);
   border: 1px solid var(--glass-border);
   box-shadow: var(--dock-rim);
-  backdrop-filter: url(#mirage-dock-lens) blur(0.6px) saturate(145%);
-  -webkit-backdrop-filter: url(#mirage-dock-lens) blur(0.6px) saturate(145%);
+  backdrop-filter: url(#mirage-dock-lens) blur(0.4px) saturate(140%);
+  -webkit-backdrop-filter: url(#mirage-dock-lens) blur(0.4px) saturate(140%);
 }
 
 :root[data-refraction="off"] .liquid-dock-glass {
   background: var(--dock-surface-blur-bg);
-  backdrop-filter: blur(24px) saturate(175%);
-  -webkit-backdrop-filter: blur(24px) saturate(175%);
+  backdrop-filter: blur(22px) saturate(180%);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
 }
 
 /* ==========================================================================
-   2. 液态玻璃滑块泡：
-   - 液态模式下始终挂载 #mirage-orb-lens，通过弹簧连续控制 scale (0 <-> 28) 与
-     双层等明度透明溶变（绝无硬切、绝无突然变亮闪白）
-   - 仅毛玻璃模式下彻底关闭 SVG 滤镜，保持统一纯净的磨砂药丸，无静态/活动态差异
+   2. 滑块泡：
+   - 液态玻璃模式：常驻等明度晶莹水晶质感 + #mirage-orb-lens（静止全域拉伸 <-> 交互仅拉边缘）
+   - 仅毛玻璃模式：标准真磨砂玻璃药丸（位于图标下层，静止与滑动完全一致）
    ========================================================================== */
 .liquid-orb-pill {
-  background: transparent;
+  background: var(--orb-crystal-bg);
+  border: 1px solid var(--glass-rim-top);
+  box-shadow: var(--orb-crystal-rim);
   backdrop-filter: url(#mirage-orb-lens);
   -webkit-backdrop-filter: url(#mirage-orb-lens);
   will-change: transform;
 }
 
 :root[data-refraction="off"] .liquid-orb-pill {
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
   background: var(--orb-blur-bg);
   border: 1px solid var(--orb-blur-border);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  box-shadow: var(--orb-blur-shadow);
+  backdrop-filter: blur(14px) saturate(185%);
+  -webkit-backdrop-filter: blur(14px) saturate(185%);
 }

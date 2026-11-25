@@ -64,9 +64,10 @@
   --glass-bg: rgba(16, 23, 40, 0.56);
   --glass-bg-elevated: rgba(20, 28, 46, 0.72);
 
-  /* 清澈通透的液态玻璃底栏基底 */
-  --dock-surface-bg: rgba(18, 25, 42, 0.36);
-  --dock-surface-blur-bg: rgba(20, 28, 46, 0.72);
+  /* 液态玻璃底栏（极透水晶底，清楚透出并全域拉伸背后内容） */
+  --dock-surface-bg: rgba(16, 23, 40, 0.24);
+  /* 仅毛玻璃模式底栏（标准半透磨砂，清晰可见背后色彩虚化） */
+  --dock-surface-blur-bg: rgba(18, 26, 44, 0.50);
   --dock-rim:
     inset 0 1px 1.2px rgba(255, 255, 255, 0.30),
     inset 0 -1px 1.5px rgba(255, 255, 255, 0.08),
@@ -77,22 +78,21 @@
   --glass-rim-bottom: rgba(var(--accent-secondary-rgb), 0.18);
   --glass-shadow: 0 14px 34px -8px rgba(0, 0, 0, 0.55);
 
-  /* 液态玻璃静止底色（克制柔和，与晶莹态明暗连贯无跳变） */
-  --orb-idle-bg: rgba(255, 255, 255, 0.095);
-  --orb-idle-border: rgba(255, 255, 255, 0.12);
-
-  /* 液态玻璃晶莹态（纯透明玻璃本体 + 细腻光学描边，绝不提亮发白） */
-  --orb-crystal-bg: rgba(255, 255, 255, 0.03);
+  /* 液态玻璃泡（静止与交互态等明度晶莹水晶，绝无突兀明暗切换） */
+  --orb-crystal-bg: rgba(255, 255, 255, 0.05);
   --orb-crystal-rim:
-    inset 0 1.2px 1.8px rgba(255, 255, 255, 0.62),
+    inset 0 1.2px 1.8px rgba(255, 255, 255, 0.58),
     inset 0 -1.2px 1.8px rgba(255, 255, 255, 0.18),
-    inset 1px 0 1.8px rgba(147, 197, 253, 0.24),
-    inset -1px 0 1.8px rgba(196, 181, 253, 0.24),
-    0 8px 22px -6px rgba(0, 0, 0, 0.45);
+    inset 1px 0 1.8px rgba(147, 197, 253, 0.22),
+    inset -1px 0 1.8px rgba(196, 181, 253, 0.22),
+    0 8px 20px -6px rgba(0, 0, 0, 0.42);
 
-  /* 仅毛玻璃模式下的统一滑块样式（静止/滑动完全一致） */
-  --orb-blur-bg: rgba(255, 255, 255, 0.13);
-  --orb-blur-border: rgba(255, 255, 255, 0.14);
+  /* 仅毛玻璃滑块（真磨砂药丸，位于图标下方，静止与滑动外观完全一致） */
+  --orb-blur-bg: rgba(255, 255, 255, 0.15);
+  --orb-blur-border: rgba(255, 255, 255, 0.20);
+  --orb-blur-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.30),
+    0 4px 12px -2px rgba(0, 0, 0, 0.28);
 
   --input-bg: rgba(6, 10, 20, 0.58);
   --subcard-bg: rgba(255, 255, 255, 0.045);
@@ -112,9 +112,10 @@
   --glass-bg: rgba(255, 255, 255, 0.66);
   --glass-bg-elevated: rgba(255, 255, 255, 0.80);
 
-  /* 清澈通透的浅色玻璃底栏基底 */
-  --dock-surface-bg: rgba(255, 255, 255, 0.34);
-  --dock-surface-blur-bg: rgba(255, 255, 255, 0.78);
+  /* 液态玻璃底栏（极透水晶底，清楚透出并全域拉伸背后内容） */
+  --dock-surface-bg: rgba(255, 255, 255, 0.24);
+  /* 仅毛玻璃模式底栏（通透磨砂，清晰可见背后色彩与卡片柔和虚化） */
+  --dock-surface-blur-bg: rgba(255, 255, 255, 0.48);
   --dock-rim:
     inset 0 1.2px 1.6px rgba(255, 255, 255, 0.92),
     inset 0 -1px 1.5px rgba(15, 23, 42, 0.05),
@@ -126,22 +127,21 @@
   --glass-shadow: 0 12px 28px -8px rgba(15, 23, 42, 0.10),
                   0 4px 10px -2px rgba(15, 23, 42, 0.05);
 
-  /* 液态玻璃静止底色（极柔和浅雾，退清成晶莹态时无明暗突变） */
-  --orb-idle-bg: rgba(15, 23, 42, 0.055);
-  --orb-idle-border: rgba(15, 23, 42, 0.04);
-
-  /* 液态玻璃晶莹态（纯透明水晶本体，只显现清晰玻璃折光轮廓，绝不闪白） */
-  --orb-crystal-bg: rgba(255, 255, 255, 0.04);
+  /* 液态玻璃泡（静止与交互态等明度晶莹水晶，绝不发灰也不闪白） */
+  --orb-crystal-bg: rgba(255, 255, 255, 0.06);
   --orb-crystal-rim:
-    inset 0 1.4px 2px rgba(255, 255, 255, 0.95),
+    inset 0 1.4px 2px rgba(255, 255, 255, 0.94),
     inset 0 -1.2px 1.8px rgba(15, 23, 42, 0.06),
     inset 1.2px 0 2px rgba(59, 130, 246, 0.16),
     inset -1.2px 0 2px rgba(139, 92, 246, 0.15),
     0 8px 20px -6px rgba(15, 23, 42, 0.14);
 
-  /* 仅毛玻璃模式下的统一滑块样式（静止/滑动完全一致） */
-  --orb-blur-bg: rgba(15, 23, 42, 0.08);
-  --orb-blur-border: rgba(15, 23, 42, 0.05);
+  /* 仅毛玻璃滑块（真磨砂玻璃药丸，与底栏层次分明） */
+  --orb-blur-bg: rgba(255, 255, 255, 0.56);
+  --orb-blur-border: rgba(255, 255, 255, 0.88);
+  --orb-blur-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.95),
+    0 4px 12px -3px rgba(15, 23, 42, 0.12);
 
   --input-bg: rgba(255, 255, 255, 0.78);
   --subcard-bg: rgba(15, 23, 42, 0.042);

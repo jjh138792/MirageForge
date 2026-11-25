@@ -9,7 +9,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import type { Component } from 'vue';
 import { SpringSolver, triggerHaptic } from '../bridge/ksu-io';
 import {
-  setOrbRefractionScale,
+  setOrbMorphState,
   updateDockLensGeometry,
   updateOrbLensGeometry,
 } from '../utils/lensEngine';
@@ -36,22 +36,18 @@ const dockRef = ref<HTMLElement | null>(null);
 const orbRef = ref<HTMLElement | null>(null);
 
 const isBlurOnly = computed(() => settingsStore.refractionLevel === 'off');
-const restingLiquidLevel = computed(() =>
-  settingsStore.refractionLevel === 'vivid' ? 0.85 : 0
-);
 
 const orbX = ref(props.activeIndex);
 const orbScaleX = ref(1);
 const orbScaleY = ref(1);
-// 0 = 柔和静止态，1 = 晶莹剔透液滴态；由弹簧连续插值，杜绝任何突兀明暗跳变
-const liquidFactor = ref(restingLiquidLevel.value);
 
 const isOrbPressed = ref(false);
 const isOrbDragging = ref(false);
 
 const springX = new SpringSolver(props.activeIndex, 260, 22);
 const springScale = new SpringSolver(1, 300, 22);
-const springLiquid = new SpringSolver(restingLiquidLevel.value, 180, 24);
+// 0 = 静止全域凸面拉伸，1 = 交互仅拉边缘
+const springMorph = new SpringSolver(0, 200, 24);
 
 let rafId = 0;
 let lastFrameTime = performance.now();
@@ -89,11 +85,10 @@ function startPhysicsLoop() {
     orbX.value = curX;
 
     if (isBlurOnly.value) {
-      // 「仅毛玻璃」模式：严格锁死无膨胀、无拉伸形变、无静态/活动态差异
+      // 仅毛玻璃模式：纯平滑水平滑移，无静态/活动态差异
       orbScaleX.value = 1;
       orbScaleY.value = 1;
-      liquidFactor.value = 0;
-      setOrbRefractionScale(0);
+      setOrbMorphState(0, 0);
 
       if (!springX.isSettled()) {
         rafId = requestAnimationFrame(tick);
@@ -104,29 +99,30 @@ function startPhysicsLoop() {
     }
 
     const baseScale = springScale.step(dt);
-    const liq = Math.max(0, Math.min(1, springLiquid.step(dt)));
+    const morphT = Math.max(0, Math.min(1, springMorph.step(dt)));
 
     const speedStretch = Math.min(0.22, Math.abs(vx) * 0.038);
     const speedSquash = Math.min(0.10, Math.abs(vx) * 0.016);
 
     orbScaleX.value = baseScale + speedStretch;
     orbScaleY.value = baseScale - speedSquash;
-    liquidFactor.value = liq;
 
-    // 连续平滑调节 SVG Snell 折射强度：静止(0) <-> 晶莹液滴(26+速度微调)，零帧跳变
-    const velocityBoost = Math.min(8, Math.abs(vx) * 1.8);
-    setOrbRefractionScale(liq * 26 + velocityBoost * liq);
+    // 静止 (morphT=0)：全域凸面拉伸 scale=18；交互 (morphT=1)：仅拉边缘 scale=28+速度微增
+    const idleScale = 18;
+    const rimScale = 28 + Math.min(8, Math.abs(vx) * 1.8);
+    const currentScale = idleScale * (1 - morphT) + rimScale * morphT;
+    setOrbMorphState(morphT, currentScale);
 
     if (
       !springX.isSettled() ||
       !springScale.isSettled() ||
-      !springLiquid.isSettled() ||
+      !springMorph.isSettled() ||
       isOrbPressed.value
     ) {
       rafId = requestAnimationFrame(tick);
     } else {
       rafId = 0;
-      setOrbRefractionScale(restingLiquidLevel.value * 26);
+      setOrbMorphState(0, 18);
     }
   };
 
@@ -152,16 +148,16 @@ watch(
       springScale.pos = 1;
       springScale.target = 1;
       springScale.vel = 0;
-      springLiquid.pos = 0;
-      springLiquid.target = 0;
-      springLiquid.vel = 0;
+      springMorph.pos = 0;
+      springMorph.target = 0;
+      springMorph.vel = 0;
       orbScaleX.value = 1;
       orbScaleY.value = 1;
-      liquidFactor.value = 0;
-      setOrbRefractionScale(0);
+      setOrbMorphState(0, 0);
     } else {
-      springLiquid.target = restingLiquidLevel.value;
-      startPhysicsLoop();
+      syncLensGeometries();
+      springMorph.target = 0;
+      setOrbMorphState(0, 18);
     }
   }
 );
@@ -181,10 +177,7 @@ function onDockPointerDown(e: PointerEvent) {
   isOrbDragging.value = false;
   pointerStartX = e.clientX;
 
-  if (isBlurOnly.value) {
-    // 仅毛玻璃模式下按下不做液滴膨胀或材质变亮
-    return;
-  }
+  if (isBlurOnly.value) return;
 
   syncLensGeometries();
 
@@ -194,11 +187,11 @@ function onDockPointerDown(e: PointerEvent) {
   const slotW = (rect.width - pad * 2) / count;
   const clickIdx = Math.max(0, Math.min(count - 1, (e.clientX - rect.left - pad) / slotW - 0.5));
 
-  // 轻触即丝滑过渡到晶莹剔透态（无明暗闪烁）
-  springLiquid.stiffness = 210;
-  springLiquid.damping = 24;
-  springLiquid.target = 1;
-  springScale.target = 1.09;
+  // 按下交互态：平滑变形为「仅拉边缘」的交互水晶透镜
+  springMorph.stiffness = 220;
+  springMorph.damping = 24;
+  springMorph.target = 1;
+  springScale.target = 1.10;
   startPhysicsLoop();
 
   if (longPressTimer) clearTimeout(longPressTimer);
@@ -219,7 +212,7 @@ function onDockPointerMove(e: PointerEvent) {
   if (Math.abs(deltaX) > 5 && !isOrbDragging.value) {
     isOrbDragging.value = true;
     if (!isBlurOnly.value) {
-      springLiquid.target = 1;
+      springMorph.target = 1;
       springScale.target = 1.20;
     }
   }
@@ -262,10 +255,10 @@ function onDockPointerUp(e: PointerEvent) {
 
   if (!isBlurOnly.value) {
     springScale.target = 1.0;
-    // 松手后使用更柔和的阻尼慢慢溶回静止态，绝不突兀回弹闪烁
-    springLiquid.stiffness = 135;
-    springLiquid.damping = 22;
-    springLiquid.target = restingLiquidLevel.value;
+    // 松手后丝滑溶回「全域拉伸」静止态
+    springMorph.stiffness = 150;
+    springMorph.damping = 22;
+    springMorph.target = 0;
   }
 
   startPhysicsLoop();
@@ -278,7 +271,10 @@ function onDockPointerUp(e: PointerEvent) {
 }
 
 onMounted(() => {
-  requestAnimationFrame(() => syncLensGeometries());
+  requestAnimationFrame(() => {
+    syncLensGeometries();
+    setOrbMorphState(0, isBlurOnly.value ? 0 : 18);
+  });
   if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => syncLensGeometries());
     if (dockRef.value) resizeObserver.observe(dockRef.value);
@@ -298,17 +294,17 @@ onUnmounted(() => {
     <div
       ref="dockRef"
       class="nav-dock-bar"
-      :class="dockStyle"
+      :class="[dockStyle, { 'blur-only': isBlurOnly }]"
       :style="{ gridTemplateColumns: `repeat(${items.length}, 1fr)` }"
       @pointerdown="onDockPointerDown"
       @pointermove="onDockPointerMove"
       @pointerup="onDockPointerUp"
       @pointercancel="onDockPointerUp"
     >
-      <!-- Layer 0: 独立兄弟玻璃底座 -->
+      <!-- Layer 0: 独立底栏玻璃层（液态=全域拉伸透视，毛玻璃=通透磨砂虚化） -->
       <div class="dock-glass-layer liquid-dock-glass" :class="dockStyle"></div>
 
-      <!-- Layer 1: 图标与文字 -->
+      <!-- 图标与文字：液态模式下在泡下方被折射，毛玻璃模式下在磨砂泡上方保持锐利 -->
       <div
         v-for="(item, idx) in items"
         :key="item.key"
@@ -319,7 +315,7 @@ onUnmounted(() => {
         <span class="dock-label">{{ item.label }}</span>
       </div>
 
-      <!-- Layer 2: 滑块泡（液态模式下双层等明度无缝溶变；仅毛玻璃模式下单一纯净磨砂药丸） -->
+      <!-- 滑块泡：液态模式静止全域拉伸 <-> 交互仅拉边缘；毛玻璃模式为统一真磨砂药丸 -->
       <div
         ref="orbRef"
         class="dock-liquid-orb liquid-orb-pill"
@@ -327,20 +323,7 @@ onUnmounted(() => {
           width: `calc((100% - 12px) / ${items.length})`,
           transform: `translate3d(${orbX * 100}%, 0, 0) scale(${orbScaleX}, ${orbScaleY})`,
         }"
-      >
-        <template v-if="!isBlurOnly">
-          <!-- 静止柔和层：随 liquidFactor 平滑淡出至完全透明 -->
-          <div
-            class="orb-layer orb-idle-layer"
-            :style="{ opacity: Math.max(0, 1 - liquidFactor) }"
-          ></div>
-          <!-- 晶莹水晶边缘折光层：随 liquidFactor 平滑淡入，不改变整体明暗 -->
-          <div
-            class="orb-layer orb-crystal-layer"
-            :style="{ opacity: liquidFactor }"
-          ></div>
-        </template>
-      </div>
+      ></div>
     </div>
   </nav>
 </template>
@@ -447,25 +430,16 @@ onUnmounted(() => {
   transform-origin: center center;
 }
 
+/* 仅毛玻璃模式下：磨砂滑块置于图标下方，图标保持清晰锐利且磨砂质感完整可见 */
+.nav-dock-bar.blur-only .dock-liquid-orb {
+  z-index: 1;
+}
+
+.nav-dock-bar.blur-only .dock-slot {
+  z-index: 2;
+}
+
 .nav-dock-bar.docked .dock-liquid-orb {
   bottom: calc(var(--inset-bottom) + 5px);
-}
-
-.orb-layer {
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-}
-
-.orb-idle-layer {
-  background: var(--orb-idle-bg);
-  border: 1px solid var(--orb-idle-border);
-}
-
-.orb-crystal-layer {
-  background: var(--orb-crystal-bg);
-  border: 1px solid var(--glass-rim-top);
-  box-shadow: var(--orb-crystal-rim);
 }
 </style>

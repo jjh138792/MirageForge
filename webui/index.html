@@ -16,12 +16,14 @@ MirageForge: https://github.com/jjh138792/MirageForge
 </head>
 <body>
   <!--
-    纯单通道无损 feDisplacementMap + userSpaceOnUse 1:1 真实 CSS 像素坐标：
-    彻底消除 feBlend 半透明 Alpha 叠加导致的发黑发灰，100% 保留晶莹剔透的光学质感
+    三图双态光学引擎 (userSpaceOnUse 1:1 像素对齐 + 无损单通道折射)：
+    1. #mirage-dock-lens：整条底栏全域曲面拉伸（透视并拉伸背后所有内容）
+    2. #mirage-orb-lens：内置 domeMap（静止全域拉伸）与 rimMap（交互仅拉边缘），
+       通过 feComposite(arithmetic) 随弹簧实时连续插值变形，0 闪烁、0 明暗跳变
   -->
   <svg style="position: fixed; width: 0; height: 0; pointer-events: none; z-index: -999;" aria-hidden="true">
     <defs>
-      <!-- 1. 整条底栏玻璃本体：透视下方页面并在边缘弧面产生拉伸扭曲 -->
+      <!-- 1. 整条底栏全域曲面拉伸滤镜 -->
       <filter
         id="mirage-dock-lens"
         filterUnits="userSpaceOnUse"
@@ -47,13 +49,13 @@ MirageForge: https://github.com/jjh138792/MirageForge
           id="mirage-dock-disp"
           in="SourceGraphic"
           in2="dockMap"
-          scale="24"
+          scale="26"
           xChannelSelector="R"
           yChannelSelector="G"
         />
       </filter>
 
-      <!-- 2. 液滴滑块泡：单通道无损高透折射（中心 0 位移清晰，外圈弧壁强 Snell 弯曲拉伸） -->
+      <!-- 2. 液态玻璃泡双态连续变形滤镜（静止=全域凸面拉伸 <-> 交互=仅拉边缘） -->
       <filter
         id="mirage-orb-lens"
         filterUnits="userSpaceOnUse"
@@ -65,21 +67,49 @@ MirageForge: https://github.com/jjh138792/MirageForge
         color-interpolation-filters="sRGB"
       >
         <feFlood flood-color="rgb(128,128,128)" result="orbNeutral" />
+
+        <!-- 静止态法线图：全域凸面拉伸背后全部内容 -->
         <feImage
-          id="mirage-spherical-map"
+          id="mirage-orb-dome-map"
           x="0"
           y="0"
           width="108"
           height="52"
           preserveAspectRatio="none"
-          result="orbRawMap"
+          result="domeRaw"
         />
-        <feComposite in="orbRawMap" in2="orbNeutral" operator="over" result="lensMap" />
+        <feComposite in="domeRaw" in2="orbNeutral" operator="over" result="domeMap" />
+
+        <!-- 交互态法线图：中心 0 畸变清澈，仅边缘弧壁强力弯曲拉伸 -->
+        <feImage
+          id="mirage-orb-rim-map"
+          x="0"
+          y="0"
+          width="108"
+          height="52"
+          preserveAspectRatio="none"
+          result="rimRaw"
+        />
+        <feComposite in="rimRaw" in2="orbNeutral" operator="over" result="rimMap" />
+
+        <!-- 实时线性插值混合：k2 = 1 - t (静止全域), k3 = t (交互边缘) -->
+        <feComposite
+          id="mirage-orb-morph"
+          in="domeMap"
+          in2="rimMap"
+          operator="arithmetic"
+          k1="0"
+          k2="1"
+          k3="0"
+          k4="0"
+          result="lensMap"
+        />
+
         <feDisplacementMap
           id="mirage-orb-disp"
           in="SourceGraphic"
           in2="lensMap"
-          scale="28"
+          scale="18"
           xChannelSelector="R"
           yChannelSelector="G"
         />
