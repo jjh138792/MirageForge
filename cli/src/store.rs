@@ -15,6 +15,7 @@ pub struct StoreEngine {
     pub meta: ModuleMeta,
     pub templates: BTreeMap<String, DeviceTemplate>,
     pub routes: BTreeMap<String, AppRoute>,
+    pub auto_spoof: AutoSpoofConfig,
 }
 
 impl StoreEngine {
@@ -23,6 +24,7 @@ impl StoreEngine {
             meta: read_module_meta(),
             templates: BTreeMap::new(),
             routes: BTreeMap::new(),
+            auto_spoof: AutoSpoofConfig::default(),
         }
     }
 
@@ -44,6 +46,7 @@ impl StoreEngine {
         self.meta = read_module_meta();
         self.templates.clear();
         self.routes.clear();
+        self.auto_spoof = Self::load_auto_spoof_file();
 
         if let Ok(entries) = fs::read_dir(TPL_DIR) {
             for entry in entries.flatten() {
@@ -75,6 +78,10 @@ impl StoreEngine {
                         self.routes.insert(pkg, r);
                     }
                 }
+                if self.auto_spoof.tpl_id.is_empty() && !parsed.auto_spoof.tpl_id.is_empty() {
+                    self.auto_spoof = parsed.auto_spoof;
+                    self.auto_spoof.normalize();
+                }
             }
         }
 
@@ -88,7 +95,7 @@ impl StoreEngine {
             if parts.len() >= 6 && is_safe_token(parts[0]) && !parts[1].is_empty() {
                 let raw_col7 = parts.get(7).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
                 let legacy_vfs = parts[4] == "1";
-                let (cow_prop, cpu, mem, vfs_nodes) = if parts.len() >= 13 {
+                let (legacy_cow, cpu, mem, vfs_nodes) = if parts.len() >= 13 {
                     (
                         parts[9] == "1",
                         parts[10] == "1",
@@ -99,11 +106,28 @@ impl StoreEngine {
                     (false, legacy_vfs, legacy_vfs, legacy_vfs)
                 };
 
+                let prop_mode = if let Some(m) = parts.get(13).filter(|s| !s.is_empty()) {
+                    sanitize_prop_mode(m)
+                } else if legacy_cow {
+                    "cow".into()
+                } else {
+                    "hook".into()
+                };
+
+                let hdr_spoof = parts.get(14).copied() == Some("1");
+                let overrides = parts
+                    .get(15)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|b64| base64_url_decode(b64))
+                    .and_then(|bytes| serde_json::from_slice::<AppOverrides>(&bytes).ok())
+                    .unwrap_or_default();
+
                 let mut r = AppRoute {
                     pkg_name: parts[0].to_string(),
                     tpl_id: parts[1].to_string(),
                     build: parts[2] == "1",
-                    cow_prop,
+                    prop_mode,
+                    cow_prop: false,
                     gl: parts[3] == "1",
                     vfs: cpu || mem || vfs_nodes,
                     cpu,
@@ -111,8 +135,10 @@ impl StoreEngine {
                     vfs_nodes,
                     probe: parts[5] == "1",
                     sdk_spoof: parts.get(6).copied() == Some("1"),
+                    hdr_spoof,
                     refresh_rate: sanitize_refresh_rate(raw_col7),
                     mount_ns: parts.get(8).copied() == Some("1"),
+                    overrides,
                 };
                 r.normalize();
                 if r.is_any_enabled() {
@@ -120,6 +146,45 @@ impl StoreEngine {
                 }
             }
         }
+    }
+
+    pub fn load_auto_spoof_file() -> AutoSpoofConfig {
+        let raw = read_file_str(AUTO_SPOOF_JSON);
+        if let Ok(mut cfg) = serde_json::from_str::<AutoSpoofConfig>(&raw) {
+            cfg.normalize();
+            return cfg;
+        }
+        AutoSpoofConfig::default()
+    }
+
+    pub fn save_auto_spoof(&mut self, mut cfg: AutoSpoofConfig) -> bool {
+        cfg.normalize();
+        if cfg.enabled && (cfg.tpl_id.is_empty() || !self.templates.contains_key(&cfg.tpl_id)) {
+            if let Some(first_id) = self.templates.keys().next() {
+                cfg.tpl_id = first_id.clone();
+            } else {
+                return false;
+            }
+        }
+        self.auto_spoof = cfg.clone();
+        ensure_dir(DATA_ROOT_DIR, 0o700);
+        let payload = serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".into());
+        let ok = write_file_atomic(AUTO_SPOOF_JSON, &(payload + "\n"), 0o600);
+        write_file_atomic(CONFIG_JSON, &self.export_json(false), 0o600);
+        ok
+    }
+
+    pub fn load_runtime_status() -> BTreeMap<String, RuntimeStatusEntry> {
+        let raw = read_file_str(RUNTIME_STATUS_FILE);
+        if raw.trim().is_empty() {
+            return BTreeMap::new();
+        }
+        serde_json::from_str::<BTreeMap<String, RuntimeStatusEntry>>(&raw).unwrap_or_default()
+    }
+
+    pub fn clear_runtime_status() {
+        ensure_dir(DATA_ROOT_DIR, 0o700);
+        write_file_atomic(RUNTIME_STATUS_FILE, "{}\n", 0o600);
     }
 
     pub fn save_all_and_compile(&mut self) -> bool {
@@ -164,10 +229,19 @@ impl StoreEngine {
         }
 
         let mut r_lines = Vec::with_capacity(self.routes.len() + 1);
-        r_lines.push(format!("# MirageForge v{} Routes Table (v2 13-col)", self.meta.version));
+        r_lines.push(format!(
+            "# MirageForge v{} Routes Table (v3 16-col)",
+            self.meta.version
+        ));
         for r in self.routes.values() {
+            let ovr_b64 = if r.overrides.is_empty() {
+                String::new()
+            } else {
+                let j = serde_json::to_string(&r.overrides).unwrap_or_default();
+                base64_url_encode(j.as_bytes())
+            };
             r_lines.push(format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.pkg_name,
                 r.tpl_id,
                 if r.build { "1" } else { "0" },
@@ -180,11 +254,14 @@ impl StoreEngine {
                 if r.cow_prop { "1" } else { "0" },
                 if r.cpu { "1" } else { "0" },
                 if r.mem { "1" } else { "0" },
-                if r.vfs_nodes { "1" } else { "0" }
+                if r.vfs_nodes { "1" } else { "0" },
+                r.prop_mode,
+                if r.hdr_spoof { "1" } else { "0" },
+                ovr_b64
             ));
         }
         write_file_atomic(ROUTES_DB, &(r_lines.join("\n") + "\n"), 0o600);
-        write_file_atomic(CONFIG_JSON, &self.export_full_json(), 0o600);
+        write_file_atomic(CONFIG_JSON, &self.export_json(false), 0o600);
         true
     }
 
@@ -219,6 +296,15 @@ impl StoreEngine {
         self.templates.remove(id);
         let _ = fs::remove_file(format!("{}/{}.tpl", TPL_DIR, id));
         self.routes.retain(|_, r| r.tpl_id != id);
+        if self.auto_spoof.tpl_id == id {
+            self.auto_spoof.enabled = false;
+            self.auto_spoof.tpl_id.clear();
+            let _ = write_file_atomic(
+                AUTO_SPOOF_JSON,
+                &(serde_json::to_string_pretty(&self.auto_spoof).unwrap_or_default() + "\n"),
+                0o600,
+            );
+        }
         self.save_all_and_compile()
     }
 
@@ -260,6 +346,10 @@ impl StoreEngine {
     }
 
     pub fn export_full_json(&self) -> String {
+        self.export_json(true)
+    }
+
+    pub fn export_json(&self, include_runtime: bool) -> String {
         let state = FullStateExport {
             version: self.meta.version.clone(),
             version_code: self.meta.version_code,
@@ -267,6 +357,12 @@ impl StoreEngine {
             template_count: self.templates.len(),
             templates: self.templates.clone(),
             app_routes: self.routes.clone(),
+            auto_spoof: self.auto_spoof.clone(),
+            runtime_status: if include_runtime {
+                Self::load_runtime_status()
+            } else {
+                BTreeMap::new()
+            },
         };
         serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".into())
     }

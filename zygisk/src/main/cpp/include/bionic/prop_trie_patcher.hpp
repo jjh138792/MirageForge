@@ -19,7 +19,6 @@ namespace mirage {
 
 // ============================================================================
 // AOSP Bionic prop_area / prop_bt / prop_info 二进制布局（Android 8 ~ 16 通用）
-// 严格使用 offsetof 定位变长成员，杜绝 C++ 末尾对齐填充导致的偏移错位
 // ============================================================================
 struct PropAreaHeaderRaw {
     uint32_t bytes_used;
@@ -65,7 +64,6 @@ inline size_t align4_size(size_t n) noexcept {
     return (n + 3u) & ~static_cast<size_t>(3u);
 }
 
-// 与 AOSP bionic/libc/system_properties/prop_area.cpp 100% 一致的段名比较器：先比长度，再比字典序
 inline int cmp_prop_bt_segment(const char *a, uint32_t a_len, const char *b, uint32_t b_len) noexcept {
     if (a_len < b_len) return -1;
     if (a_len > b_len) return 1;
@@ -161,11 +159,6 @@ struct PropAreaPatchResult {
     uint32_t skipped          = 0;
 };
 
-// ============================================================================
-// 通用内存无源 prop_area 补丁器：同时服务于纯 COW 引擎与 MountNS 引擎
-// - 已有属性：精确验证键名后原地覆写短值或长值
-// - 宿主缺失的新增属性（allow_insert=true）：直接在 128KB 属性区尾部空闲区插入 prop_bt + prop_info
-// ============================================================================
 inline PropAreaPatchResult patch_prop_area_buffer(
     uint8_t *area_base,
     size_t area_len,
@@ -185,6 +178,10 @@ inline PropAreaPatchResult patch_prop_area_buffer(
     auto get_bt = [&](uint32_t off) -> PropBtRaw * {
         if (off >= hdr->bytes_used || hdr->bytes_used - off < kPropBtHdrSize) return nullptr;
         auto *bt = reinterpret_cast<PropBtRaw *>(data + off);
+        if (off == 0) {
+            // AOSP 空属性区根节点位于 data + 0 且 bytes_used 初始为 20（无 name 字节）
+            return (bt->namelen == 0) ? bt : nullptr;
+        }
         if (bt->namelen > 255 || off + kPropBtHdrSize + bt->namelen + 1 > hdr->bytes_used) return nullptr;
         return bt;
     };
@@ -210,8 +207,7 @@ inline PropAreaPatchResult patch_prop_area_buffer(
             continue;
         }
 
-        // 1. 沿 '.' 分段遍历/构建 prop_bt 前缀树
-        uint32_t cur_off = 0; // root node 固定位于 data + 0
+        uint32_t cur_off = 0;
         const char *rem = key.c_str();
         bool walk_ok = true;
 
@@ -293,7 +289,6 @@ inline PropAreaPatchResult patch_prop_area_buffer(
 
         uint32_t pi_off = __atomic_load_n(&leaf->prop, __ATOMIC_ACQUIRE);
         if (pi_off != 0) {
-            // 已有属性：先校验完整属性名再原地覆写
             if (pi_off >= hdr->bytes_used ||
                 hdr->bytes_used - pi_off < kPropInfoHdrSize + key.size() + 1) {
                 ++res.skipped;
@@ -311,7 +306,6 @@ inline PropAreaPatchResult patch_prop_area_buffer(
                 ++res.skipped;
             }
         } else {
-            // 宿主缺失的新增属性：尾部原生分配 prop_info 并挂入前缀树
             if (!allow_insert) {
                 ++res.skipped;
                 continue;
@@ -343,7 +337,7 @@ inline PropAreaPatchResult patch_prop_area_buffer(
 
 // ============================================================================
 // Android 9+ /dev/__properties__/property_info 二进制上下文解析器（带运行时自检）
-// 精准反查任意属性键（含宿主不存在的跨品牌属性）在 Bionic 中归属的 SELinux 上下文文件名
+// 严格按 AOSP property_info_parser.h 格式解引用 uint32_t 偏移表
 // ============================================================================
 class PropertyInfoContextResolver {
 public:
@@ -390,7 +384,6 @@ public:
 
         loaded_ = true;
 
-        // 运行时自检：拿必存在的标准属性验证解析器能返回合法 "u:object_r:..." 上下文名
         std::string probe_ctx = resolve_context("ro.product.model");
         if (probe_ctx.rfind("u:object_r:", 0) != 0) {
             loaded_ = false;
@@ -433,41 +426,48 @@ public:
         for (int depth = 0; depth < 64 && cur != nullptr; ++depth) {
             size_t rem_len = std::strlen(rem);
 
-            // 1. 前缀规则匹配（如 "ro.product."）
+            // 1. 前缀规则匹配（prefix_entries 为 uint32_t 偏移数组，每项指向一个 PropEntryRaw）
             if (cur->num_prefixes > 0 && cur->prefix_entries < limit) {
-                size_t max_entries = (limit - cur->prefix_entries) / sizeof(PropEntryRaw);
+                size_t max_entries = (limit - cur->prefix_entries) / sizeof(uint32_t);
                 uint32_t cnt = cur->num_prefixes < max_entries ? cur->num_prefixes : static_cast<uint32_t>(max_entries);
-                const auto *arr = reinterpret_cast<const PropEntryRaw *>(buf_.data() + cur->prefix_entries);
+                const auto *offs = reinterpret_cast<const uint32_t *>(buf_.data() + cur->prefix_entries);
+                uint32_t best_prefix_len = 0;
                 for (uint32_t i = 0; i < cnt; ++i) {
+                    const auto *pe = get_entry(offs[i]);
+                    if (!pe) continue;
                     uint32_t avail = 0;
-                    const char *pname = get_cstr(arr[i].name_offset, &avail);
-                    if (pname && arr[i].namelen > 0 && arr[i].namelen <= avail &&
-                        rem_len >= arr[i].namelen &&
-                        std::memcmp(pname, rem, arr[i].namelen) == 0) {
-                        if (arr[i].context_index != ~0u) best_ctx = arr[i].context_index;
+                    const char *pname = get_cstr(pe->name_offset, &avail);
+                    if (pname && pe->namelen > 0 && pe->namelen <= avail &&
+                        rem_len >= pe->namelen && pe->namelen >= best_prefix_len &&
+                        std::memcmp(pname, rem, pe->namelen) == 0) {
+                        if (pe->context_index != ~0u) {
+                            best_ctx = pe->context_index;
+                            best_prefix_len = pe->namelen;
+                        }
                     }
                 }
             }
 
             const char *dot = std::strchr(rem, '.');
             if (!dot) {
-                // 2. 最后一段：优先精确匹配
+                // 2. 最后一段：优先精确匹配（exact_match_entries 同样为 uint32_t 偏移数组）
                 if (cur->num_exact_matches > 0 && cur->exact_match_entries < limit) {
-                    size_t max_entries = (limit - cur->exact_match_entries) / sizeof(PropEntryRaw);
+                    size_t max_entries = (limit - cur->exact_match_entries) / sizeof(uint32_t);
                     uint32_t cnt = cur->num_exact_matches < max_entries ? cur->num_exact_matches : static_cast<uint32_t>(max_entries);
-                    const auto *arr = reinterpret_cast<const PropEntryRaw *>(buf_.data() + cur->exact_match_entries);
+                    const auto *offs = reinterpret_cast<const uint32_t *>(buf_.data() + cur->exact_match_entries);
                     for (uint32_t i = 0; i < cnt; ++i) {
+                        const auto *pe = get_entry(offs[i]);
+                        if (!pe) continue;
                         uint32_t avail = 0;
-                        const char *ename = get_cstr(arr[i].name_offset, &avail);
-                        if (ename && arr[i].namelen == rem_len && arr[i].namelen <= avail &&
+                        const char *ename = get_cstr(pe->name_offset, &avail);
+                        if (ename && pe->namelen == rem_len && pe->namelen <= avail &&
                             std::memcmp(ename, rem, rem_len) == 0) {
-                            if (arr[i].context_index != ~0u) {
-                                return context_by_index(arr[i].context_index);
+                            if (pe->context_index != ~0u) {
+                                return context_by_index(pe->context_index);
                             }
                         }
                     }
                 }
-                // 再检查同名子节点
                 const TrieNodeRaw *leaf_child = find_child(cur, rem, rem_len, limit);
                 if (leaf_child) {
                     if (const auto *pe = get_entry(leaf_child->property_entry)) {
@@ -523,7 +523,6 @@ private:
         uint32_t cnt = node->num_child_nodes < max_children ? node->num_child_nodes : static_cast<uint32_t>(max_children);
         const auto *offs = reinterpret_cast<const uint32_t *>(buf_.data() + node->child_nodes);
 
-        // 线性/二分安全查找子节点
         for (uint32_t i = 0; i < cnt; ++i) {
             uint32_t co = offs[i];
             if (co > limit || limit - co < sizeof(TrieNodeRaw)) continue;
@@ -559,13 +558,11 @@ private:
     std::vector<uint8_t> buf_;
 };
 
-// 提取路径末尾的文件名（例如 "/__properties__/u:object_r:build_prop:s0" -> "u:object_r:build_prop:s0"）
 inline std::string prop_path_basename(const std::string &path) {
     size_t pos = path.rfind('/');
     return (pos == std::string::npos) ? path : path.substr(pos + 1);
 }
 
-// 兼容云机 / 容器环境：若 VMA 路径为 "/__properties__/..." 且直接 open 失败，自动回退尝试 "/dev/__properties__/..."
 inline int open_prop_backing_file_ro(const std::string &vma_path) noexcept {
     int fd = open(vma_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd >= 0) return fd;

@@ -2,14 +2,14 @@
 // Copyright (c) 2025-2026 jjh138792
 // MirageForge: https://github.com/jjh138792/MirageForge
 
-use crate::models::{sanitize_refresh_rate, AppRoute, DeviceTemplate};
+use crate::models::{sanitize_prop_mode, sanitize_refresh_rate, AppRoute, DeviceTemplate};
 
 pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
     let mut normalized = tpl.clone();
     normalized.normalize_vulkan_fields();
     let tpl = &normalized;
 
-    let mut lines: Vec<String> = Vec::with_capacity(148);
+    let mut lines: Vec<String> = Vec::with_capacity(160);
 
     let push_kv = |out: &mut Vec<String>, k: &str, v: &str| {
         if !k.is_empty() && !v.is_empty() {
@@ -17,21 +17,36 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         }
     };
 
-    let any_prop = route.build || route.cow_prop;
+    let prop_mode = if route.build {
+        sanitize_prop_mode(&route.prop_mode)
+    } else {
+        "hook".into()
+    };
     let any_vfs = route.cpu || route.mem || route.vfs_nodes;
     let effective_fps = sanitize_refresh_rate(route.refresh_rate);
+    let enable_hdr = (route.build || route.gl) && route.hdr_spoof;
 
-    // 1. 模块级总控元数据（细粒度零改动门控）
+    // 1. 模块级总控元数据（严格零改动门控 + 三引擎属性模式声明）
     push_kv(&mut lines, "META:ENABLE_BUILD", if route.build { "1" } else { "0" });
-    push_kv(&mut lines, "META:ENABLE_COW_PROP", if route.cow_prop { "1" } else { "0" });
+    push_kv(&mut lines, "META:PROP_MODE", &prop_mode);
+    push_kv(
+        &mut lines,
+        "META:ENABLE_COW_PROP",
+        if route.build && prop_mode == "cow" { "1" } else { "0" },
+    );
     push_kv(&mut lines, "META:ENABLE_GL", if route.gl { "1" } else { "0" });
+    push_kv(&mut lines, "META:ENABLE_HDR", if enable_hdr { "1" } else { "0" });
     push_kv(&mut lines, "META:ENABLE_VFS", if any_vfs { "1" } else { "0" });
     push_kv(&mut lines, "META:ENABLE_CPU", if route.cpu { "1" } else { "0" });
     push_kv(&mut lines, "META:ENABLE_MEM", if route.mem { "1" } else { "0" });
     push_kv(&mut lines, "META:ENABLE_VFS_NODES", if route.vfs_nodes { "1" } else { "0" });
     push_kv(&mut lines, "META:ENABLE_MOUNT_NS", if any_vfs && route.mount_ns { "1" } else { "0" });
     push_kv(&mut lines, "META:ENABLE_PROBE", if route.probe { "1" } else { "0" });
-    push_kv(&mut lines, "META:FORCE_SPOOF_SDK", if route.sdk_spoof { "1" } else { "0" });
+    push_kv(
+        &mut lines,
+        "META:FORCE_SPOOF_SDK",
+        if route.build && route.sdk_spoof { "1" } else { "0" },
+    );
     if (route.build || route.gl) && effective_fps >= 90 {
         push_kv(&mut lines, "META:REFRESH_RATE", &effective_fps.to_string());
     }
@@ -54,16 +69,25 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "VULKAN:DRIVER_INFO", &tpl.vk_driver_info);
     }
 
-    // 3. 硬件与文件节点拓扑模块 (严格按 cpu / mem / vfs_nodes 细粒度输出)
-    let ram_gb = if tpl.ram_gb > 0 { tpl.ram_gb } else { 16 };
+    // 3. 硬件与文件节点拓扑模块（支持单应用局部覆写 RAM 与 CPU 核数）
+    let ram_gb = route
+        .overrides
+        .ram_gb
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| if tpl.ram_gb > 0 { tpl.ram_gb } else { 16 });
+    let cpu_cores = route
+        .overrides
+        .cpu_cores
+        .filter(|&v| v > 0)
+        .unwrap_or(tpl.cpu_cores);
     let ddr_type = if tpl.ddr_type.is_empty() { "LPDDR5X" } else { &tpl.ddr_type };
     let ddr_vendor = if tpl.ddr_vendor.is_empty() { "SKhynix" } else { &tpl.ddr_vendor };
 
     if route.cpu || route.vfs_nodes {
         push_kv(&mut lines, "VFS:CPU_HARDWARE", &tpl.cpu_hardware);
         push_kv(&mut lines, "VFS:CPU_ARCH", "aarch64");
-        if tpl.cpu_cores > 0 {
-            push_kv(&mut lines, "VFS:CPU_CORES", &tpl.cpu_cores.to_string());
+        if cpu_cores > 0 {
+            push_kv(&mut lines, "VFS:CPU_CORES", &cpu_cores.to_string());
         }
         push_kv(&mut lines, "VFS:CPU_MAX_FREQ", &tpl.cpu_max_freq.to_string());
         push_kv(&mut lines, "VFS:CPU_CLUSTERS", &tpl.cpu_clusters);
@@ -79,8 +103,8 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "VFS:DDR_VENDOR", ddr_vendor);
     }
 
-    // 4. 系统属性与 COW Prop Spoof 模块
-    if any_prop {
+    // 4. 系统属性三引擎全量属性与 Java Build 反射表（Hook / COW / MountNS 均同步生效）
+    if route.build {
         let abis = if tpl.supported_abis.is_empty() {
             "arm64-v8a,armeabi-v7a,armeabi"
         } else {
@@ -109,42 +133,38 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             "builder"
         };
 
-        // Java android.os.Build 与 Build$VERSION 反射字段仅在开启常规「伪装系统属性」时输出
-        if route.build {
-            push_kv(&mut lines, "BUILD:MODEL", &tpl.model);
-            push_kv(&mut lines, "BUILD:BRAND", &tpl.brand);
-            push_kv(&mut lines, "BUILD:MANUFACTURER", &tpl.manufacturer);
-            push_kv(&mut lines, "BUILD:DEVICE", &tpl.device);
-            push_kv(&mut lines, "BUILD:PRODUCT", &tpl.product);
-            push_kv(&mut lines, "BUILD:HARDWARE", &tpl.hardware);
-            push_kv(&mut lines, "BUILD:BOARD", &tpl.board);
-            push_kv(&mut lines, "BUILD:BOOTLOADER", &tpl.bootloader);
-            push_kv(&mut lines, "BUILD:SOC_MANUFACTURER", &tpl.soc_manufacturer);
-            push_kv(&mut lines, "BUILD:SOC_MODEL", &tpl.soc_model);
-            push_kv(&mut lines, "BUILD:ID", &tpl.build_id);
-            push_kv(&mut lines, "BUILD:DISPLAY", display_id);
-            push_kv(&mut lines, "BUILD:HOST", build_host);
-            push_kv(&mut lines, "BUILD:USER", build_user);
-            push_kv(&mut lines, "BUILD:FINGERPRINT", &tpl.fingerprint);
-            push_kv(&mut lines, "BUILD:SUPPORTED_ABIS", abis);
-            push_kv(&mut lines, "BUILD:SUPPORTED_64_BIT_ABIS", "arm64-v8a");
-            push_kv(&mut lines, "BUILD:SUPPORTED_32_BIT_ABIS", "armeabi-v7a,armeabi");
-            push_kv(&mut lines, "BUILD:TAGS", "release-keys");
-            push_kv(&mut lines, "BUILD:TYPE", "user");
-            push_kv(&mut lines, "BUILD:TIME", &tpl.build_time);
+        push_kv(&mut lines, "BUILD:MODEL", &tpl.model);
+        push_kv(&mut lines, "BUILD:BRAND", &tpl.brand);
+        push_kv(&mut lines, "BUILD:MANUFACTURER", &tpl.manufacturer);
+        push_kv(&mut lines, "BUILD:DEVICE", &tpl.device);
+        push_kv(&mut lines, "BUILD:PRODUCT", &tpl.product);
+        push_kv(&mut lines, "BUILD:HARDWARE", &tpl.hardware);
+        push_kv(&mut lines, "BUILD:BOARD", &tpl.board);
+        push_kv(&mut lines, "BUILD:BOOTLOADER", &tpl.bootloader);
+        push_kv(&mut lines, "BUILD:SOC_MANUFACTURER", &tpl.soc_manufacturer);
+        push_kv(&mut lines, "BUILD:SOC_MODEL", &tpl.soc_model);
+        push_kv(&mut lines, "BUILD:ID", &tpl.build_id);
+        push_kv(&mut lines, "BUILD:DISPLAY", display_id);
+        push_kv(&mut lines, "BUILD:HOST", build_host);
+        push_kv(&mut lines, "BUILD:USER", build_user);
+        push_kv(&mut lines, "BUILD:FINGERPRINT", &tpl.fingerprint);
+        push_kv(&mut lines, "BUILD:SUPPORTED_ABIS", abis);
+        push_kv(&mut lines, "BUILD:SUPPORTED_64_BIT_ABIS", "arm64-v8a");
+        push_kv(&mut lines, "BUILD:SUPPORTED_32_BIT_ABIS", "armeabi-v7a,armeabi");
+        push_kv(&mut lines, "BUILD:TAGS", "release-keys");
+        push_kv(&mut lines, "BUILD:TYPE", "user");
+        push_kv(&mut lines, "BUILD:TIME", &tpl.build_time);
 
-            push_kv(&mut lines, "VERSION:INCREMENTAL", incremental);
-            push_kv(&mut lines, "VERSION:SECURITY_PATCH", &tpl.security_patch);
-            if route.sdk_spoof {
-                push_kv(&mut lines, "VERSION:CODENAME", "REL");
-                push_kv(&mut lines, "VERSION:PREVIEW_SDK_INT", "0");
-                push_kv(&mut lines, "VERSION:RELEASE", &tpl.release);
-                push_kv(&mut lines, "VERSION:SDK_INT", &tpl.sdk_int);
-                push_kv(&mut lines, "VERSION:DEVICE_INITIAL_SDK_INT", &tpl.sdk_int);
-            }
+        push_kv(&mut lines, "VERSION:INCREMENTAL", incremental);
+        push_kv(&mut lines, "VERSION:SECURITY_PATCH", &tpl.security_patch);
+        if route.sdk_spoof {
+            push_kv(&mut lines, "VERSION:CODENAME", "REL");
+            push_kv(&mut lines, "VERSION:PREVIEW_SDK_INT", "0");
+            push_kv(&mut lines, "VERSION:RELEASE", &tpl.release);
+            push_kv(&mut lines, "VERSION:SDK_INT", &tpl.sdk_int);
+            push_kv(&mut lines, "VERSION:DEVICE_INITIAL_SDK_INT", &tpl.sdk_int);
         }
 
-        // Bionic SystemProperties 全分区属性（供常规 PLT 与 COW Prop Spoof 共用）
         for part in &["", "system.", "vendor.", "odm.", "product.", "system_ext."] {
             push_kv(&mut lines, &format!("ro.product.{}model", part), &tpl.model);
             push_kv(&mut lines, &format!("ro.product.{}brand", part), &tpl.brand);
@@ -180,7 +200,6 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "ro.build.tags", "release-keys");
         push_kv(&mut lines, "ro.build.type", "user");
 
-        // SELinux 受限属性区与云控 Root 隐藏
         push_kv(&mut lines, "ro.boot.vbmeta.device_state", "locked");
         push_kv(&mut lines, "ro.boot.vbmeta.avb_version", "1.2");
         push_kv(&mut lines, "ro.boot.vbmeta.hash_alg", "sha256");
@@ -203,7 +222,6 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
         push_kv(&mut lines, "ro.boot.hardware.sku", &tpl.device);
         push_kv(&mut lines, "ro.boot.product.hardware.sku", &tpl.device);
 
-        // 严格子模块隔离：仅当「伪装内存信息」开启时才注入 DDR 物理内存属性
         if route.mem {
             let ram_str = format!("{}GB", ram_gb);
             let ram_mb_str = (ram_gb * 1024).to_string();
@@ -222,7 +240,6 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             push_kv(&mut lines, "persist.sys.ram_size", &ram_str);
         }
 
-        // 严格子模块隔离：仅当「伪装 GPU」开启时才注入底层 Vulkan/GLES 辅助属性
         if route.gl {
             if !tpl.vk_device_name.is_empty() {
                 push_kv(&mut lines, "persist.sys.cloud.gpu.vk_devicename", &tpl.vk_device_name);
@@ -244,27 +261,34 @@ pub fn compile_modular_conf(tpl: &DeviceTemplate, route: &AppRoute) -> String {
             }
         }
 
-        for raw in tpl.custom_props.lines() {
-            let tr = raw.trim();
-            if tr.is_empty() || tr.starts_with('#') {
-                continue;
-            }
-            if let Some(eq) = tr.find('=') {
-                let k = tr[..eq].trim();
-                if k.contains("lcd_density") || k.ends_with(".dpi") {
+        let append_custom_block = |out: &mut Vec<String>, block: &str| {
+            for raw in block.lines() {
+                let tr = raw.trim();
+                if tr.is_empty() || tr.starts_with('#') {
                     continue;
                 }
-                if !route.sdk_spoof
-                    && (k.contains("build.version.sdk")
-                        || k.contains("build.version.release")
-                        || k.contains("first_api_level")
-                        || k.contains("preview_sdk")
-                        || k.contains("version.codename"))
-                {
-                    continue;
+                if let Some(eq) = tr.find('=') {
+                    let k = tr[..eq].trim();
+                    if k.is_empty() || k.contains("lcd_density") || k.ends_with(".dpi") {
+                        continue;
+                    }
+                    if !route.sdk_spoof
+                        && (k.contains("build.version.sdk")
+                            || k.contains("build.version.release")
+                            || k.contains("first_api_level")
+                            || k.contains("preview_sdk")
+                            || k.contains("version.codename"))
+                    {
+                        continue;
+                    }
+                    out.push(tr.to_string());
                 }
-                lines.push(tr.to_string());
             }
+        };
+
+        append_custom_block(&mut lines, &tpl.custom_props);
+        if !route.overrides.custom_props.is_empty() {
+            append_custom_block(&mut lines, &route.overrides.custom_props);
         }
     }
 

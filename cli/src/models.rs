@@ -12,6 +12,10 @@ pub const TPL_DIR: &str = "/data/adb/mirage_forge/templates";
 pub const APPS_DIR: &str = "/data/adb/mirage_forge/apps";
 pub const ROUTES_DB: &str = "/data/adb/mirage_forge/routes.db";
 pub const CONFIG_JSON: &str = "/data/adb/mirage_forge/config.json";
+pub const AUTO_SPOOF_JSON: &str = "/data/adb/mirage_forge/auto_spoof.json";
+pub const KNOWN_PKGS_DB: &str = "/data/adb/mirage_forge/known_pkgs.db";
+pub const WATCHER_PID_FILE: &str = "/data/adb/mirage_forge/watch_installs.pid";
+pub const RUNTIME_STATUS_FILE: &str = "/data/adb/mirage_forge/runtime_status.json";
 pub const LAUNCH_LOG_FILE: &str = "/data/adb/mirage_forge/launch_history.log";
 pub const PROBE_LOG_FILE: &str = "/data/adb/mirage_forge/probe_events.log";
 pub const CRASH_LOG_FILE: &str = "/data/adb/mirage_forge/crash_events.log";
@@ -72,6 +76,32 @@ where
     }
 }
 
+fn de_opt_i32_flex<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OptIntOrStr {
+        Null,
+        Int(i32),
+        Str(String),
+    }
+    match OptIntOrStr::deserialize(deserializer)? {
+        OptIntOrStr::Null => Ok(None),
+        OptIntOrStr::Int(v) => Ok(if v > 0 { Some(v) } else { None }),
+        OptIntOrStr::Str(s) => Ok(s.trim().parse::<i32>().ok().filter(|&v| v > 0)),
+    }
+}
+
+pub fn sanitize_prop_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "cow" => "cow".into(),
+        "mount_ns" | "mountns" => "mount_ns".into(),
+        _ => "hook".into(),
+    }
+}
+
 fn default_hardware() -> String { "qcom".into() }
 fn default_bootloader() -> String { "unknown".into() }
 fn default_soc_man() -> String { "Qualcomm".into() }
@@ -101,6 +131,7 @@ fn default_soc_machine() -> String { "SM8750".into() }
 fn default_kernel_rel() -> String { "6.6.30-android15-8-g94b8f12ab4c1".into() }
 fn default_kernel_ver() -> String { "#1 SMP PREEMPT Fri Nov 15 12:00:00 UTC 2025".into() }
 fn default_true() -> bool { true }
+fn default_prop_mode_cow() -> String { "cow".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceTemplate {
@@ -286,13 +317,50 @@ impl DeviceTemplate {
     }
 }
 
-// 中间反序列化结构：确保 1.2.x 旧版 config.json 自动把 vfs 字段继承给 cpu/mem/vfsNodes
+// ============================================================================
+// 单应用专属局部覆写（无需复制整套模板即可按 App 微调内存/核数/附加属性）
+// ============================================================================
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppOverrides {
+    #[serde(
+        rename = "ramGb",
+        default,
+        deserialize_with = "de_opt_i32_flex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ram_gb: Option<i32>,
+    #[serde(
+        rename = "cpuCores",
+        default,
+        deserialize_with = "de_opt_i32_flex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cpu_cores: Option<i32>,
+    #[serde(rename = "customProps", default, skip_serializing_if = "String::is_empty")]
+    pub custom_props: String,
+}
+
+impl AppOverrides {
+    pub fn normalize(&mut self) {
+        self.ram_gb = self.ram_gb.filter(|&v| (1..=128).contains(&v));
+        self.cpu_cores = self.cpu_cores.filter(|&v| (1..=32).contains(&v));
+        self.custom_props = self.custom_props.trim().to_string();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ram_gb.is_none() && self.cpu_cores.is_none() && self.custom_props.trim().is_empty()
+    }
+}
+
+// 中间反序列化结构：无损兼容 1.2.x 旧版 config.json (cowProp -> propMode="cow", vfs -> cpu/mem/vfsNodes)
 #[derive(Deserialize)]
 struct AppRouteDe {
     #[serde(rename = "tplId")]
     tpl_id: String,
     #[serde(default = "default_true")]
     build: bool,
+    #[serde(rename = "propMode", default)]
+    prop_mode: Option<String>,
     #[serde(rename = "cowProp", default)]
     cow_prop: bool,
     #[serde(default = "default_true")]
@@ -309,10 +377,14 @@ struct AppRouteDe {
     probe: bool,
     #[serde(rename = "sdkSpoof", default)]
     sdk_spoof: bool,
+    #[serde(rename = "hdrSpoof", default)]
+    hdr_spoof: bool,
     #[serde(rename = "refreshRate", default, deserialize_with = "de_i32_flex")]
     refresh_rate: i32,
     #[serde(rename = "mountNs", alias = "seccomp", default)]
     mount_ns: bool,
+    #[serde(default)]
+    overrides: AppOverrides,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,8 +395,10 @@ pub struct AppRoute {
     #[serde(rename = "tplId")]
     pub tpl_id: String,
     pub build: bool,
+    #[serde(rename = "propMode")]
+    pub prop_mode: String, // "hook" | "cow" | "mount_ns"
     #[serde(rename = "cowProp")]
-    pub cow_prop: bool,
+    pub cow_prop: bool, // 兼容只读衍生位：build && prop_mode == "cow"
     pub gl: bool,
     pub vfs: bool, // 兼容聚合位：cpu || mem || vfs_nodes
     pub cpu: bool,
@@ -334,10 +408,14 @@ pub struct AppRoute {
     pub probe: bool,
     #[serde(rename = "sdkSpoof")]
     pub sdk_spoof: bool,
+    #[serde(rename = "hdrSpoof")]
+    pub hdr_spoof: bool,
     #[serde(rename = "refreshRate")]
     pub refresh_rate: i32,
     #[serde(rename = "mountNs")]
     pub mount_ns: bool,
+    #[serde(default, skip_serializing_if = "AppOverrides::is_empty")]
+    pub overrides: AppOverrides,
 }
 
 impl From<AppRouteDe> for AppRoute {
@@ -346,39 +424,63 @@ impl From<AppRouteDe> for AppRoute {
         let mem = raw.mem.unwrap_or(raw.vfs);
         let vfs_nodes = raw.vfs_nodes.unwrap_or(raw.vfs);
         let vfs = cpu || mem || vfs_nodes;
-        Self {
+        let resolved_mode = match raw.prop_mode {
+            Some(m) if !m.trim().is_empty() => sanitize_prop_mode(&m),
+            _ => {
+                if raw.cow_prop {
+                    "cow".into()
+                } else {
+                    "hook".into()
+                }
+            }
+        };
+
+        let mut route = Self {
             pkg_name: String::new(),
             tpl_id: raw.tpl_id,
             build: raw.build,
-            cow_prop: raw.cow_prop && raw.build,
+            prop_mode: resolved_mode,
+            cow_prop: false,
             gl: raw.gl,
             vfs,
             cpu,
             mem,
             vfs_nodes,
             probe: raw.probe,
-            sdk_spoof: raw.sdk_spoof && raw.build,
+            sdk_spoof: raw.sdk_spoof,
+            hdr_spoof: raw.hdr_spoof,
             refresh_rate: sanitize_refresh_rate(raw.refresh_rate),
-            mount_ns: raw.mount_ns && vfs,
-        }
+            mount_ns: raw.mount_ns,
+            overrides: raw.overrides,
+        };
+        route.normalize();
+        route
     }
 }
 
 impl AppRoute {
     pub fn normalize(&mut self) {
+        self.prop_mode = sanitize_prop_mode(&self.prop_mode);
         if !self.build {
-            self.cow_prop = false;
+            self.prop_mode = "hook".into();
             self.sdk_spoof = false;
         }
+        self.cow_prop = self.build && self.prop_mode == "cow";
         self.vfs = self.cpu || self.mem || self.vfs_nodes;
         if !self.vfs {
             self.mount_ns = false;
         }
-        self.refresh_rate = sanitize_refresh_rate(self.refresh_rate);
+        if !self.build && !self.gl {
+            self.hdr_spoof = false;
+            self.refresh_rate = 0;
+        } else {
+            self.refresh_rate = sanitize_refresh_rate(self.refresh_rate);
+        }
+        self.overrides.normalize();
     }
 
     pub fn is_any_enabled(&self) -> bool {
-        self.build || self.cow_prop || self.gl || self.cpu || self.mem || self.vfs_nodes || self.probe
+        self.build || self.gl || self.cpu || self.mem || self.vfs_nodes || self.probe
     }
 }
 
@@ -391,7 +493,131 @@ pub fn sanitize_refresh_rate(hz: i32) -> i32 {
 }
 
 // ============================================================================
-// 零第三方依赖的 URL-Safe Base64 模板分享码编解码器 (mf://...)
+// 新安装应用自动加入伪装配置（由 inotify 守护进程热读取）
+// ============================================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoSpoofConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(rename = "tplId", default)]
+    pub tpl_id: String,
+    #[serde(default = "default_true")]
+    pub build: bool,
+    #[serde(rename = "propMode", default = "default_prop_mode_cow")]
+    pub prop_mode: String,
+    #[serde(default = "default_true")]
+    pub gl: bool,
+    #[serde(default = "default_true")]
+    pub cpu: bool,
+    #[serde(default = "default_true")]
+    pub mem: bool,
+    #[serde(rename = "vfsNodes", default = "default_true")]
+    pub vfs_nodes: bool,
+    #[serde(rename = "mountNs", default)]
+    pub mount_ns: bool,
+    #[serde(rename = "hdrSpoof", default)]
+    pub hdr_spoof: bool,
+    #[serde(rename = "refreshRate", default, deserialize_with = "de_i32_flex")]
+    pub refresh_rate: i32,
+    #[serde(rename = "excludePackages", default)]
+    pub exclude_packages: Vec<String>,
+}
+
+impl Default for AutoSpoofConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tpl_id: String::new(),
+            build: true,
+            prop_mode: "cow".into(),
+            gl: true,
+            cpu: true,
+            mem: true,
+            vfs_nodes: true,
+            mount_ns: false,
+            hdr_spoof: false,
+            refresh_rate: 0,
+            exclude_packages: Vec::new(),
+        }
+    }
+}
+
+impl AutoSpoofConfig {
+    pub fn normalize(&mut self) {
+        self.prop_mode = sanitize_prop_mode(&self.prop_mode);
+        if !self.build {
+            self.prop_mode = "hook".into();
+        }
+        let any_vfs = self.cpu || self.mem || self.vfs_nodes;
+        if !any_vfs {
+            self.mount_ns = false;
+        }
+        self.refresh_rate = sanitize_refresh_rate(self.refresh_rate);
+        self.exclude_packages = self
+            .exclude_packages
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.exclude_packages.sort();
+        self.exclude_packages.dedup();
+    }
+
+    pub fn build_route_for(&self, pkg: &str) -> AppRoute {
+        let mut r = AppRoute {
+            pkg_name: pkg.to_string(),
+            tpl_id: self.tpl_id.clone(),
+            build: self.build,
+            prop_mode: self.prop_mode.clone(),
+            cow_prop: false,
+            gl: self.gl,
+            vfs: self.cpu || self.mem || self.vfs_nodes,
+            cpu: self.cpu,
+            mem: self.mem,
+            vfs_nodes: self.vfs_nodes,
+            probe: false,
+            sdk_spoof: false,
+            hdr_spoof: self.hdr_spoof,
+            refresh_rate: self.refresh_rate,
+            mount_ns: self.mount_ns,
+            overrides: AppOverrides::default(),
+        };
+        r.normalize();
+        r
+    }
+}
+
+// ============================================================================
+// Zygisk Companion 落盘的真实运行态徽章记录 (runtime_status.json)
+// ============================================================================
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeStatusEntry {
+    #[serde(default)]
+    pub timestamp: i64,
+    #[serde(default)]
+    pub pid: i32,
+    #[serde(rename = "propReq", default)]
+    pub prop_req: String,
+    #[serde(rename = "propEff", default)]
+    pub prop_eff: String,
+    #[serde(rename = "propVerified", default)]
+    pub prop_verified: u32,
+    #[serde(rename = "propInserted", default)]
+    pub prop_inserted: u32,
+    #[serde(rename = "vfsMounted", default)]
+    pub vfs_mounted: u32,
+    #[serde(rename = "vfsRequested", default)]
+    pub vfs_requested: u32,
+    #[serde(rename = "liveNodes", default)]
+    pub live_nodes: u32,
+    #[serde(rename = "zeroResidence", default)]
+    pub zero_residence: bool,
+    #[serde(default)]
+    pub diag: String,
+}
+
+// ============================================================================
+// 零第三方依赖的 URL-Safe Base64 编解码器（供 mf:// 分享码与局部覆写持久化共用）
 // ============================================================================
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -485,6 +711,14 @@ pub struct FullStateExport {
     pub templates: BTreeMap<String, DeviceTemplate>,
     #[serde(rename = "appRoutes")]
     pub app_routes: BTreeMap<String, AppRoute>,
+    #[serde(rename = "autoSpoof", default)]
+    pub auto_spoof: AutoSpoofConfig,
+    #[serde(
+        rename = "runtimeStatus",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub runtime_status: BTreeMap<String, RuntimeStatusEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

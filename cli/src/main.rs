@@ -9,6 +9,7 @@ mod fs_atomic;
 mod models;
 mod probe;
 mod store;
+mod watcher;
 
 use alchemy::parse_build_prop;
 use device_info::{clone_host_as_template, collect_host_device_info};
@@ -75,6 +76,27 @@ fn main() {
         return;
     }
 
+    if cmd == "watch-installs" {
+        if has_flag(&args, "--init-snapshot") {
+            let _ = watcher::scan_once(true);
+            if json_mode {
+                println!("{{\"ok\":true,\"mode\":\"init-snapshot\"}}");
+            }
+            return;
+        }
+        if has_flag(&args, "--once") {
+            let added = watcher::scan_once(false);
+            if json_mode {
+                println!("{{\"ok\":true,\"added\":{}}}", added);
+            } else {
+                println!("[MirageForge] watch-installs --once added {} app(s).", added);
+            }
+            return;
+        }
+        watcher::run_watch_daemon();
+        return;
+    }
+
     if cmd == "device-info" {
         let info = collect_host_device_info();
         if json_mode {
@@ -115,13 +137,19 @@ fn main() {
 
     match cmd {
         "status" => {
+            let watcher_pid = watcher::get_running_watcher_pid();
+            let runtime_map = StoreEngine::load_runtime_status();
             if json_mode {
                 println!(
-                    "{{\"ok\":true,\"version\":\"{}\",\"versionCode\":{},\"activeApps\":{},\"templateCount\":{}}}",
+                    "{{\"ok\":true,\"version\":\"{}\",\"versionCode\":{},\"activeApps\":{},\"templateCount\":{},\"autoSpoofEnabled\":{},\"watcherRunning\":{},\"watcherPid\":{},\"runtimeStatusCount\":{}}}",
                     store.meta.version,
                     store.meta.version_code,
                     store.routes.len(),
-                    store.templates.len()
+                    store.templates.len(),
+                    store.auto_spoof.enabled,
+                    watcher_pid.is_some(),
+                    watcher_pid.unwrap_or(0),
+                    runtime_map.len()
                 );
             } else {
                 println!("==========================================");
@@ -129,6 +157,17 @@ fn main() {
                 println!("==========================================");
                 println!("- 已储备全息模板数: {} 套", store.templates.len());
                 println!("- 当前生效分流应用: {} 款", store.routes.len());
+                println!(
+                    "- 新应用自动托管: {} (监听守护: {})",
+                    if store.auto_spoof.enabled {
+                        format!("开启 -> {}", store.auto_spoof.tpl_id)
+                    } else {
+                        "关闭".into()
+                    },
+                    watcher_pid
+                        .map(|p| format!("运行中 PID {}", p))
+                        .unwrap_or_else(|| "未运行".into())
+                );
                 for r in store.routes.values() {
                     let m_name = store
                         .templates
@@ -136,12 +175,13 @@ fn main() {
                         .map(|t| t.name.as_str())
                         .unwrap_or(&r.tpl_id);
                     println!(
-                        "  * {} -> [{} | Build:{} COW:{} GL:{} CPU:{} Mem:{} Nodes:{} MountNS:{} Probe:{} SDK:{} FPS:{}Hz]",
+                        "  * {} -> [{} | Build:{}({}) GL:{} HDR:{} CPU:{} Mem:{} Nodes:{} MountNS:{} Probe:{} SDK:{} FPS:{}Hz]",
                         r.pkg_name,
                         m_name,
                         r.build as u8,
-                        r.cow_prop as u8,
+                        r.prop_mode,
                         r.gl as u8,
+                        r.hdr_spoof as u8,
                         r.cpu as u8,
                         r.mem as u8,
                         r.vfs_nodes as u8,
@@ -159,6 +199,87 @@ fn main() {
         "sync" => {
             store.save_all_and_compile();
             println!("{{\"ok\":true}}");
+        }
+        "runtime-status" => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+            match sub {
+                "clear" => {
+                    StoreEngine::clear_runtime_status();
+                    println!("{{\"ok\":true}}");
+                }
+                _ => {
+                    let map = StoreEngine::load_runtime_status();
+                    if json_mode {
+                        println!("{}", serde_json::to_string(&map).unwrap_or_else(|_| "{}".into()));
+                    } else if map.is_empty() {
+                        println!("  (暂无已记录的应用运行态状态)");
+                    } else {
+                        for (pkg, st) in map {
+                            println!(
+                                "  * {} [PID:{}] Prop:{}->{} (核验:{}, +插:{}) | VFS:{}/{} (活体:{}) | 零驻留:{}",
+                                pkg,
+                                st.pid,
+                                st.prop_req,
+                                st.prop_eff,
+                                st.prop_verified,
+                                st.prop_inserted,
+                                st.vfs_mounted,
+                                st.vfs_requested,
+                                st.live_nodes,
+                                if st.zero_residence { "是" } else { "否" }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        "auto-spoof" => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("get");
+            match sub {
+                "get" => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&store.auto_spoof).unwrap_or_else(|_| "{}".into())
+                    );
+                }
+                "status" => {
+                    let pid = watcher::get_running_watcher_pid();
+                    println!(
+                        "{{\"ok\":true,\"enabled\":{},\"tplId\":\"{}\",\"watcherRunning\":{},\"watcherPid\":{}}}",
+                        store.auto_spoof.enabled,
+                        store.auto_spoof.tpl_id,
+                        pid.is_some(),
+                        pid.unwrap_or(0)
+                    );
+                }
+                "set" | "set-stdin" => {
+                    let payload = if sub == "set-stdin" {
+                        read_stdin_all()
+                    } else {
+                        get_opt(&args, "--json", "").to_string()
+                    };
+                    match serde_json::from_str::<AutoSpoofConfig>(&payload) {
+                        Ok(cfg) => {
+                            let will_enable = cfg.enabled;
+                            if store.save_auto_spoof(cfg) {
+                                if will_enable {
+                                    // 首次开启时立刻刷新存量应用快照，避免误伤旧应用
+                                    let _ = watcher::scan_once(true);
+                                }
+                                println!("{{\"ok\":true}}");
+                            } else {
+                                println!("{{\"ok\":false,\"error\":\"invalid_auto_spoof\"}}");
+                                process::exit(1);
+                            }
+                        }
+                        Err(_) => {
+                            println!("{{\"ok\":false,\"error\":\"json_parse_error\"}}");
+                            process::exit(1);
+                        }
+                    }
+                }
+                _ => process::exit(1),
+            }
         }
         "clone-device" => {
             let custom_id = get_opt(&args, "--id", "");
@@ -282,11 +403,40 @@ fn main() {
                 let mem = find_opt(&args, "--mem").map(parse_bool_val).unwrap_or(legacy_vfs);
                 let vfs_nodes = find_opt(&args, "--vfs-nodes").map(parse_bool_val).unwrap_or(legacy_vfs);
 
+                let prop_mode = if let Some(pm) = find_opt(&args, "--prop-mode") {
+                    sanitize_prop_mode(pm)
+                } else if parse_bool_val(get_opt(&args, "--cow-prop", "0")) {
+                    "cow".into()
+                } else {
+                    "hook".into()
+                };
+
+                let mut overrides = find_opt(&args, "--overrides-b64")
+                    .and_then(base64_url_decode)
+                    .and_then(|bytes| serde_json::from_slice::<AppOverrides>(&bytes).ok())
+                    .unwrap_or_default();
+
+                if let Some(ram_s) = find_opt(&args, "--ram-override") {
+                    overrides.ram_gb = ram_s.trim().parse::<i32>().ok().filter(|&v| v > 0);
+                }
+                if let Some(cores_s) = find_opt(&args, "--cores-override") {
+                    overrides.cpu_cores = cores_s.trim().parse::<i32>().ok().filter(|&v| v > 0);
+                }
+                if let Some(cp_b64) = find_opt(&args, "--custom-props-b64") {
+                    if let Some(bytes) = base64_url_decode(cp_b64) {
+                        if let Ok(text) = String::from_utf8(bytes) {
+                            overrides.custom_props = text;
+                        }
+                    }
+                }
+                overrides.normalize();
+
                 let mut route = AppRoute {
                     pkg_name: args[3].clone(),
                     tpl_id: args[4].clone(),
                     build: parse_bool_val(get_opt(&args, "--build", "1")),
-                    cow_prop: parse_bool_val(get_opt(&args, "--cow-prop", "0")),
+                    prop_mode,
+                    cow_prop: false,
                     gl: parse_bool_val(get_opt(&args, "--gl", "1")),
                     vfs: cpu || mem || vfs_nodes,
                     cpu,
@@ -294,8 +444,10 @@ fn main() {
                     vfs_nodes,
                     probe: parse_bool_val(get_opt(&args, "--probe", "0")),
                     sdk_spoof: parse_bool_val(get_opt(&args, "--sdk", "0")),
+                    hdr_spoof: parse_bool_val(get_opt(&args, "--hdr", "0")),
                     refresh_rate: sanitize_refresh_rate(fps_str.parse::<i32>().unwrap_or(0)),
                     mount_ns: parse_bool_val(mount_ns_str),
+                    overrides,
                 };
                 route.normalize();
                 let restart = has_flag(&args, "--restart");

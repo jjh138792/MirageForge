@@ -13,6 +13,10 @@ fi
 "$CLI" status
 
 echo "--------------------------------------------------------"
+echo "- 引擎真实生效态 (runtime-status):"
+"$CLI" runtime-status
+
+echo "--------------------------------------------------------"
 echo "- 最近 6 次应用注入遥测 (probe telemetry):"
 "$CLI" probe telemetry --limit 6
 

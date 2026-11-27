@@ -11,7 +11,7 @@ MOD_VER=$(grep_prop version "$MODPATH/module.prop")
 MOD_CODE=$(grep_prop versionCode "$MODPATH/module.prop")
 
 ui_print "========================================================"
-ui_print "   蜃楼工坊 · MirageForge $MOD_VER (Build $MOD_CODE)     " 
+ui_print "   蜃楼工坊 · MirageForge $MOD_VER (Build $MOD_CODE)     "
 ui_print "========================================================"
 ui_print "- 设备架构: $ARCH ($ABI) | Android API: $API"
 
@@ -23,6 +23,7 @@ ui_print "- 正在解压模块核心组件与光学液态玻璃 WebUI 资源..."
 unzip -o "$ZIPFILE" \
   "module.prop" \
   "action.sh" \
+  "service.sh" \
   "uninstall.sh" \
   "bin/*" \
   "zygisk/*" \
@@ -58,6 +59,7 @@ set_perm_recursive "$MODPATH/zygisk" 0 0 0755 0644
 set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm_recursive "$MODPATH/webroot" 0 0 0755 0644
 set_perm "$MODPATH/action.sh" 0 0 0755
+set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 
 ui_print "- MirageForge $MOD_VER 安装完成！重启设备后生效。"

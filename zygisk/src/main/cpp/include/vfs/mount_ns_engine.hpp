@@ -292,9 +292,12 @@ inline MountNsExecSummary request_private_mount_ns_in_pre_specialize(int fd) {
                     if (!ctx.empty()) {
                         auto it = ctx_to_idx.find(ctx);
                         if (it != ctx_to_idx.end()) ti = it->second;
+                    } else if (def_idx < vmas.size()) {
+                        ti = def_idx;
                     }
+                } else if (def_idx < vmas.size()) {
+                    ti = def_idx;
                 }
-                if (ti == vmas.size() && def_idx < vmas.size()) ti = def_idx;
                 if (ti < vmas.size()) {
                     grouped[ti].emplace_back(mk.first, mk.second);
                 }
