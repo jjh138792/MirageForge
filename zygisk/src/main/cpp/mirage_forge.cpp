@@ -108,29 +108,96 @@ public:
         raw_kvs.clear();
 
         if (!g_cfg.is_any_enabled()) {
-            uint8_t no_ns = 0;
-            write_full(fd, &no_ns, sizeof(no_ns));
+            uint8_t zero = 0;
+            write_full(fd, &zero, sizeof(zero)); // want_ns = 0
+            write_full(fd, &zero, sizeof(zero)); // has_status = 0
             close(fd);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        if (g_cfg.vfs.any_enabled() || g_cfg.build.any_prop_enabled()) {
+        // 严格初始化顺序：必须先就绪 VFS/Bionic 符号与属性默认表，再发起统一 MountNS 请求
+        if (g_cfg.vfs.any_enabled() || g_cfg.build.enabled) {
             init_vfs_symbols();
         }
         if (g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_vfs_nodes) {
             init_vfs_clusters_lightweight();
         }
-
-        bool want_mount_ns = (g_cfg.vfs.any_enabled() && g_cfg.vfs.enable_mount_ns);
-        uint32_t ns_mounted_cnt = 0;
-        std::string ns_diag;
-        if (want_mount_ns) {
-            ns_mounted_cnt = request_private_mount_ns_in_pre_specialize(fd, &ns_diag);
-        } else {
-            uint8_t no_ns = 0;
-            write_full(fd, &no_ns, sizeof(no_ns));
+        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
+            init_bionic_prop_symbols();
         }
+        if (g_cfg.build.enabled) {
+            prepare_bionic_prop_map_defaults();
+        }
+
+        // 1. 统一 MountNS 握手（同步处理 VFS 节点 + MountNS 零脏页属性区）
+        MountNsExecSummary ns_summary = request_private_mount_ns_in_pre_specialize(fd);
+
+        // 2. 系统属性三引擎自适应执行与容灾降级：MountNS -> 纯 COW -> Hook
+        uint32_t final_prop_verified = 0;
+        uint32_t final_prop_inserted = 0;
+        std::string status_diag = ns_summary.diag;
+
+        if (g_cfg.build.enabled) {
+            g_cfg.build.effective_prop_mode = g_cfg.build.prop_mode;
+
+            if (g_cfg.build.effective_prop_mode == PropSpoofMode::MOUNT_NS) {
+                if (ns_summary.prop_verified > 0) {
+                    final_prop_verified = ns_summary.prop_verified;
+                    final_prop_inserted = ns_summary.prop_inserted;
+                } else {
+                    g_cfg.build.effective_prop_mode = PropSpoofMode::COW;
+                    if (!status_diag.empty()) status_diag += "|";
+                    status_diag += "prop_ns_fallback=cow";
+                }
+            }
+
+            if (g_cfg.build.effective_prop_mode == PropSpoofMode::COW) {
+                NativePropSpoofStats cow_st = apply_cow_prop_spoof(
+                    orig_system_property_find,
+                    orig_system_property_read_callback,
+                    orig_system_property_get,
+                    orig_fopen,
+                    orig_fclose
+                );
+                if (cow_st.verified_ok > 0) {
+                    final_prop_verified = cow_st.verified_ok;
+                    final_prop_inserted = cow_st.inserted_new;
+                    if (!status_diag.empty()) status_diag += "|";
+                    status_diag += "cow_vmas=" + std::to_string(cow_st.remapped_vmas) +
+                                   ",ins=" + std::to_string(cow_st.inserted_new);
+                } else {
+                    g_cfg.build.effective_prop_mode = PropSpoofMode::HOOK;
+                    if (!status_diag.empty()) status_diag += "|";
+                    status_diag += "cow_fallback=hook";
+                }
+            }
+
+            // 仅在最终落入 HOOK 模式时构建只读匿名属性区（纯 COW / MountNS 模式 0 匿名内存痕迹）
+            if (g_cfg.build.effective_prop_mode == PropSpoofMode::HOOK) {
+                freeze_bionic_prop_arena();
+                final_prop_verified = static_cast<uint32_t>(g_cfg.build.prop_map.size());
+            }
+        }
+
+        if (g_cfg.gl.enabled) {
+            init_graphics_symbols();
+        }
+
+        need_resident_hooks_ = needs_any_plt_hooks();
+        uint8_t zero_residence = need_resident_hooks_ ? 0 : 1;
+
+        // 3. 向 Companion 汇报真实落盘的运行时状态（用于生成 runtime_status.json 实时徽章）
+        uint8_t has_status = 1;
+        write_full(fd, &has_status, sizeof(has_status));
+        write_str(fd, g_cfg.build.enabled ? prop_mode_to_str(g_cfg.build.prop_mode) : "off");
+        write_str(fd, g_cfg.build.enabled ? prop_mode_to_str(g_cfg.build.effective_prop_mode) : "off");
+        write_full(fd, &final_prop_verified, sizeof(final_prop_verified));
+        write_full(fd, &final_prop_inserted, sizeof(final_prop_inserted));
+        write_full(fd, &ns_summary.vfs_mounted, sizeof(ns_summary.vfs_mounted));
+        write_full(fd, &ns_summary.vfs_requested, sizeof(ns_summary.vfs_requested));
+        write_full(fd, &zero_residence, sizeof(zero_residence));
+        write_str(fd, status_diag);
 
         uint8_t sink_ready = 0;
         read_full(fd, &sink_ready, sizeof(sink_ready));
@@ -138,48 +205,22 @@ public:
         if (g_cfg.probe.enabled && sink_ready == 1) {
             api->exemptFd(fd);
             g_probe_log_fd = fd;
-            if (want_mount_ns && ns_mounted_cnt == 0 && !ns_diag.empty()) {
-                emit_probe("VFS_MOUNT_NS", "PrivateMountNS_Fallback", ns_diag);
-            }
         } else {
             close(fd);
         }
 
-        if (g_cfg.build.any_prop_enabled() || g_cfg.probe.enabled) {
-            init_bionic_prop_symbols();
-        }
-        if (g_cfg.build.any_prop_enabled()) {
-            prepare_bionic_prop_map_defaults();
-        }
-
-        // COW Prop Spoof：在单线程子进程阶段对命中属性区执行私有 MAP_PRIVATE|MAP_FIXED 原地覆写
-        if (g_cfg.build.cow_prop) {
-            CowSpoofStats cow_st = apply_cow_prop_spoof(orig_system_property_find, orig_fopen, orig_fclose);
-            if (g_cfg.probe.enabled) {
-                emit_probe("COW_PROP", "PrivateCOW_Active",
-                           "patched=" + std::to_string(cow_st.patched_props) +
-                           " vmas=" + std::to_string(cow_st.remapped_vmas) +
-                           " fallback=" + std::to_string(cow_st.skipped_props));
-            }
-        }
-
-        if (g_cfg.build.enabled) {
-            freeze_bionic_prop_arena();
-        }
-        if (g_cfg.gl.enabled) {
-            init_graphics_symbols();
-        }
+        // 仅在用户显式开启「探针」时安装崩溃信号捕获，日常保持原厂信号处理器 0 改动
         if (g_cfg.probe.enabled) {
             install_crash_signal_logger(pkg_name);
         }
 
         g_cfg.active = true;
 
-        // 严格 0 改动：若仅开启了 COW Prop Spoof（无需任何 PLT Hook），直接免扫描、免挂载并卸载自身
-        if (needs_any_plt_hooks()) {
+        if (need_resident_hooks_) {
             init_linker_symbols();
             scan_and_commit_plt_hooks();
         } else if (!g_cfg.build.enabled) {
+            // 既无需驻留 PLT 也无需在 postAppSpecialize 反射 Java Build：立刻自卸载
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
         }
     }
@@ -192,6 +233,14 @@ public:
             reflect_java_build_fields(env);
             g_cfg.build.wipe_volatile_reflection_maps();
         }
+        if (needs_display_lazy_hook()) {
+            try_lazy_spoof_display_modes();
+        }
+
+        // 终极零驻留隐身：纯 COW/MountNS 场景下，Java 反射完毕立即卸载自身 .so
+        if (!need_resident_hooks_) {
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        }
     }
 
     void preServerSpecialize(ServerSpecializeArgs *) override {
@@ -201,17 +250,22 @@ public:
 private:
     Api *api = nullptr;
     JNIEnv *env = nullptr;
+    bool need_resident_hooks_ = false;
 
     void load_modular_config(const std::vector<std::pair<std::string, std::string>> &raw_kvs) {
         bool legacy_vfs_on = false;
         bool has_granular_vfs = false;
+        bool has_prop_mode = false;
+        bool legacy_cow_on = false;
 
         for (const auto &kv : raw_kvs) {
             const std::string &k = kv.first;
             const std::string &v = kv.second;
             if (k == "META:ENABLE_BUILD")          g_cfg.build.enabled = (v == "1");
-            else if (k == "META:ENABLE_COW_PROP")  g_cfg.build.cow_prop = (v == "1");
+            else if (k == "META:PROP_MODE")        { g_cfg.build.prop_mode = parse_prop_mode(v); has_prop_mode = true; }
+            else if (k == "META:ENABLE_COW_PROP")  legacy_cow_on = (v == "1");
             else if (k == "META:ENABLE_GL")        g_cfg.gl.enabled = (v == "1");
+            else if (k == "META:ENABLE_HDR")       g_cfg.gl.enable_hdr_spoof = (v == "1");
             else if (k == "META:ENABLE_VFS")       legacy_vfs_on = (v == "1");
             else if (k == "META:ENABLE_CPU")       { g_cfg.vfs.enable_cpu = (v == "1"); has_granular_vfs = true; }
             else if (k == "META:ENABLE_MEM")       { g_cfg.vfs.enable_mem = (v == "1"); has_granular_vfs = true; }
@@ -222,17 +276,21 @@ private:
             else if (k == "META:ENABLE_MOUNT_NS")  g_cfg.vfs.enable_mount_ns = (v == "1");
         }
 
-        // 向下兼容 1.2.x 旧版 .conf：若未出现新细粒度键，自动继承 META:ENABLE_VFS
         if (!has_granular_vfs && legacy_vfs_on) {
             g_cfg.vfs.enable_cpu = true;
             g_cfg.vfs.enable_mem = true;
             g_cfg.vfs.enable_vfs_nodes = true;
         }
         g_cfg.vfs.enabled = g_cfg.vfs.any_enabled();
+
+        if (!has_prop_mode && legacy_cow_on) {
+            g_cfg.build.prop_mode = PropSpoofMode::COW;
+        }
         if (!g_cfg.build.enabled) {
-            g_cfg.build.cow_prop = false;
+            g_cfg.build.prop_mode = PropSpoofMode::HOOK;
             g_cfg.build.force_spoof_sdk = false;
         }
+        g_cfg.build.effective_prop_mode = g_cfg.build.prop_mode;
 
         for (const auto &kv : raw_kvs) {
             const std::string &k = kv.first;
@@ -289,10 +347,9 @@ private:
                 continue;
             }
 
-            if (!g_cfg.build.any_prop_enabled()) continue;
+            if (!g_cfg.build.enabled) continue;
 
             if (k.rfind("BUILD:", 0) == 0) {
-                if (!g_cfg.build.enabled) continue;
                 std::string b_field = k.substr(6);
                 g_cfg.build.build_map[b_field] = v;
                 if (b_field == "DEVICE") {
@@ -300,7 +357,6 @@ private:
                     g_cfg.build.build_map["ODM_SKU"] = v;
                 }
             } else if (k.rfind("VERSION:", 0) == 0) {
-                if (!g_cfg.build.enabled) continue;
                 std::string v_field = k.substr(8);
                 if (!g_cfg.build.force_spoof_sdk &&
                     (v_field == "SDK_INT" || v_field == "DEVICE_INITIAL_SDK_INT" ||
@@ -328,10 +384,86 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程（并发安全缓存 + Mount NS + 探针与真实死亡核验）
+// Root Companion 守护进程（并发安全缓存 + 统一 MountNS + 实时状态落盘 + 探针）
 // ============================================================================
 static std::mutex g_file_write_mtx;
 static std::mutex g_companion_cache_mtx;
+
+struct RuntimeStatusRecord {
+    int64_t timestamp = 0;
+    int32_t pid = 0;
+    std::string prop_req;
+    std::string prop_eff;
+    uint32_t prop_verified = 0;
+    uint32_t prop_inserted = 0;
+    uint32_t vfs_mounted = 0;
+    uint32_t vfs_requested = 0;
+    uint32_t live_nodes = 0;
+    bool zero_residence = false;
+    std::string diag;
+};
+
+static std::unordered_map<std::string, RuntimeStatusRecord> g_runtime_status_map;
+
+static std::string json_escape_str(const std::string &in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (unsigned char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c >= 0x20) out.push_back(static_cast<char>(c));
+                break;
+        }
+    }
+    return out;
+}
+
+static void record_runtime_status_as_root(const std::string &pkg, const RuntimeStatusRecord &rec) {
+    std::lock_guard<std::mutex> lock(g_file_write_mtx);
+    if (g_runtime_status_map.size() >= 128 && g_runtime_status_map.find(pkg) == g_runtime_status_map.end()) {
+        g_runtime_status_map.erase(g_runtime_status_map.begin());
+    }
+    g_runtime_status_map[pkg] = rec;
+
+    mkdir(DATA_ROOT_DIR, 0700);
+    std::ostringstream ss;
+    ss << "{\n";
+    bool first = true;
+    for (const auto &kv : g_runtime_status_map) {
+        if (!first) ss << ",\n";
+        first = false;
+        const auto &r = kv.second;
+        ss << "  \"" << json_escape_str(kv.first) << "\": {"
+           << "\"timestamp\":" << r.timestamp
+           << ",\"pid\":" << r.pid
+           << ",\"propReq\":\"" << json_escape_str(r.prop_req) << "\""
+           << ",\"propEff\":\"" << json_escape_str(r.prop_eff) << "\""
+           << ",\"propVerified\":" << r.prop_verified
+           << ",\"propInserted\":" << r.prop_inserted
+           << ",\"vfsMounted\":" << r.vfs_mounted
+           << ",\"vfsRequested\":" << r.vfs_requested
+           << ",\"liveNodes\":" << r.live_nodes
+           << ",\"zeroResidence\":" << (r.zero_residence ? "true" : "false")
+           << ",\"diag\":\"" << json_escape_str(r.diag) << "\""
+           << "}";
+    }
+    ss << "\n}\n";
+
+    std::string payload = ss.str();
+    std::string tmp_path = std::string(RUNTIME_STATUS_PATH) + ".tmp";
+    FILE *fp = std::fopen(tmp_path.c_str(), "w");
+    if (!fp) return;
+    std::fwrite(payload.data(), 1, payload.size(), fp);
+    std::fflush(fp);
+    std::fclose(fp);
+    chmod(tmp_path.c_str(), 0600);
+    std::rename(tmp_path.c_str(), RUNTIME_STATUS_PATH);
+}
 
 static void append_line_as_root(const char *path, const std::string &line) {
     std::lock_guard<std::mutex> lock(g_file_write_mtx);
@@ -532,8 +664,31 @@ static void companion_handler(int fd) {
         write_str(fd, kv.second);
     }
 
-    std::string ns_diag;
-    uint32_t ns_mounted_cnt = companion_handle_mount_ns_sync(fd, app_pid, &ns_diag);
+    // 1. 统一 MountNS 挂载（VFS 文件节点 + 系统属性区 + 活体动态 pwrite 线程）
+    MountNsExecSummary ns_summary = companion_handle_mount_ns_sync(fd, app_pid);
+
+    // 2. 接收 App 端最终引擎状态汇报并落盘 runtime_status.json
+    uint8_t has_status = 0;
+    if (!read_full(fd, &has_status, sizeof(has_status)) || has_status == 0) {
+        return;
+    }
+
+    RuntimeStatusRecord st{};
+    st.timestamp = static_cast<int64_t>(std::time(nullptr));
+    st.pid = app_pid;
+    st.prop_req = read_str(fd);
+    st.prop_eff = read_str(fd);
+    read_full(fd, &st.prop_verified, sizeof(st.prop_verified));
+    read_full(fd, &st.prop_inserted, sizeof(st.prop_inserted));
+    read_full(fd, &st.vfs_mounted, sizeof(st.vfs_mounted));
+    read_full(fd, &st.vfs_requested, sizeof(st.vfs_requested));
+    uint8_t zero_res_u8 = 0;
+    read_full(fd, &zero_res_u8, sizeof(zero_res_u8));
+    st.zero_residence = (zero_res_u8 == 1);
+    st.live_nodes = ns_summary.live_nodes;
+    st.diag = read_str(fd);
+
+    record_runtime_status_as_root(pkg_name, st);
 
     std::string model = entries.count("BUILD:MODEL") ? entries.at("BUILD:MODEL") : "Custom";
     std::string gpu   = entries.count("GLES:RENDERER") ? entries.at("GLES:RENDERER") : "DefaultGPU";
@@ -545,14 +700,17 @@ static void companion_handler(int fd) {
         append_line_as_root(
             PROBE_LOG_PATH,
             "[PROBE][" + pkg_name + "][SESSION] MirageForge_v" + version_snapshot +
-                "_Attached => " + model + " | " + gpu + " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
+                "_Attached => " + model + " | " + gpu +
+                " | prop=" + st.prop_eff + "(" + std::to_string(st.prop_verified) +
+                ",+" + std::to_string(st.prop_inserted) + ")" +
+                " | zero_res=" + std::string(st.zero_residence ? "1" : "0") +
+                " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
         );
-        if (!ns_diag.empty()) {
+        if (!st.diag.empty() && st.diag != "disabled") {
             append_line_as_root(
                 PROBE_LOG_PATH,
-                "[PROBE][" + pkg_name + "][VFS_MOUNT_NS] " +
-                    std::string(ns_mounted_cnt > 0 ? "PrivateMountNS_Active" : "PrivateMountNS_Fallback") +
-                    " => " + ns_diag + " @@ companion::mount_ns(pid=" + std::to_string(app_pid) + ")"
+                "[PROBE][" + pkg_name + "][ENGINE_DIAG] " + st.prop_req + "->" + st.prop_eff +
+                    " => " + st.diag + " @@ companion(pid=" + std::to_string(app_pid) + ")"
             );
         }
 

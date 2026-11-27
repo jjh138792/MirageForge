@@ -16,6 +16,7 @@ namespace mirage {
 inline bool is_sensitive_proc_line(const char *line, bool is_mounts) noexcept {
     if (std::strstr(line, "mirage_forge") != nullptr ||
         std::strstr(line, "mnt_stage") != nullptr ||
+        std::strstr(line, ".st_ns") != nullptr ||
         std::strstr(line, "zygisk") != nullptr ||
         std::strstr(line, "magisk") != nullptr ||
         std::strstr(line, "/data/adb") != nullptr ||
@@ -25,10 +26,24 @@ inline bool is_sensitive_proc_line(const char *line, bool is_mounts) noexcept {
         std::strstr(line, "lsposed") != nullptr) {
         return true;
     }
-    if (is_mounts && g_vfs_ns_mounted.load(std::memory_order_acquire) &&
-        (std::strstr(line, " /proc/") != nullptr || std::strstr(line, " /sys/") != nullptr) &&
-        (std::strstr(line, "tmpfs") != nullptr || std::strstr(line, "//deleted") != nullptr)) {
-        return true;
+
+    if (is_mounts) {
+        bool any_ns = g_vfs_ns_mounted.load(std::memory_order_acquire) ||
+                      g_prop_ns_mounted.load(std::memory_order_acquire);
+        if (any_ns) {
+            // 任何针对单个 /dev/__properties__/* 或 /__properties__/* 文件的 bind-mount 均直接清洗
+            if (std::strstr(line, " /dev/__properties__/") != nullptr ||
+                std::strstr(line, " /__properties__/") != nullptr) {
+                return true;
+            }
+            // 清洗挂载在 /proc/* 或 /sys/* 子节点上的 tmpfs / 已删节点 bind-mount（保留原生 /proc 与 /sys 根挂载）
+            if ((std::strstr(line, " /proc/") != nullptr || std::strstr(line, " /sys/") != nullptr) &&
+                (std::strstr(line, "tmpfs") != nullptr ||
+                 std::strstr(line, "//deleted") != nullptr ||
+                 std::strstr(line, " (deleted)") != nullptr)) {
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -36,10 +51,14 @@ inline bool is_sensitive_proc_line(const char *line, bool is_mounts) noexcept {
 inline bool sanitize_live_proc_file(const std::string &norm_path, std::string *out_clean) {
     bool is_maps = (norm_path == "/proc/self/maps" ||
                     norm_path == "/proc/thread-self/maps" ||
-                    norm_path == "/proc/self/smaps");
+                    norm_path == "/proc/self/smaps" ||
+                    norm_path == "/proc/thread-self/smaps");
     bool is_mounts = (norm_path == "/proc/self/mountinfo" ||
+                      norm_path == "/proc/thread-self/mountinfo" ||
                       norm_path == "/proc/self/mounts" ||
-                      norm_path == "/proc/mounts");
+                      norm_path == "/proc/thread-self/mounts" ||
+                      norm_path == "/proc/mounts" ||
+                      norm_path == "/proc/self/mountstats");
 
     if (!is_maps && !is_mounts) return false;
 

@@ -10,114 +10,53 @@
 #include <cinttypes>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/system_properties.h>
 #include "mirage_config.hpp"
+#include "bionic/prop_trie_patcher.hpp"
 
 namespace mirage {
 
-// 严格对齐 AOSP bionic/libc/system_properties/include/system_properties/prop_area.h & prop_info.h
-struct PropAreaHeaderRaw {
-    uint32_t bytes_used;
-    uint32_t serial;
-    uint32_t magic;       // 0x504f5250 ("PROP")
-    uint32_t version;     // 0xfc6ed0ab
-    uint32_t reserved[28];
-};
-static_assert(sizeof(PropAreaHeaderRaw) == 128, "PropAreaHeaderRaw must be 128 bytes");
-
-struct PropInfoCowRaw {
-    uint32_t serial;
-    union {
-        char value[PROP_VALUE_MAX];
-        struct {
-            char error_message[56];
-            uint32_t offset;
-        } long_property;
-    };
-    char name[1];
-};
-static_assert(offsetof(PropInfoCowRaw, value) == 4, "PropInfoCowRaw::value offset mismatch");
-static_assert(offsetof(PropInfoCowRaw, name) == 96, "PropInfoCowRaw::name offset mismatch");
-
-constexpr uint32_t kPropAreaMagic   = 0x504f5250u;
-constexpr uint32_t kPropAreaVersion = 0xfc6ed0abu;
-constexpr uint32_t kPropLongFlag    = 1u << 16;
-
-struct CowSpoofStats {
-    uint32_t patched_props = 0;
-    uint32_t remapped_vmas = 0;
-    uint32_t skipped_props = 0;
+struct NativePropSpoofStats {
+    uint32_t patched_existing = 0;
+    uint32_t inserted_new     = 0;
+    uint32_t remapped_vmas    = 0;
+    uint32_t verified_ok      = 0;
+    uint32_t skipped_props    = 0;
 };
 
-// 记录已通过私有 COW 原地覆写的属性名：
-// 1. 仅开 COW 时实现 0 PLT Hook 隐蔽伪装
-// 2. 与常规属性伪装同开时，已 COW 覆写的属性直接交由原生 Bionic 零开销读取真实 /dev/__properties__ 指针
-inline std::unordered_set<std::string> g_cow_patched_keys;
+// 记录已通过原生 Bionic 读回核验的属性键（供 COW 与 MountNS 两种纯原生模式共用）
+inline std::unordered_set<std::string> g_native_prop_patched_keys;
 
-inline bool is_cow_patched_key(const char *name) noexcept {
-    if (!name || g_cow_patched_keys.empty()) return false;
-    return g_cow_patched_keys.find(name) != g_cow_patched_keys.end();
+inline bool is_native_prop_patched(const char *name) noexcept {
+    if (!name || g_native_prop_patched_keys.empty()) return false;
+    return g_native_prop_patched_keys.find(name) != g_native_prop_patched_keys.end();
 }
 
-inline CowSpoofStats apply_cow_prop_spoof(
-    const prop_info *(*orig_find_fn)(const char *),
+struct PropAreaVmaInfo {
+    uintptr_t start = 0;
+    uintptr_t end   = 0;
+    uintptr_t offset = 0;
+    bool is_shared  = false;
+    std::string vma_path;
+    std::string ctx_name;
+};
+
+// 扫描当前进程全部合法属性区映射（同时识别标准 /dev/__properties__/ 与云机容器 /__properties__/）
+inline std::vector<PropAreaVmaInfo> scan_self_prop_area_vmas(
     FILE *(*orig_fopen_fn)(const char *, const char *),
     int (*orig_fclose_fn)(FILE *)) {
-    CowSpoofStats stats{};
-    if (!g_cfg.build.cow_prop || !orig_find_fn || g_cfg.build.prop_map.empty()) {
-        return stats;
-    }
-
-    // 绝对 0 改动安全闸门：绝不允许在 Zygote 本体 (ppid <= 1) 执行属性区重映射
-    if (getppid() <= 1) {
-        return stats;
-    }
-
-    ErrnoRestorer errno_guard;
-
-    struct PendingCowPatch {
-        uintptr_t pi_addr;
-        const std::string *key;
-        const std::string *val;
-    };
-
-    // 1. 触发 Bionic 懒加载各目标属性对应的 /dev/__properties__/* 映射，并拿到精确 prop_info* 地址
-    std::vector<PendingCowPatch> pending;
-    pending.reserve(g_cfg.build.prop_map.size());
-    for (const auto &kv : g_cfg.build.prop_map) {
-        if (kv.first.empty()) continue;
-        const prop_info *pi = orig_find_fn(kv.first.c_str());
-        if (pi) {
-            pending.push_back({reinterpret_cast<uintptr_t>(pi), &kv.first, &kv.second});
-        } else {
-            ++stats.skipped_props;
-        }
-    }
-    if (pending.empty()) {
-        return stats;
-    }
-
-    // 2. 扫描 /proc/self/maps，定位包含目标 prop_info* 的 /dev/__properties__/* 映射区域
-    struct PropVma {
-        uintptr_t start;
-        uintptr_t end;
-        uintptr_t offset;
-        bool is_shared;
-        std::string path;
-        std::vector<size_t> patch_indices;
-    };
-
-    std::vector<PropVma> vmas;
+    std::vector<PropAreaVmaInfo> vmas;
     FILE *fp = orig_fopen_fn ? orig_fopen_fn("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
-    if (!fp) return stats;
+    if (!fp) return vmas;
 
     char line[1024];
     while (std::fgets(line, sizeof(line), fp)) {
-        if (std::strstr(line, "/dev/__properties__/") == nullptr) {
+        if (std::strstr(line, "/__properties__/") == nullptr) {
             continue;
         }
         uintptr_t s = 0, e = 0, off = 0;
@@ -127,7 +66,7 @@ inline CowSpoofStats apply_cow_prop_spoof(
                         &s, &e, perms, &off, &path_pos) < 4) {
             continue;
         }
-        if (e <= s || (e - s) < sizeof(PropAreaHeaderRaw)) continue;
+        if (e <= s || (e - s) <= sizeof(PropAreaHeaderRaw)) continue;
 
         char *p = line + path_pos;
         while (*p == ' ' || *p == '\t') ++p;
@@ -135,47 +74,177 @@ inline CowSpoofStats apply_cow_prop_spoof(
         while (len > 0 && (p[len - 1] == '\n' || p[len - 1] == '\r')) p[--len] = '\0';
         if (len == 0 || std::strstr(p, " (deleted)") != nullptr) continue;
 
-        // 跳过目录或非属性区文件（如 properties_serial）
-        const auto *hdr = reinterpret_cast<const PropAreaHeaderRaw *>(s);
-        if (hdr->magic != kPropAreaMagic || hdr->version != kPropAreaVersion) {
+        const auto *base = reinterpret_cast<const uint8_t *>(s);
+        if (!is_valid_prop_area_header(base, static_cast<size_t>(e - s))) {
             continue;
         }
 
-        vmas.push_back({s, e, off, perms[3] == 's', std::string(p, len), {}});
+        PropAreaVmaInfo info;
+        info.start = s;
+        info.end = e;
+        info.offset = off;
+        info.is_shared = (perms[3] == 's');
+        info.vma_path.assign(p, len);
+        info.ctx_name = prop_path_basename(info.vma_path);
+        vmas.push_back(std::move(info));
     }
-    if (orig_fclose_fn) orig_fclose_fn(fp); else std::fclose(fp);
 
-    if (vmas.empty()) {
-        stats.skipped_props += static_cast<uint32_t>(pending.size());
+    if (orig_fclose_fn) orig_fclose_fn(fp); else std::fclose(fp);
+    return vmas;
+}
+
+// 真实读回核验：通过原生 Bionic 查询每个属性并比对结果，绝不虚报成功
+using T_NativeReadCb = void (*)(void *, const char *, const char *, uint32_t);
+
+inline uint32_t verify_native_prop_spoof(
+    const prop_info *(*orig_find_fn)(const char *),
+    void (*orig_read_cb_fn)(const prop_info *, T_NativeReadCb, void *),
+    int (*orig_get_fn)(const char *, char *)) {
+    g_native_prop_patched_keys.clear();
+    if (!orig_find_fn) return 0;
+
+    uint32_t ok_cnt = 0;
+    for (const auto &kv : g_cfg.build.prop_map) {
+        const prop_info *pi = orig_find_fn(kv.first.c_str());
+        if (!pi) continue;
+
+        std::string actual;
+        if (orig_read_cb_fn) {
+            auto reader = [](void *c, const char *, const char *val, uint32_t) {
+                if (val) *static_cast<std::string *>(c) = val;
+            };
+            orig_read_cb_fn(pi, reader, &actual);
+        } else if (orig_get_fn) {
+            char buf[PROP_VALUE_MAX] = {0};
+            if (orig_get_fn(kv.first.c_str(), buf) >= 0) actual = buf;
+        }
+
+        if (actual == kv.second) {
+            g_native_prop_patched_keys.insert(kv.first);
+            ++ok_cnt;
+        }
+    }
+    return ok_cnt;
+}
+
+// ============================================================================
+// 纯 COW Prop 引擎：支持原地覆写 + prop_trie 尾部原生插入跨品牌新属性
+// 绝不分配 [anon:SystemProperties]，绝不污染宿主机或 Zygote
+// ============================================================================
+inline NativePropSpoofStats apply_cow_prop_spoof(
+    const prop_info *(*orig_find_fn)(const char *),
+    void (*orig_read_cb_fn)(const prop_info *, T_NativeReadCb, void *),
+    int (*orig_get_fn)(const char *, char *),
+    FILE *(*orig_fopen_fn)(const char *, const char *),
+    int (*orig_fclose_fn)(FILE *)) {
+    NativePropSpoofStats stats{};
+    if (!g_cfg.build.enabled || !orig_find_fn || g_cfg.build.prop_map.empty()) {
         return stats;
     }
 
-    for (size_t i = 0; i < pending.size(); ++i) {
-        uintptr_t addr = pending[i].pi_addr;
-        bool matched = false;
-        for (auto &vma : vmas) {
-            if (addr >= vma.start + sizeof(PropAreaHeaderRaw) && addr < vma.end) {
-                vma.patch_indices.push_back(i);
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) {
-            ++stats.skipped_props;
+    // 绝对 0 改动安全闸门：绝不在 Zygote 本体 (ppid <= 1) 执行属性区私有重映射
+    if (getppid() <= 1) {
+        return stats;
+    }
+
+    ErrnoRestorer errno_guard;
+
+    // 1. 触发 Bionic 懒加载所有目标属性对应的上下文属性区 VMA（即使属性不存在，Bionic 也会映射其归属上下文区）
+    struct ExistingMatch {
+        uintptr_t pi_addr;
+        std::string key;
+        std::string val;
+    };
+    std::vector<ExistingMatch> existing;
+    std::vector<std::pair<std::string, std::string>> missing;
+    existing.reserve(g_cfg.build.prop_map.size());
+
+    for (const auto &kv : g_cfg.build.prop_map) {
+        if (kv.first.empty()) continue;
+        const prop_info *pi = orig_find_fn(kv.first.c_str());
+        if (pi) {
+            existing.push_back({reinterpret_cast<uintptr_t>(pi), kv.first, kv.second});
+        } else {
+            missing.emplace_back(kv.first, kv.second);
         }
     }
 
-    // 3. 仅对实际命中目标属性的 VMA 执行 MAP_PRIVATE | MAP_FIXED 私有写时复制重映射
-    for (auto &vma : vmas) {
-        if (vma.patch_indices.empty()) continue;
+    // 2. 扫描当前进程映射的合法属性区
+    std::vector<PropAreaVmaInfo> vmas = scan_self_prop_area_vmas(orig_fopen_fn, orig_fclose_fn);
+    if (vmas.empty()) {
+        stats.skipped_props = static_cast<uint32_t>(g_cfg.build.prop_map.size());
+        return stats;
+    }
 
+    std::unordered_map<std::string, size_t> ctx_to_vma_idx;
+    for (size_t i = 0; i < vmas.size(); ++i) {
+        ctx_to_vma_idx[vmas[i].ctx_name] = i;
+    }
+
+    std::vector<std::vector<std::pair<std::string, std::string>>> vma_jobs(vmas.size());
+
+    // 2a. 已有属性直接按地址归组
+    for (const auto &ex : existing) {
+        bool placed = false;
+        for (size_t i = 0; i < vmas.size(); ++i) {
+            if (ex.pi_addr >= vmas[i].start + sizeof(PropAreaHeaderRaw) && ex.pi_addr < vmas[i].end) {
+                vma_jobs[i].emplace_back(ex.key, ex.val);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) ++stats.skipped_props;
+    }
+
+    // 2b. 宿主不存在的新增属性：通过 property_info 二进制树解析归属上下文并归组准备尾部插入
+    if (!missing.empty()) {
+        PropertyInfoContextResolver resolver;
+        bool has_resolver = resolver.load_and_verify();
+
+        // 兜底上下文索引（若目标上下文恰好未映射，优先回落至 default_prop）
+        size_t default_vma_idx = vmas.size();
+        for (const char *def_ctx : {"u:object_r:default_prop:s0", "u:object_r:exported_default_prop:s0"}) {
+            auto it = ctx_to_vma_idx.find(def_ctx);
+            if (it != ctx_to_vma_idx.end()) {
+                default_vma_idx = it->second;
+                break;
+            }
+        }
+
+        for (const auto &mk : missing) {
+            size_t target_idx = vmas.size();
+            if (has_resolver) {
+                std::string ctx = resolver.resolve_context(mk.first);
+                if (!ctx.empty()) {
+                    auto it = ctx_to_vma_idx.find(ctx);
+                    if (it != ctx_to_vma_idx.end()) {
+                        target_idx = it->second;
+                    }
+                }
+            }
+            if (target_idx == vmas.size() && default_vma_idx < vmas.size()) {
+                target_idx = default_vma_idx;
+            }
+            if (target_idx < vmas.size()) {
+                vma_jobs[target_idx].emplace_back(mk.first, mk.second);
+            } else {
+                ++stats.skipped_props;
+            }
+        }
+    }
+
+    // 3. 逐个 VMA 执行 MAP_PRIVATE | MAP_FIXED 私有写时复制 -> 原地覆写 + 尾部插节点 -> 恢复 PROT_READ
+    for (size_t i = 0; i < vmas.size(); ++i) {
+        if (vma_jobs[i].empty()) continue;
+
+        const auto &vma = vmas[i];
         size_t vma_len = static_cast<size_t>(vma.end - vma.start);
         bool writable = false;
 
         if (vma.is_shared) {
-            int pfd = open(vma.path.c_str(), O_RDONLY | O_CLOEXEC);
+            int pfd = open_prop_backing_file_ro(vma.vma_path);
             if (pfd < 0) {
-                stats.skipped_props += static_cast<uint32_t>(vma.patch_indices.size());
+                stats.skipped_props += static_cast<uint32_t>(vma_jobs[i].size());
                 continue;
             }
             void *remapped = mmap(
@@ -188,7 +257,7 @@ inline CowSpoofStats apply_cow_prop_spoof(
             );
             close(pfd);
             if (remapped == MAP_FAILED || reinterpret_cast<uintptr_t>(remapped) != vma.start) {
-                stats.skipped_props += static_cast<uint32_t>(vma.patch_indices.size());
+                stats.skipped_props += static_cast<uint32_t>(vma_jobs[i].size());
                 continue;
             }
             writable = true;
@@ -199,74 +268,28 @@ inline CowSpoofStats apply_cow_prop_spoof(
         }
 
         if (!writable) {
-            stats.skipped_props += static_cast<uint32_t>(vma.patch_indices.size());
+            stats.skipped_props += static_cast<uint32_t>(vma_jobs[i].size());
             continue;
         }
 
         ++stats.remapped_vmas;
-        uint32_t vma_patched = 0;
+        PropAreaPatchResult pres = patch_prop_area_buffer(
+            reinterpret_cast<uint8_t *>(vma.start),
+            vma_len,
+            vma_jobs[i],
+            /*allow_insert=*/true
+        );
 
-        for (size_t idx : vma.patch_indices) {
-            const auto &job = pending[idx];
-            const std::string &key = *job.key;
-            const std::string &val = *job.val;
+        stats.patched_existing += pres.patched_existing;
+        stats.inserted_new     += pres.inserted_new;
+        stats.skipped_props    += pres.skipped;
 
-            if (job.pi_addr + offsetof(PropInfoCowRaw, name) + key.size() + 1 > vma.end) {
-                ++stats.skipped_props;
-                continue;
-            }
-
-            auto *pi = reinterpret_cast<PropInfoCowRaw *>(job.pi_addr);
-            // 100% ABI 校验：确保该偏移处确实是目标属性名，防止跨版本偏移错位
-            if (std::memcmp(pi->name, key.data(), key.size() + 1) != 0) {
-                ++stats.skipped_props;
-                continue;
-            }
-
-            uint32_t old_serial = __atomic_load_n(&pi->serial, __ATOMIC_RELAXED);
-            bool patched = false;
-
-            if (val.size() < PROP_VALUE_MAX) {
-                std::memset(pi->value, 0, PROP_VALUE_MAX);
-                std::memcpy(pi->value, val.data(), val.size());
-                uint32_t counter = (old_serial + 2u) & 0x0000FFFEu;
-                uint32_t new_serial = (static_cast<uint32_t>(val.size()) << 24) | counter;
-                __atomic_store_n(&pi->serial, new_serial, __ATOMIC_RELEASE);
-                patched = true;
-            } else if ((old_serial & kPropLongFlag) != 0) {
-                uint32_t loff = pi->long_property.offset;
-                if (loff > 0 && job.pi_addr + loff < vma.end) {
-                    char *long_dst = reinterpret_cast<char *>(job.pi_addr + loff);
-                    size_t max_avail = static_cast<size_t>(vma.end - (job.pi_addr + loff));
-                    size_t old_len = strnlen(long_dst, max_avail);
-                    if (val.size() <= old_len) {
-                        std::memcpy(long_dst, val.data(), val.size());
-                        long_dst[val.size()] = '\0';
-                        uint32_t new_serial = ((old_serial + 2u) & 0x0000FFFEu) | kPropLongFlag;
-                        __atomic_store_n(&pi->serial, new_serial, __ATOMIC_RELEASE);
-                        patched = true;
-                    }
-                }
-            }
-
-            if (patched) {
-                g_cow_patched_keys.insert(key);
-                ++stats.patched_props;
-                ++vma_patched;
-            } else {
-                ++stats.skipped_props;
-            }
-        }
-
-        if (vma_patched > 0) {
-            auto *area = reinterpret_cast<PropAreaHeaderRaw *>(vma.start);
-            __atomic_fetch_add(&area->serial, 2u, __ATOMIC_RELEASE);
-        }
-
-        // 立刻恢复只读权限 (r--p)，不留可写痕迹
+        // 立刻恢复只读权限 (r--p)
         mprotect(reinterpret_cast<void *>(vma.start), vma_len, PROT_READ);
     }
 
+    // 4. 真实读回核验（确保 Bionic 实际读出的值与目标 100% 一致）
+    stats.verified_ok = verify_native_prop_spoof(orig_find_fn, orig_read_cb_fn, orig_get_fn);
     return stats;
 }
 

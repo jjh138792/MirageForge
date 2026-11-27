@@ -25,12 +25,13 @@
 
 namespace mirage {
 
-constexpr const char *MODULE_PROP_PATH = "/data/adb/modules/mirage_forge/module.prop";
-constexpr const char *CLI_BIN_PATH     = "/data/adb/modules/mirage_forge/bin/mirageforge_cli";
-constexpr const char *DATA_ROOT_DIR    = "/data/adb/mirage_forge";
-constexpr const char *ROUTES_DB_PATH   = "/data/adb/mirage_forge/routes.db";
-constexpr const char *APPS_CONF_DIR    = "/data/adb/mirage_forge/apps";
-constexpr const char *LAUNCH_LOG_PATH  = "/data/adb/mirage_forge/launch_history.log";
+constexpr const char *MODULE_PROP_PATH    = "/data/adb/modules/mirage_forge/module.prop";
+constexpr const char *CLI_BIN_PATH        = "/data/adb/modules/mirage_forge/bin/mirageforge_cli";
+constexpr const char *DATA_ROOT_DIR       = "/data/adb/mirage_forge";
+constexpr const char *ROUTES_DB_PATH      = "/data/adb/mirage_forge/routes.db";
+constexpr const char *APPS_CONF_DIR       = "/data/adb/mirage_forge/apps";
+constexpr const char *LAUNCH_LOG_PATH     = "/data/adb/mirage_forge/launch_history.log";
+constexpr const char *RUNTIME_STATUS_PATH = "/data/adb/mirage_forge/runtime_status.json";
 
 inline std::string read_module_prop_version() {
     std::ifstream ifs(MODULE_PROP_PATH);
@@ -135,18 +136,48 @@ inline uint32_t pack_vk_version_str(const std::string &raw) noexcept {
 }
 
 // ============================================================================
-// 微模块 1：系统属性（Java Build + Bionic PLT）与 COW Prop Spoof 配置
+// 系统属性伪装三引擎模式：Hook / 纯 COW / MountNS（零脏页 MAP_SHARED）
+// ============================================================================
+enum class PropSpoofMode : uint8_t {
+    HOOK     = 0,
+    COW      = 1,
+    MOUNT_NS = 2,
+};
+
+inline const char *prop_mode_to_str(PropSpoofMode m) noexcept {
+    switch (m) {
+        case PropSpoofMode::COW:      return "cow";
+        case PropSpoofMode::MOUNT_NS: return "mount_ns";
+        default:                      return "hook";
+    }
+}
+
+inline PropSpoofMode parse_prop_mode(const std::string &s) noexcept {
+    if (s == "cow" || s == "COW") return PropSpoofMode::COW;
+    if (s == "mount_ns" || s == "mountns" || s == "MOUNT_NS") return PropSpoofMode::MOUNT_NS;
+    return PropSpoofMode::HOOK;
+}
+
+// ============================================================================
+// 微模块 1：系统属性三引擎配置（Hook / 纯 COW / MountNS + Java Build 反射）
 // ============================================================================
 struct BuildModuleConfig {
-    bool enabled = false;        // 伪装系统属性 (Java Build 反射 + PLT 属性 Hook + build.prop)
-    bool cow_prop = false;       // COW Prop Spoof (私有写时复制 /dev/__properties__/* 原地覆写)
+    bool enabled = false;
+    PropSpoofMode prop_mode = PropSpoofMode::HOOK;           // 用户期望模式
+    PropSpoofMode effective_prop_mode = PropSpoofMode::HOOK; // 运行时实际生效模式（含安全降级）
     bool force_spoof_sdk = false;
+
     std::unordered_map<std::string, std::string> prop_map;
     std::unordered_map<std::string, std::string> build_map;
     std::unordered_map<std::string, std::string> version_map;
 
     inline bool any_prop_enabled() const noexcept {
-        return enabled || cow_prop;
+        return enabled;
+    }
+
+    inline bool is_pure_native_prop_active() const noexcept {
+        return enabled && (effective_prop_mode == PropSpoofMode::COW ||
+                           effective_prop_mode == PropSpoofMode::MOUNT_NS);
     }
 
     void wipe_volatile_reflection_maps() noexcept {
@@ -156,11 +187,12 @@ struct BuildModuleConfig {
 };
 
 // ============================================================================
-// 微模块 2：OpenGL ES / Vulkan 独立渲染层 / MediaDrm / 屏幕高刷配置
+// 微模块 2：OpenGL ES / Vulkan 独立渲染层 / MediaDrm / 屏幕高刷 / HDR 配置
 // ============================================================================
 struct GraphicsModuleConfig {
     bool enabled = false;
     int max_refresh_rate = 0;
+    bool enable_hdr_spoof = false;
 
     std::string gl_vendor;
     std::string gl_renderer;
@@ -247,11 +279,11 @@ struct CpuClusterSpec {
 };
 
 struct VfsModuleConfig {
-    bool enabled = false;          // 聚合标志：等价于 enable_cpu || enable_mem || enable_vfs_nodes
+    bool enabled = false;          // 聚合标志：enable_cpu || enable_mem || enable_vfs_nodes
     bool enable_cpu = false;       // 伪装 CPU (/proc/cpuinfo, 核数, uname)
     bool enable_mem = false;       // 伪装内存信息 (/proc/meminfo, sysinfo, DDR)
     bool enable_vfs_nodes = false; // 伪装 CPU/GPU 文件节点 (/sys/devices/system/cpu/*, soc0, kgsl)
-    bool enable_mount_ns = false;  // 是否使用私有挂载命名空间方式伪装已启用的文件节点
+    bool enable_mount_ns = false;  // 是否使用私有挂载命名空间方式伪装文件节点
 
     std::string cpu_hardware;
     std::string cpu_arch = "aarch64";
@@ -292,7 +324,7 @@ struct ModularConfig {
     ProbeModuleConfig    probe;
 
     inline bool is_any_enabled() const noexcept {
-        return build.any_prop_enabled() || gl.enabled || vfs.any_enabled() || probe.enabled;
+        return build.enabled || gl.enabled || vfs.any_enabled() || probe.enabled;
     }
 };
 

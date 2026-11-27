@@ -39,14 +39,47 @@ inline PFN_loader_android_dlopen_ext orig_loader_android_dlopen_ext = nullptr;
 
 inline void scan_and_commit_plt_hooks();
 
-// 仅当有任意文件节点开关开启且 MountNS 未激活时，才启用传统 PLT 文件 Hook 引擎
-inline bool should_use_legacy_vfs_plt() noexcept {
-    return (g_cfg.vfs.any_enabled() || g_cfg.build.enabled) &&
-           !g_vfs_ns_mounted.load(std::memory_order_acquire);
+inline bool needs_display_lazy_hook() noexcept {
+    return (g_cfg.build.enabled || g_cfg.gl.enabled) &&
+           (g_cfg.gl.max_refresh_rate >= 90 || g_cfg.gl.enable_hdr_spoof);
 }
 
+inline bool needs_vfs_syscall_plt() noexcept {
+    if (g_cfg.vfs.enable_mem && g_cfg.vfs.ram_gb > 0) return true;
+    if (g_cfg.vfs.enable_cpu && (g_cfg.vfs.cpu_cores > 0 || !g_cfg.vfs.kernel_release.empty())) return true;
+    if (g_cfg.vfs.enable_vfs_nodes && !g_cfg.vfs.kernel_release.empty()) return true;
+    return false;
+}
+
+// 传统文件 I/O PLT 回退条件：VFS 未走 MountNS，或系统属性处于传统 Hook 模式
+inline bool needs_legacy_vfs_file_plt() noexcept {
+    if (g_cfg.vfs.any_enabled() && !g_vfs_ns_mounted.load(std::memory_order_acquire)) {
+        return true;
+    }
+    if (g_cfg.build.enabled && g_cfg.build.effective_prop_mode == PropSpoofMode::HOOK) {
+        return true;
+    }
+    return false;
+}
+
+// 严格判定是否需要驻留任何 PLT Hook：
+// 若返回 false（如纯 COW/MountNS 系统属性 + 无 GPU/无探针/无高刷HDR），
+// 则 0 PLT Hook 并在 postAppSpecialize 反射完 Java Build 后立刻 DLCLOSE 自卸载实现零驻留！
 inline bool needs_any_plt_hooks() noexcept {
-    return g_cfg.build.enabled || g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || g_cfg.probe.enabled;
+    return needs_prop_plt_hooks() ||
+           g_cfg.gl.enabled ||
+           needs_display_lazy_hook() ||
+           needs_vfs_syscall_plt() ||
+           needs_legacy_vfs_file_plt() ||
+           g_cfg.probe.enabled;
+}
+
+// 当进程已决定驻留 PLT 时，若启用了 MountNS，顺手挂载文件 I/O 与 statfs 钩子以清洗 mountinfo/maps 并伪造文件系统魔数
+inline bool should_use_file_io_plt() noexcept {
+    if (needs_legacy_vfs_file_plt()) return true;
+    return needs_any_plt_hooks() &&
+           (g_vfs_ns_mounted.load(std::memory_order_acquire) ||
+            g_prop_ns_mounted.load(std::memory_order_acquire));
 }
 
 inline void init_linker_symbols() {
@@ -194,13 +227,17 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
         }
     }
 
-    if (should_use_legacy_vfs_plt()) {
+    if (should_use_file_io_plt()) {
         if (std::strcmp(symbol, "open") == 0) return reinterpret_cast<void *>(hook_open);
         if (std::strcmp(symbol, "open64") == 0) return reinterpret_cast<void *>(hook_open64);
         if (std::strcmp(symbol, "openat") == 0) return reinterpret_cast<void *>(hook_openat);
         if (std::strcmp(symbol, "openat64") == 0) return reinterpret_cast<void *>(hook_openat64);
         if (std::strcmp(symbol, "fopen") == 0) return reinterpret_cast<void *>(hook_fopen);
         if (std::strcmp(symbol, "fopen64") == 0) return reinterpret_cast<void *>(hook_fopen64);
+        if (std::strcmp(symbol, "statfs") == 0) return reinterpret_cast<void *>(hook_statfs);
+        if (std::strcmp(symbol, "statfs64") == 0) return reinterpret_cast<void *>(hook_statfs64);
+        if (std::strcmp(symbol, "fstatfs") == 0) return reinterpret_cast<void *>(hook_fstatfs);
+        if (std::strcmp(symbol, "fstatfs64") == 0) return reinterpret_cast<void *>(hook_fstatfs64);
     }
     if (g_cfg.vfs.enable_mem && std::strcmp(symbol, "sysinfo") == 0) {
         return reinterpret_cast<void *>(hook_sysinfo);
@@ -243,7 +280,7 @@ inline void *hook_dlopen(const char *filename, int flags) {
         if (guard) {
             emit_probe("DLOPEN", filename, "Incremental PLT Hook");
             scan_and_commit_plt_hooks();
-            if ((g_cfg.build.enabled || g_cfg.gl.enabled) && g_cfg.gl.max_refresh_rate >= 90) {
+            if (needs_display_lazy_hook()) {
                 try_lazy_spoof_display_modes();
             }
         }
@@ -261,7 +298,7 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
         if (guard) {
             emit_probe("DLOPEN_EXT", filename, "Incremental PLT Hook");
             scan_and_commit_plt_hooks();
-            if ((g_cfg.build.enabled || g_cfg.gl.enabled) && g_cfg.gl.max_refresh_rate >= 90) {
+            if (needs_display_lazy_hook()) {
                 try_lazy_spoof_display_modes();
             }
         }
@@ -270,7 +307,6 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
 }
 
 inline void scan_and_commit_plt_hooks() {
-    // 严格 0 改动：如果用户只开了 COW Prop Spoof（其他所有需要 PLT 的开关全关），0 PLT Hook！
     if (!g_zygisk_api || !needs_any_plt_hooks()) return;
     ErrnoRestorer errno_guard;
     if (!g_maps_mtx.try_lock()) return;
@@ -281,7 +317,9 @@ inline void scan_and_commit_plt_hooks() {
         return;
     }
 
-    const bool use_legacy_vfs = should_use_legacy_vfs_plt();
+    const bool use_file_plt = should_use_file_io_plt();
+    const bool use_prop_plt = needs_prop_plt_hooks();
+    const bool use_popen_plt = g_cfg.build.enabled && (g_cfg.build.effective_prop_mode != PropSpoofMode::MOUNT_NS);
     char line[1024];
     bool dirty = false;
 
@@ -335,11 +373,11 @@ inline void scan_and_commit_plt_hooks() {
 
         reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
         reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
-        if (g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || use_legacy_vfs) {
+        if (g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || use_file_plt) {
             reg("dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym));
         }
 
-        if (g_cfg.build.enabled || g_cfg.probe.enabled) {
+        if (use_prop_plt) {
             reg("__system_property_find", reinterpret_cast<void *>(hook_system_property_find), reinterpret_cast<void **>(&orig_system_property_find));
             reg("__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read_callback), reinterpret_cast<void **>(&orig_system_property_read_callback));
             reg("__system_property_read", reinterpret_cast<void *>(hook_system_property_read), reinterpret_cast<void **>(&orig_system_property_read));
@@ -347,11 +385,11 @@ inline void scan_and_commit_plt_hooks() {
             reg("__system_property_foreach", reinterpret_cast<void *>(hook_system_property_foreach), reinterpret_cast<void **>(&orig_system_property_foreach));
             reg("__system_property_find_nth", reinterpret_cast<void *>(hook_system_property_find_nth), reinterpret_cast<void **>(&orig_system_property_find_nth));
         }
-        if (g_cfg.build.enabled) {
+        if (use_popen_plt) {
             reg("popen", reinterpret_cast<void *>(hook_popen), reinterpret_cast<void **>(&orig_popen));
         }
 
-        if (use_legacy_vfs) {
+        if (use_file_plt) {
             reg("open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open));
             reg("open64", reinterpret_cast<void *>(hook_open64), reinterpret_cast<void **>(&orig_open64));
             reg("__open_2", reinterpret_cast<void *>(hook_open_2), reinterpret_cast<void **>(&orig_open_2));
@@ -377,6 +415,10 @@ inline void scan_and_commit_plt_hooks() {
             reg("fstatat64", reinterpret_cast<void *>(hook_fstatat64), reinterpret_cast<void **>(&orig_fstatat64));
             reg("fstat", reinterpret_cast<void *>(hook_fstat), reinterpret_cast<void **>(&orig_fstat));
             reg("fstat64", reinterpret_cast<void *>(hook_fstat64), reinterpret_cast<void **>(&orig_fstat64));
+            reg("statfs", reinterpret_cast<void *>(hook_statfs), reinterpret_cast<void **>(&orig_statfs));
+            reg("statfs64", reinterpret_cast<void *>(hook_statfs64), reinterpret_cast<void **>(&orig_statfs64));
+            reg("fstatfs", reinterpret_cast<void *>(hook_fstatfs), reinterpret_cast<void **>(&orig_fstatfs));
+            reg("fstatfs64", reinterpret_cast<void *>(hook_fstatfs64), reinterpret_cast<void **>(&orig_fstatfs64));
             reg("readlink", reinterpret_cast<void *>(hook_readlink), reinterpret_cast<void **>(&orig_readlink));
             reg("readlinkat", reinterpret_cast<void *>(hook_readlinkat), reinterpret_cast<void **>(&orig_readlinkat));
         }

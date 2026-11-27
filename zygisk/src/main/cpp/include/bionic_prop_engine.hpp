@@ -124,9 +124,20 @@ inline void init_bionic_prop_symbols() {
     orig_system_property_find_nth = reinterpret_cast<decltype(orig_system_property_find_nth)>(dlsym(RTLD_DEFAULT, "__system_property_find_nth"));
 }
 
-// 预处理属性表默认项（供 COW Prop Spoof 与 Bionic 只读属性区共用，严格按对应子开关门控）
+// 决定当前是否需要挂载 Bionic 属性 PLT Hook：
+// - HOOK 模式：需要 PLT Hook
+// - 纯 COW / MountNS 模式：0 属性 PLT Hook（仅在用户主动开启「探针」时挂只读观测）
+inline bool needs_prop_plt_hooks() noexcept {
+    if (g_cfg.probe.enabled) return true;
+    return g_cfg.build.enabled && (g_cfg.build.effective_prop_mode == PropSpoofMode::HOOK);
+}
+
+inline const char *active_native_prop_probe_domain() noexcept {
+    return (g_cfg.build.effective_prop_mode == PropSpoofMode::MOUNT_NS) ? "MOUNT_NS_PROP" : "COW_PROP";
+}
+
 inline void prepare_bionic_prop_map_defaults() {
-    if (!g_cfg.build.any_prop_enabled()) return;
+    if (!g_cfg.build.enabled) return;
 
     auto set_default_restricted = [&](const char *k, const std::string &v) {
         if (g_cfg.build.prop_map.find(k) == g_cfg.build.prop_map.end()) {
@@ -206,17 +217,15 @@ inline void prepare_bionic_prop_map_defaults() {
     }
 }
 
-// 仅当「伪装系统属性 (build)」开启时构建只读属性区，且自动跳过已由 COW 覆写的属性
+// 仅在 HOOK 模式下构建只读匿名属性区；纯 COW 与 MountNS 模式彻底零 [anon:SystemProperties] 痕迹！
 inline void freeze_bionic_prop_arena() {
-    if (!g_cfg.build.enabled) return;
-
+    if (!g_cfg.build.enabled || g_cfg.build.effective_prop_mode != PropSpoofMode::HOOK) {
+        return;
+    }
     for (const auto &kv : g_cfg.build.prop_map) {
-        if (is_cow_patched_key(kv.first.c_str())) {
-            continue;
-        }
+        if (is_native_prop_patched(kv.first.c_str())) continue;
         g_prop_arena.insert_before_freeze(kv.first, kv.second);
     }
-
     g_prop_arena.seal_readonly();
 }
 
@@ -230,19 +239,28 @@ inline bool is_interesting_unmapped_prop(const char *name) noexcept {
            std::strncmp(name, "dalvik.vm.", 10) == 0;
 }
 
+inline bool is_hook_override_mode() noexcept {
+    return g_cfg.build.enabled && (g_cfg.build.effective_prop_mode == PropSpoofMode::HOOK);
+}
+
 inline const prop_info *hook_system_property_find(const char *name) {
     if (name) {
-        if (is_cow_patched_key(name)) {
+        if (is_native_prop_patched(name)) {
+            const prop_info *real_pi = orig_system_property_find ? orig_system_property_find(name) : nullptr;
             if (__builtin_expect(g_cfg.probe.enabled, 0)) {
                 ScopedHookGuard guard;
-                if (guard) {
-                    auto it = g_cfg.build.prop_map.find(name);
-                    if (it != g_cfg.build.prop_map.end()) emit_probe("COW_PROP", name, it->second);
+                if (guard && real_pi && orig_system_property_read_callback) {
+                    std::string live_val;
+                    auto reader = [](void *c, const char *, const char *v, uint32_t) {
+                        if (v) *static_cast<std::string *>(c) = v;
+                    };
+                    orig_system_property_read_callback(real_pi, reader, &live_val);
+                    emit_probe(active_native_prop_probe_domain(), name, live_val);
                 }
             }
-            return orig_system_property_find ? orig_system_property_find(name) : nullptr;
+            return real_pi;
         }
-        if (g_cfg.build.enabled) {
+        if (is_hook_override_mode()) {
             const std::string *syn_val = nullptr;
             if (const prop_info *syn = g_prop_arena.find_lockfree(name, &syn_val)) {
                 if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -272,15 +290,15 @@ inline void internal_read_cb_bridge(void *cookie, const char *name, const char *
     if (!ctx || !ctx->user_cb) return;
 
     if (name) {
-        if (is_cow_patched_key(name)) {
+        if (is_native_prop_patched(name)) {
             if (__builtin_expect(g_cfg.probe.enabled, 0)) {
                 ScopedHookGuard guard;
-                if (guard) emit_probe("COW_PROP", name, value ? value : "");
+                if (guard) emit_probe(active_native_prop_probe_domain(), name, value ? value : "");
             }
             ctx->user_cb(ctx->user_cookie, name, value, serial);
             return;
         }
-        if (g_cfg.build.enabled) {
+        if (is_hook_override_mode()) {
             auto it = g_cfg.build.prop_map.find(name);
             if (it != g_cfg.build.prop_map.end()) {
                 if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -304,7 +322,7 @@ inline void internal_read_cb_bridge(void *cookie, const char *name, const char *
 inline void hook_system_property_read_callback(const prop_info *pi, T_PropCallback callback, void *cookie) {
     if (!pi || !callback) return;
 
-    if (g_cfg.build.enabled) {
+    if (is_hook_override_mode()) {
         const char *syn_name = nullptr;
         const std::string *syn_val = nullptr;
         if (g_prop_arena.is_synthetic_lockfree(pi, &syn_name, &syn_val) && syn_name && syn_val) {
@@ -326,7 +344,7 @@ inline void hook_system_property_read_callback(const prop_info *pi, T_PropCallba
 inline int hook_system_property_read(const prop_info *pi, char *name, char *value) {
     if (!pi) return 0;
 
-    if (g_cfg.build.enabled) {
+    if (is_hook_override_mode()) {
         const char *syn_name = nullptr;
         const std::string *syn_val = nullptr;
         if (g_prop_arena.is_synthetic_lockfree(pi, &syn_name, &syn_val) && syn_name && syn_val) {
@@ -349,7 +367,7 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 
     if (!orig_system_property_read) return 0;
     int ret = orig_system_property_read(pi, name, value);
-    if (name && value && g_cfg.build.enabled && !is_cow_patched_key(name)) {
+    if (name && value && is_hook_override_mode() && !is_native_prop_patched(name)) {
         auto it = g_cfg.build.prop_map.find(name);
         if (it != g_cfg.build.prop_map.end()) {
             if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -366,15 +384,15 @@ inline int hook_system_property_read(const prop_info *pi, char *name, char *valu
 
 inline int hook_system_property_get(const char *name, char *value) {
     if (name && value) {
-        if (is_cow_patched_key(name)) {
-            int cow_len = orig_system_property_get ? orig_system_property_get(name, value) : 0;
+        if (is_native_prop_patched(name)) {
+            int native_len = orig_system_property_get ? orig_system_property_get(name, value) : 0;
             if (__builtin_expect(g_cfg.probe.enabled, 0)) {
                 ScopedHookGuard guard;
-                if (guard) emit_probe("COW_PROP", name, cow_len > 0 ? value : "<empty>");
+                if (guard) emit_probe(active_native_prop_probe_domain(), name, native_len > 0 ? value : "<empty>");
             }
-            return cow_len;
+            return native_len;
         }
-        if (g_cfg.build.enabled) {
+        if (is_hook_override_mode()) {
             auto it = g_cfg.build.prop_map.find(name);
             if (it != g_cfg.build.prop_map.end()) {
                 if (__builtin_expect(g_cfg.probe.enabled, 0)) {
@@ -408,7 +426,7 @@ inline void internal_foreach_cb(const prop_info *pi, void *cookie) {
     auto *ctx = static_cast<ForeachBridgeCtx *>(cookie);
     if (!ctx || !ctx->user_fn || !pi) return;
 
-    if (g_cfg.build.enabled && orig_system_property_read_callback) {
+    if (is_hook_override_mode() && orig_system_property_read_callback) {
         std::string key;
         auto key_extractor = [](void *c, const char *name, const char *, uint32_t) {
             if (name) *static_cast<std::string *>(c) = name;
@@ -416,7 +434,7 @@ inline void internal_foreach_cb(const prop_info *pi, void *cookie) {
         orig_system_property_read_callback(pi, key_extractor, &key);
         if (!key.empty()) {
             ctx->seen_keys.insert(key);
-            if (!is_cow_patched_key(key.c_str())) {
+            if (!is_native_prop_patched(key.c_str())) {
                 if (const prop_info *syn = g_prop_arena.find_lockfree(key.c_str())) {
                     ctx->user_fn(syn, ctx->user_cookie);
                     return;
@@ -429,7 +447,7 @@ inline void internal_foreach_cb(const prop_info *pi, void *cookie) {
 
 inline int hook_system_property_foreach(T_ForeachCallback propfn, void *cookie) {
     if (!propfn) return -1;
-    if (!g_cfg.build.enabled || !orig_system_property_foreach) {
+    if (!is_hook_override_mode() || !orig_system_property_foreach) {
         return orig_system_property_foreach ? orig_system_property_foreach(propfn, cookie) : -1;
     }
 
@@ -452,13 +470,13 @@ inline int hook_system_property_foreach(T_ForeachCallback propfn, void *cookie) 
 
 inline const prop_info *hook_system_property_find_nth(unsigned n) {
     const prop_info *real_pi = orig_system_property_find_nth ? orig_system_property_find_nth(n) : nullptr;
-    if (real_pi && g_cfg.build.enabled && orig_system_property_read_callback) {
+    if (real_pi && is_hook_override_mode() && orig_system_property_read_callback) {
         std::string key;
         auto key_extractor = [](void *c, const char *name, const char *, uint32_t) {
             if (name) *static_cast<std::string *>(c) = name;
         };
         orig_system_property_read_callback(real_pi, key_extractor, &key);
-        if (!key.empty() && !is_cow_patched_key(key.c_str())) {
+        if (!key.empty() && !is_native_prop_patched(key.c_str())) {
             if (const prop_info *syn = g_prop_arena.find_lockfree(key.c_str())) {
                 return syn;
             }

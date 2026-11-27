@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
@@ -26,11 +27,21 @@
 #define MFD_CLOEXEC 0x0001U
 #endif
 
+#ifndef PROC_SUPER_MAGIC
+#define PROC_SUPER_MAGIC 0x9fa0U
+#endif
+
+#ifndef SYSFS_MAGIC
+#define SYSFS_MAGIC 0x62656572U
+#endif
+
 namespace mirage {
 
-// 私有 Mount NS 生效状态与已挂载路径表
+// 私有 Mount NS 生效状态与已挂载路径表（分别追踪 VFS 节点与系统属性区）
 inline std::atomic<bool> g_vfs_ns_mounted{false};
+inline std::atomic<bool> g_prop_ns_mounted{false};
 inline std::unordered_set<std::string> g_ns_mounted_paths;
+inline std::unordered_set<std::string> g_ns_mounted_prop_paths;
 
 inline bool is_ns_mounted_path(const std::string &norm) noexcept {
     if (__builtin_expect(!g_vfs_ns_mounted.load(std::memory_order_acquire), 1)) {
@@ -39,7 +50,7 @@ inline bool is_ns_mounted_path(const std::string &norm) noexcept {
     return g_ns_mounted_paths.find(norm) != g_ns_mounted_paths.end();
 }
 
-// 原始 Bionic I/O & 系统信息函数指针
+// 原始 Bionic I/O & 文件系统元数据函数指针
 inline int (*orig_open)(const char *pathname, int flags, mode_t mode) = nullptr;
 inline int (*orig_open64)(const char *pathname, int flags, mode_t mode) = nullptr;
 inline int (*orig_open_2)(const char *pathname, int flags) = nullptr;
@@ -65,6 +76,11 @@ inline int (*orig_fstatat)(int dirfd, const char *pathname, struct stat *statbuf
 inline int (*orig_fstatat64)(int dirfd, const char *pathname, struct stat64 *statbuf, int flags) = nullptr;
 inline int (*orig_fstat)(int fd, struct stat *statbuf) = nullptr;
 inline int (*orig_fstat64)(int fd, struct stat64 *statbuf) = nullptr;
+
+inline int (*orig_statfs)(const char *path, struct statfs *buf) = nullptr;
+inline int (*orig_statfs64)(const char *path, struct statfs64 *buf) = nullptr;
+inline int (*orig_fstatfs)(int fd, struct statfs *buf) = nullptr;
+inline int (*orig_fstatfs64)(int fd, struct statfs64 *buf) = nullptr;
 
 inline ssize_t (*orig_readlink)(const char *pathname, char *buf, size_t bufsiz) = nullptr;
 inline ssize_t (*orig_readlinkat)(int dirfd, const char *pathname, char *buf, size_t bufsiz) = nullptr;
@@ -101,6 +117,11 @@ inline void init_vfs_symbols() {
     orig_fstatat64 = reinterpret_cast<decltype(orig_fstatat64)>(dlsym(RTLD_DEFAULT, "fstatat64"));
     orig_fstat = reinterpret_cast<decltype(orig_fstat)>(dlsym(RTLD_DEFAULT, "fstat"));
     orig_fstat64 = reinterpret_cast<decltype(orig_fstat64)>(dlsym(RTLD_DEFAULT, "fstat64"));
+
+    orig_statfs = reinterpret_cast<decltype(orig_statfs)>(dlsym(RTLD_DEFAULT, "statfs"));
+    orig_statfs64 = reinterpret_cast<decltype(orig_statfs64)>(dlsym(RTLD_DEFAULT, "statfs64"));
+    orig_fstatfs = reinterpret_cast<decltype(orig_fstatfs)>(dlsym(RTLD_DEFAULT, "fstatfs"));
+    orig_fstatfs64 = reinterpret_cast<decltype(orig_fstatfs64)>(dlsym(RTLD_DEFAULT, "fstatfs64"));
 
     orig_readlink = reinterpret_cast<decltype(orig_readlink)>(dlsym(RTLD_DEFAULT, "readlink"));
     orig_readlinkat = reinterpret_cast<decltype(orig_readlinkat)>(dlsym(RTLD_DEFAULT, "readlinkat"));

@@ -16,10 +16,14 @@ inline JavaVM *g_jvm = nullptr;
 inline std::atomic<bool> g_post_specialized{false};
 inline std::atomic<bool> g_fps_spoof_applied{false};
 
-// 仅在 postAppSpecialize 之后、且开启系统属性或 GPU 伪装并设置刷新率 >= 90Hz 时懒修补显示模式
+// 仅在 postAppSpecialize 之后、且开启刷新率 (>=90Hz) 或 HDR/杜比视界声明时懒修补 DisplayInfo 缓存，
+// 绝不在 Zygote 阶段主动触发 Binder IPC，未开启时严格 0 改动
 inline void try_lazy_spoof_display_modes() {
     int target_hz = g_cfg.gl.max_refresh_rate;
-    if ((!g_cfg.build.enabled && !g_cfg.gl.enabled) || target_hz < 90 || target_hz > 240 || !g_jvm) return;
+    bool want_fps = (target_hz >= 90 && target_hz <= 240);
+    bool want_hdr = g_cfg.gl.enable_hdr_spoof;
+
+    if ((!g_cfg.build.enabled && !g_cfg.gl.enabled) || (!want_fps && !want_hdr) || !g_jvm) return;
     if (!g_post_specialized.load(std::memory_order_acquire)) return;
     if (g_fps_spoof_applied.load(std::memory_order_relaxed)) return;
 
@@ -46,58 +50,117 @@ inline void try_lazy_spoof_display_modes() {
         return;
     }
 
-    float fps = static_cast<float>(target_hz);
-    bool patched = false;
+    bool fps_patched = false;
+    bool hdr_patched = false;
 
     jmethodID get_di = env->GetMethodID(dmg_cls, "getDisplayInfo", "(I)Landroid/view/DisplayInfo;");
     if (get_di) {
         jobject di = env->CallObjectMethod(dmg, get_di, 0);
         if (!env->ExceptionCheck() && di) {
             jclass di_cls = env->GetObjectClass(di);
-            jclass mode_cls = env->FindClass("android/view/Display$Mode");
-
-            jfieldID mode_rr_fid = mode_cls ? env->GetFieldID(mode_cls, "mRefreshRate", "F") : nullptr;
-            if (env->ExceptionCheck()) { env->ExceptionClear(); mode_rr_fid = nullptr; }
-
-            jfieldID mode_vsync_fid = mode_cls ? env->GetFieldID(mode_cls, "mVsyncRate", "F") : nullptr;
-            if (env->ExceptionCheck()) { env->ExceptionClear(); mode_vsync_fid = nullptr; }
-
             if (di_cls) {
-                jfieldID ovr_fid = env->GetFieldID(di_cls, "refreshRateOverride", "F");
-                if (!env->ExceptionCheck() && ovr_fid) {
-                    env->SetFloatField(di, ovr_fid, fps);
-                    patched = true;
-                } else {
-                    env->ExceptionClear();
-                }
+                // 1. 屏幕最高刷新率声明修补
+                if (want_fps) {
+                    float fps = static_cast<float>(target_hz);
+                    jclass mode_cls = env->FindClass("android/view/Display$Mode");
+                    if (env->ExceptionCheck()) { env->ExceptionClear(); mode_cls = nullptr; }
 
-                auto patch_mode_array = [&](const char *arr_name) {
-                    if (!mode_rr_fid) return;
-                    jfieldID arr_fid = env->GetFieldID(di_cls, arr_name, "[Landroid/view/Display$Mode;");
-                    if (env->ExceptionCheck() || !arr_fid) { env->ExceptionClear(); return; }
-                    auto arr = static_cast<jobjectArray>(env->GetObjectField(di, arr_fid));
-                    if (!env->ExceptionCheck() && arr) {
-                        jsize len = env->GetArrayLength(arr);
-                        for (jsize i = 0; i < len; ++i) {
-                            jobject m_obj = env->GetObjectArrayElement(arr, i);
-                            if (m_obj) {
-                                env->SetFloatField(m_obj, mode_rr_fid, fps);
-                                if (mode_vsync_fid) env->SetFloatField(m_obj, mode_vsync_fid, fps);
-                                env->DeleteLocalRef(m_obj);
-                                patched = true;
-                            }
-                        }
-                        env->DeleteLocalRef(arr);
+                    jfieldID mode_rr_fid = mode_cls ? env->GetFieldID(mode_cls, "mRefreshRate", "F") : nullptr;
+                    if (env->ExceptionCheck()) { env->ExceptionClear(); mode_rr_fid = nullptr; }
+
+                    jfieldID mode_vsync_fid = mode_cls ? env->GetFieldID(mode_cls, "mVsyncRate", "F") : nullptr;
+                    if (env->ExceptionCheck()) { env->ExceptionClear(); mode_vsync_fid = nullptr; }
+
+                    jfieldID ovr_fid = env->GetFieldID(di_cls, "refreshRateOverride", "F");
+                    if (!env->ExceptionCheck() && ovr_fid) {
+                        env->SetFloatField(di, ovr_fid, fps);
+                        fps_patched = true;
                     } else {
                         env->ExceptionClear();
                     }
-                };
 
-                patch_mode_array("supportedModes");
-                patch_mode_array("appsSupportedModes");
+                    auto patch_mode_array = [&](const char *arr_name) {
+                        if (!mode_rr_fid) return;
+                        jfieldID arr_fid = env->GetFieldID(di_cls, arr_name, "[Landroid/view/Display$Mode;");
+                        if (env->ExceptionCheck() || !arr_fid) { env->ExceptionClear(); return; }
+                        auto arr = static_cast<jobjectArray>(env->GetObjectField(di, arr_fid));
+                        if (!env->ExceptionCheck() && arr) {
+                            jsize len = env->GetArrayLength(arr);
+                            for (jsize i = 0; i < len; ++i) {
+                                jobject m_obj = env->GetObjectArrayElement(arr, i);
+                                if (m_obj) {
+                                    env->SetFloatField(m_obj, mode_rr_fid, fps);
+                                    if (mode_vsync_fid) env->SetFloatField(m_obj, mode_vsync_fid, fps);
+                                    env->DeleteLocalRef(m_obj);
+                                    fps_patched = true;
+                                }
+                            }
+                            env->DeleteLocalRef(arr);
+                        } else {
+                            env->ExceptionClear();
+                        }
+                    };
+
+                    patch_mode_array("supportedModes");
+                    patch_mode_array("appsSupportedModes");
+                    if (mode_cls) env->DeleteLocalRef(mode_cls);
+                }
+
+                // 2. HDR10 / HLG / HDR10+ / 杜比视界能力声明修补
+                if (want_hdr) {
+                    jfieldID hdr_fid = env->GetFieldID(di_cls, "hdrCapabilities", "Landroid/view/Display$HdrCapabilities;");
+                    if (!env->ExceptionCheck() && hdr_fid) {
+                        jclass hdr_cls = env->FindClass("android/view/Display$HdrCapabilities");
+                        if (!env->ExceptionCheck() && hdr_cls) {
+                            // 1=Dolby Vision, 2=HDR10, 3=HLG, 4=HDR10+
+                            static const jint kHdrTypes[4] = {1, 2, 3, 4};
+                            jintArray types_arr = env->NewIntArray(4);
+                            if (types_arr) {
+                                env->SetIntArrayRegion(types_arr, 0, 4, kHdrTypes);
+
+                                jmethodID ctor = env->GetMethodID(hdr_cls, "<init>", "([IFFF)V");
+                                if (!env->ExceptionCheck() && ctor) {
+                                    jobject new_hdr = env->NewObject(hdr_cls, ctor, types_arr, 1600.0f, 800.0f, 0.0005f);
+                                    if (!env->ExceptionCheck() && new_hdr) {
+                                        env->SetObjectField(di, hdr_fid, new_hdr);
+                                        env->DeleteLocalRef(new_hdr);
+                                        hdr_patched = true;
+                                    } else {
+                                        env->ExceptionClear();
+                                    }
+                                } else {
+                                    env->ExceptionClear();
+                                }
+
+                                // 降级路径：若构造函数签名差异，直接原地改写现有 HdrCapabilities 实例字段
+                                if (!hdr_patched) {
+                                    jobject existing_hdr = env->GetObjectField(di, hdr_fid);
+                                    if (!env->ExceptionCheck() && existing_hdr) {
+                                        jfieldID types_fid = env->GetFieldID(hdr_cls, "mSupportedHdrTypes", "[I");
+                                        if (!env->ExceptionCheck() && types_fid) {
+                                            env->SetObjectField(existing_hdr, types_fid, types_arr);
+                                            hdr_patched = true;
+                                        } else {
+                                            env->ExceptionClear();
+                                        }
+                                        env->DeleteLocalRef(existing_hdr);
+                                    } else {
+                                        env->ExceptionClear();
+                                    }
+                                }
+                                env->DeleteLocalRef(types_arr);
+                            }
+                            env->DeleteLocalRef(hdr_cls);
+                        } else {
+                            env->ExceptionClear();
+                        }
+                    } else {
+                        env->ExceptionClear();
+                    }
+                }
+
                 env->DeleteLocalRef(di_cls);
             }
-            if (mode_cls) env->DeleteLocalRef(mode_cls);
             env->DeleteLocalRef(di);
         } else {
             env->ExceptionClear();
@@ -109,9 +172,14 @@ inline void try_lazy_spoof_display_modes() {
     env->DeleteLocalRef(dmg);
     env->DeleteLocalRef(dmg_cls);
 
-    if (patched) {
+    if (fps_patched || hdr_patched) {
         g_fps_spoof_applied.store(true, std::memory_order_release);
-        emit_probe("DISPLAY_FPS", "DisplayInfo.supportedModes", std::to_string(target_hz) + "Hz");
+        if (fps_patched) {
+            emit_probe("DISPLAY_FPS", "DisplayInfo.supportedModes", std::to_string(target_hz) + "Hz");
+        }
+        if (hdr_patched) {
+            emit_probe("DISPLAY_HDR", "DisplayInfo.hdrCapabilities", "DV/HDR10/HLG/HDR10+");
+        }
     }
 }
 

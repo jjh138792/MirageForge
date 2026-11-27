@@ -28,7 +28,7 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
         synthesize_mem_soc_vfs_node(norm, out_content)) {
         return true;
     }
-    if (g_cfg.vfs.any_enabled() && norm.rfind("/proc/", 0) == 0 &&
+    if ((g_cfg.vfs.any_enabled() || g_cfg.build.enabled) && norm.rfind("/proc/", 0) == 0 &&
         sanitize_live_proc_file(norm, out_content)) {
         return true;
     }
@@ -36,6 +36,17 @@ inline bool synthesize_vfs_node_on_demand(const std::string &norm, std::string *
         return true;
     }
     return false;
+}
+
+// 伪造与虚拟路径一致的内核文件系统魔数（防止反作弊检查 statfs/fstatfs.f_type 发现 tmpfs/memfd）
+template <typename StatfsT>
+inline void patch_virtual_statfs_magic(const std::string &norm, StatfsT *buf) noexcept {
+    if (!buf || norm.empty()) return;
+    if (norm.rfind("/proc/", 0) == 0) {
+        buf->f_type = static_cast<decltype(buf->f_type)>(PROC_SUPER_MAGIC);
+    } else if (norm.rfind("/sys/", 0) == 0) {
+        buf->f_type = static_cast<decltype(buf->f_type)>(SYSFS_MAGIC);
+    }
 }
 
 inline int open_cloaked_vfs_fd_norm(const std::string &norm) {
@@ -314,6 +325,66 @@ inline int hook_fstat64(int fd, struct stat64 *statbuf) {
         return 0;
     }
     return orig_fstat64 ? orig_fstat64(fd, statbuf) : -1;
+}
+
+inline int hook_statfs(const char *path, struct statfs *buf) {
+    int ret = orig_statfs ? orig_statfs(path, buf) : statfs(path, buf);
+    if (ret == 0 && buf && __builtin_expect(is_vfs_candidate_prefix(path), 0)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            std::string norm = normalize_vfs_path(path);
+            if (is_ns_mounted_path(norm) || norm == "/proc/cpuinfo" || norm == "/proc/meminfo") {
+                patch_virtual_statfs_magic(norm, buf);
+            }
+        }
+    }
+    return ret;
+}
+
+inline int hook_statfs64(const char *path, struct statfs64 *buf) {
+    int ret = orig_statfs64 ? orig_statfs64(path, buf) : statfs64(path, buf);
+    if (ret == 0 && buf && __builtin_expect(is_vfs_candidate_prefix(path), 0)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            std::string norm = normalize_vfs_path(path);
+            if (is_ns_mounted_path(norm) || norm == "/proc/cpuinfo" || norm == "/proc/meminfo") {
+                patch_virtual_statfs_magic(norm, buf);
+            }
+        }
+    }
+    return ret;
+}
+
+inline int hook_fstatfs(int fd, struct statfs *buf) {
+    int ret = orig_fstatfs ? orig_fstatfs(fd, buf) : fstatfs(fd, buf);
+    if (ret == 0 && buf && __builtin_expect(g_fd_cloak.is_tracked_fast(fd), 0)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            char link_p[48];
+            std::snprintf(link_p, sizeof(link_p), "/proc/self/fd/%d", fd);
+            std::string fake_path;
+            if (g_fd_cloak.resolve_proc_fd_link(link_p, &fake_path)) {
+                patch_virtual_statfs_magic(fake_path, buf);
+            }
+        }
+    }
+    return ret;
+}
+
+inline int hook_fstatfs64(int fd, struct statfs64 *buf) {
+    int ret = orig_fstatfs64 ? orig_fstatfs64(fd, buf) : fstatfs64(fd, buf);
+    if (ret == 0 && buf && __builtin_expect(g_fd_cloak.is_tracked_fast(fd), 0)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            char link_p[48];
+            std::snprintf(link_p, sizeof(link_p), "/proc/self/fd/%d", fd);
+            std::string fake_path;
+            if (g_fd_cloak.resolve_proc_fd_link(link_p, &fake_path)) {
+                patch_virtual_statfs_magic(fake_path, buf);
+            }
+        }
+    }
+    return ret;
 }
 
 inline ssize_t hook_readlink(const char *pathname, char *buf, size_t bufsiz) {
