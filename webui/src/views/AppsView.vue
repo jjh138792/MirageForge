@@ -13,11 +13,17 @@ import {
   Cpu,
   ShieldCheck,
   Sparkles,
+  Activity,
 } from 'lucide-vue-next';
 import AppDetailEditor from '../components/AppDetailEditor.vue';
 import { useI18n } from '../i18n';
 import { triggerHaptic, type InstalledAppInfo } from '../bridge/ksu-io';
-import { mirageStore, reloadAppList } from '../store/mirageStore';
+import {
+  mirageStore,
+  reloadAppList,
+  isAppOverridesEmpty,
+  type RuntimeStatusEntry,
+} from '../store/mirageStore';
 
 const { t } = useI18n();
 const searchQuery = ref('');
@@ -51,15 +57,43 @@ function getRouteSummaryBadges(pkg: string): string[] {
   const r = mirageStore.appRoutes[pkg];
   if (!r) return [];
   const tags: string[] = [];
-  if (r.build) tags.push('属性');
-  if (r.cowProp) tags.push('COW');
+  if (r.build) {
+    const modeTxt = r.propMode === 'mount_ns' ? 'MountNS' : r.propMode === 'cow' ? 'COW' : 'Hook';
+    tags.push(`属性·${modeTxt}`);
+  }
   if (r.cpu) tags.push('CPU');
   if (r.gl) tags.push('GPU');
   if (r.mem) tags.push('内存');
-  if (r.vfsNodes) tags.push(r.mountNs ? 'MountNS' : '节点');
+  if (r.vfsNodes) tags.push(r.mountNs ? 'MountNS节点' : '节点');
+  if (r.hdrSpoof) tags.push('HDR');
   if (r.refreshRate >= 90) tags.push(`${r.refreshRate}Hz`);
+  if (!isAppOverridesEmpty(r.overrides)) tags.push('局部覆写');
   if (r.probe) tags.push('Trace');
   return tags;
+}
+
+function getRuntimeSummary(pkg: string): { text: string; zeroRes: boolean; degraded: boolean } | null {
+  const st: RuntimeStatusEntry | undefined = mirageStore.runtimeStatus[pkg];
+  if (!st || !st.timestamp) return null;
+  const parts: string[] = [];
+  if (st.propEff && st.propEff !== 'off') {
+    const label = st.propEff === 'mount_ns' ? 'MountNS' : st.propEff === 'cow' ? 'COW' : 'Hook';
+    const ins = st.propInserted > 0 ? `,+${st.propInserted}` : '';
+    parts.push(`${label}(${st.propVerified}${ins})`);
+  }
+  if (st.vfsRequested > 0) {
+    parts.push(`VFS ${st.vfsMounted}/${st.vfsRequested}`);
+  }
+  if (st.liveNodes > 0) {
+    parts.push(`活体${st.liveNodes}`);
+  }
+  if (parts.length === 0) return null;
+  const degraded = Boolean(st.propReq && st.propReq !== 'off' && st.propReq !== st.propEff);
+  return {
+    text: parts.join(' · '),
+    zeroRes: Boolean(st.zeroResidence),
+    degraded,
+  };
 }
 
 function openAppEditor(app: InstalledAppInfo) {
@@ -128,7 +162,7 @@ async function toggleSystemApps() {
       </div>
     </div>
 
-    <!-- 3. 整齐应用长条列表（显示图标 + 下方显示所伪装的模板） -->
+    <!-- 3. 整齐应用长条列表 -->
     <div class="app-list">
       <button
         v-for="app in filteredApps"
@@ -138,7 +172,6 @@ async function toggleSystemApps() {
         v-touch-glass
         @click="openAppEditor(app)"
       >
-        <!-- 应用图标（附首字母兜底壳） -->
         <div class="icon-shell">
           <span class="icon-fallback">{{ (app.appLabel || app.packageName).slice(0, 1).toUpperCase() }}</span>
           <img
@@ -158,7 +191,6 @@ async function toggleSystemApps() {
 
           <div class="app-pkg">{{ app.packageName }}</div>
 
-          <!-- 下方清晰展示伪装模板名称与模块摘要 -->
           <div class="strip-template-line">
             <template v-if="mirageStore.appRoutes[app.packageName]">
               <span class="tpl-badge">
@@ -172,6 +204,20 @@ async function toggleSystemApps() {
                   class="mini-tag"
                 >
                   {{ tag }}
+                </span>
+              </div>
+
+              <!-- 实时生效态徽章（Companion 核验落盘） -->
+              <div v-if="getRuntimeSummary(app.packageName)" class="runtime-strip">
+                <span
+                  class="rt-badge"
+                  :class="{ warn: getRuntimeSummary(app.packageName)?.degraded }"
+                >
+                  <Activity :size="10" />
+                  <span>实效: {{ getRuntimeSummary(app.packageName)?.text }}</span>
+                </span>
+                <span v-if="getRuntimeSummary(app.packageName)?.zeroRes" class="rt-zero-tag">
+                  零驻留
                 </span>
               </div>
             </template>
@@ -394,6 +440,43 @@ async function toggleSystemApps() {
   border-radius: 6px;
   background: rgba(var(--accent-primary-rgb), 0.14);
   color: var(--accent-primary);
+}
+
+.runtime-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 1px;
+}
+
+.rt-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1.5px 7px;
+  border-radius: 6px;
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.13);
+  border: 1px solid rgba(16, 185, 129, 0.32);
+}
+
+.rt-badge.warn {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.13);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.rt-zero-tag {
+  font-size: 9.5px;
+  font-weight: 800;
+  padding: 1.5px 6px;
+  border-radius: 6px;
+  color: var(--accent-secondary);
+  background: rgba(var(--accent-secondary-rgb), 0.13);
+  border: 1px solid rgba(var(--accent-secondary-rgb), 0.32);
 }
 
 .native-label {

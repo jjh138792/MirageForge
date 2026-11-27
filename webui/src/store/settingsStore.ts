@@ -5,12 +5,14 @@
 import { reactive } from 'vue';
 import { syncSystemBarsTheme, triggerHaptic } from '../bridge/ksu-io';
 import { setRefractionIntensity } from '../utils/lensEngine';
-import type {
-  AccentTheme,
-  AppSettings,
-  DockStyle,
-  RefractionLevel,
-  ThemeMode,
+import {
+  sanitizePropMode,
+  type AccentTheme,
+  type AppSettings,
+  type DockStyle,
+  type PropSpoofMode,
+  type RefractionLevel,
+  type ThemeMode,
 } from './types';
 
 function readStr<T extends string>(key: string, valid: readonly T[], def: T): T {
@@ -26,6 +28,18 @@ function readBool(key: string, def: boolean): boolean {
   return v === '1' || v === 'true';
 }
 
+function readInitialPropMode(): PropSpoofMode {
+  if (typeof localStorage === 'undefined') return 'cow';
+  const saved = localStorage.getItem('mirage_default_prop_mode');
+  if (saved) return sanitizePropMode(saved);
+  // 无缝兼容老版本 defaultCowProp 设置
+  const legacyCow = localStorage.getItem('mirage_default_cow_prop');
+  if (legacyCow === '1' || legacyCow === 'true') return 'cow';
+  return 'hook';
+}
+
+const initPropMode = readInitialPropMode();
+
 export const settingsStore = reactive<AppSettings & { resolvedTheme: 'light' | 'dark' }>({
   themeMode: readStr('mirage_theme', ['auto', 'light', 'dark'] as const, 'auto'),
   resolvedTheme: 'dark',
@@ -33,7 +47,8 @@ export const settingsStore = reactive<AppSettings & { resolvedTheme: 'light' | '
   dockStyle: readStr('mirage_dock_style', ['floating', 'docked'] as const, 'floating'),
   refractionLevel: readStr('mirage_refraction', ['standard', 'vivid', 'off'] as const, 'standard'),
   defaultMountNs: readBool('mirage_default_mount_ns', false),
-  defaultCowProp: readBool('mirage_default_cow_prop', false),
+  defaultPropMode: initPropMode,
+  defaultCowProp: initPropMode === 'cow',
   autoRestartOnSave: readBool('mirage_auto_restart', false),
 });
 
@@ -90,14 +105,26 @@ export function setRefractionLevel(level: RefractionLevel) {
   triggerHaptic('light');
 }
 
+export function setDefaultPropMode(mode: PropSpoofMode) {
+  const clean = sanitizePropMode(mode);
+  settingsStore.defaultPropMode = clean;
+  settingsStore.defaultCowProp = clean === 'cow';
+  localStorage.setItem('mirage_default_prop_mode', clean);
+  localStorage.setItem('mirage_default_cow_prop', clean === 'cow' ? '1' : '0');
+  triggerHaptic('light');
+}
+
 export function setEngineSetting(
   key: 'defaultMountNs' | 'defaultCowProp' | 'autoRestartOnSave',
   val: boolean
 ) {
+  if (key === 'defaultCowProp') {
+    setDefaultPropMode(val ? 'cow' : 'hook');
+    return;
+  }
   settingsStore[key] = val;
   const map = {
     defaultMountNs: 'mirage_default_mount_ns',
-    defaultCowProp: 'mirage_default_cow_prop',
     autoRestartOnSave: 'mirage_auto_restart',
   };
   localStorage.setItem(map[key], val ? '1' : '0');

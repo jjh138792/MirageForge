@@ -6,6 +6,7 @@ export type ThemeMode = 'auto' | 'light' | 'dark';
 export type AccentTheme = 'violet' | 'cyan' | 'emerald' | 'rose' | 'amber';
 export type DockStyle = 'floating' | 'docked';
 export type RefractionLevel = 'standard' | 'vivid' | 'off';
+export type PropSpoofMode = 'hook' | 'cow' | 'mount_ns';
 
 export type RootManagerKind = 'auto' | 'ksu' | 'apatch' | 'magisk';
 export type OtaMirrorMode = 'auto' | 'ghfast' | 'ghproxy' | 'direct';
@@ -24,6 +25,8 @@ export interface AppSettings {
   dockStyle: DockStyle;
   refractionLevel: RefractionLevel;
   defaultMountNs: boolean;
+  defaultPropMode: PropSpoofMode;
+  /** 兼容保留位，始终与 defaultPropMode === 'cow' 同步 */
   defaultCowProp: boolean;
   autoRestartOnSave: boolean;
 }
@@ -77,9 +80,17 @@ export interface DeviceTemplate {
   CUSTOM_PROPS: string;
 }
 
+export interface AppOverrides {
+  ramGb?: number;
+  cpuCores?: number;
+  customProps?: string;
+}
+
 export interface AppRoute {
   tplId: string;
   build: boolean;
+  propMode: PropSpoofMode;
+  /** 兼容衍生位：build && propMode === 'cow' */
   cowProp: boolean;
   gl: boolean;
   vfs: boolean;
@@ -88,8 +99,44 @@ export interface AppRoute {
   vfsNodes: boolean;
   probe: boolean;
   sdkSpoof: boolean;
+  hdrSpoof: boolean;
   refreshRate: number;
   mountNs: boolean;
+  overrides?: AppOverrides;
+}
+
+export interface AutoSpoofConfig {
+  enabled: boolean;
+  tplId: string;
+  build: boolean;
+  propMode: PropSpoofMode;
+  gl: boolean;
+  cpu: boolean;
+  mem: boolean;
+  vfsNodes: boolean;
+  mountNs: boolean;
+  hdrSpoof: boolean;
+  refreshRate: number;
+  excludePackages: string[];
+}
+
+export interface RuntimeStatusEntry {
+  timestamp: number;
+  pid: number;
+  propReq: string;
+  propEff: string;
+  propVerified: number;
+  propInserted: number;
+  vfsMounted: number;
+  vfsRequested: number;
+  liveNodes: number;
+  zeroResidence: boolean;
+  diag: string;
+}
+
+export interface WatcherRuntimeState {
+  running: boolean;
+  pid: number;
 }
 
 export interface HostDeviceInfo {
@@ -179,4 +226,51 @@ export interface HubSyncStatus {
 export function sanitizeRefreshRate(hz: number | undefined): number {
   const n = Number(hz || 0);
   return n >= 90 && n <= 240 ? n : 0;
+}
+
+export function sanitizePropMode(raw: unknown): PropSpoofMode {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'cow') return 'cow';
+  if (s === 'mount_ns' || s === 'mountns') return 'mount_ns';
+  return 'hook';
+}
+
+export function normalizeAppOverrides(raw?: Partial<AppOverrides> | null): AppOverrides {
+  if (!raw) return {};
+  const out: AppOverrides = {};
+  const ram = Number(raw.ramGb || 0);
+  if (Number.isInteger(ram) && ram >= 1 && ram <= 128) {
+    out.ramGb = ram;
+  }
+  const cores = Number(raw.cpuCores || 0);
+  if (Number.isInteger(cores) && cores >= 1 && cores <= 32) {
+    out.cpuCores = cores;
+  }
+  const cp = String(raw.customProps || '').trim();
+  if (cp.length > 0) {
+    out.customProps = cp;
+  }
+  return out;
+}
+
+export function isAppOverridesEmpty(o?: AppOverrides | null): boolean {
+  if (!o) return true;
+  return !o.ramGb && !o.cpuCores && !(o.customProps && o.customProps.trim().length > 0);
+}
+
+export function createDefaultAutoSpoof(): AutoSpoofConfig {
+  return {
+    enabled: false,
+    tplId: '',
+    build: true,
+    propMode: 'cow',
+    gl: true,
+    cpu: true,
+    mem: true,
+    vfsNodes: true,
+    mountNs: false,
+    hdrSpoof: false,
+    refreshRate: 0,
+    excludePackages: [],
+  };
 }

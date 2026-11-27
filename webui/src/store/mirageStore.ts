@@ -17,6 +17,7 @@ import {
 } from '../bridge/ksu-io';
 import {
   compileModularConfInTs,
+  encodeBase64Url,
   isRouteAnyEnabled,
   normalizeAppRoute,
   normalizeTemplateVulkanFields,
@@ -28,6 +29,7 @@ import {
   setAccentColor,
   setDockStyle,
   setRefractionLevel,
+  setDefaultPropMode,
   setEngineSetting,
   applyAllVisualSettings,
 } from './settingsStore';
@@ -37,8 +39,12 @@ import {
   cloneHostDeviceViaCli,
 } from './deviceInfoStore';
 import {
+  createDefaultAutoSpoof,
+  isAppOverridesEmpty,
+  sanitizePropMode,
   sanitizeRefreshRate,
   type AppRoute,
+  type AutoSpoofConfig,
   type CrashEvent,
   type DeviceTemplate,
   type HubSyncStatus,
@@ -46,14 +52,18 @@ import {
   type OtaRuntimeState,
   type OtaStage,
   type ProbeEvent,
+  type PropSpoofMode,
   type RootManagerKind,
+  type RuntimeStatusEntry,
   type TelemetryEvent,
   type ThemeMode,
   type UpdateInfo,
+  type WatcherRuntimeState,
 } from './types';
 
 export * from './types';
 export {
+  encodeBase64Url,
   normalizeTemplateVulkanFields,
   normalizeAppRoute,
   isRouteAnyEnabled,
@@ -64,6 +74,7 @@ export {
   setAccentColor,
   setDockStyle,
   setRefractionLevel,
+  setDefaultPropMode,
   setEngineSetting,
   applyAllVisualSettings,
   hostDeviceState,
@@ -74,6 +85,8 @@ export {
 export const CLI_BIN = '/data/adb/modules/mirage_forge/bin/mirageforge_cli';
 export const MODULE_PROP_FILE = '/data/adb/modules/mirage_forge/module.prop';
 export const CONFIG_JSON_FILE = '/data/adb/mirage_forge/config.json';
+export const AUTO_SPOOF_JSON_FILE = '/data/adb/mirage_forge/auto_spoof.json';
+export const RUNTIME_STATUS_FILE = '/data/adb/mirage_forge/runtime_status.json';
 export const ROUTES_DB_FILE = '/data/adb/mirage_forge/routes.db';
 export const APPS_DIR_PATH = '/data/adb/mirage_forge/apps';
 export const TPL_DIR_PATH = '/data/adb/mirage_forge/templates';
@@ -193,6 +206,12 @@ export const mirageStore = reactive({
   loading: false,
   templates: {} as Record<string, DeviceTemplate>,
   appRoutes: {} as Record<string, AppRoute>,
+  autoSpoof: createDefaultAutoSpoof() as AutoSpoofConfig,
+  watcherStatus: {
+    running: false,
+    pid: 0,
+  } as WatcherRuntimeState,
+  runtimeStatus: {} as Record<string, RuntimeStatusEntry>,
   installedApps: [] as InstalledAppInfo[],
   includeSystemApps: false,
   probeEvents: [] as ProbeEvent[],
@@ -772,11 +791,7 @@ export async function rebootDeviceNow() {
 export function encodeTemplateShareCode(tpl: DeviceTemplate): string {
   const normalized = normalizeTemplateVulkanFields(tpl);
   const json = JSON.stringify(normalized);
-  const b64 = btoa(unescape(encodeURIComponent(json)))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-  return `mf://${b64}`;
+  return `mf://${encodeBase64Url(json)}`;
 }
 
 export function decodeTemplateShareCode(rawCode: string): DeviceTemplate | null {
@@ -866,8 +881,36 @@ export async function fetchOnlineTemplateHub(forceToast = false) {
   if (forceToast) showToast(`云端拉取失败，已切换至离线精选库 (${lastErr})`);
 }
 
+function normalizeAutoSpoofConfig(raw?: Partial<AutoSpoofConfig> | null): AutoSpoofConfig {
+  const def = createDefaultAutoSpoof();
+  if (!raw) return def;
+  const build = raw.build !== false;
+  const cpu = raw.cpu !== false;
+  const mem = raw.mem !== false;
+  const vfsNodes = raw.vfsNodes !== false;
+  const anyVfs = cpu || mem || vfsNodes;
+  const excludes = Array.isArray(raw.excludePackages)
+    ? Array.from(new Set(raw.excludePackages.map((s) => String(s || '').trim()).filter(Boolean)))
+    : [];
+
+  return {
+    enabled: Boolean(raw.enabled),
+    tplId: String(raw.tplId || ''),
+    build,
+    propMode: build ? sanitizePropMode(raw.propMode || 'cow') : 'hook',
+    gl: raw.gl !== false,
+    cpu,
+    mem,
+    vfsNodes,
+    mountNs: Boolean(raw.mountNs) && anyVfs,
+    hdrSpoof: Boolean(raw.hdrSpoof) && (build || raw.gl !== false),
+    refreshRate: sanitizeRefreshRate(raw.refreshRate),
+    excludePackages: excludes,
+  };
+}
+
 async function flushStateZeroFork() {
-  const rLines = [`# MirageForge v${mirageStore.version} Routes Table (v2 13-col)`];
+  const rLines = [`# MirageForge v${mirageStore.version} Routes Table (v3 16-col)`];
   for (const [pkg, rawR] of Object.entries(mirageStore.appRoutes)) {
     const r = normalizeAppRoute(rawR);
     const tpl = mirageStore.templates[r.tplId];
@@ -879,8 +922,11 @@ async function flushStateZeroFork() {
     mirageStore.appRoutes[pkg] = r;
     const confText = compileModularConfInTs(tpl, r);
     await writeFileZeroFork(`${APPS_DIR_PATH}/${pkg}.conf`, confText);
+    const ovrB64 = !isAppOverridesEmpty(r.overrides)
+      ? encodeBase64Url(JSON.stringify(r.overrides))
+      : '';
     rLines.push(
-      `${pkg}|${r.tplId}|${r.build ? 1 : 0}|${r.gl ? 1 : 0}|${r.vfs ? 1 : 0}|${r.probe ? 1 : 0}|${r.sdkSpoof ? 1 : 0}|${r.refreshRate}|${r.mountNs ? 1 : 0}|${r.cowProp ? 1 : 0}|${r.cpu ? 1 : 0}|${r.mem ? 1 : 0}|${r.vfsNodes ? 1 : 0}`
+      `${pkg}|${r.tplId}|${r.build ? 1 : 0}|${r.gl ? 1 : 0}|${r.vfs ? 1 : 0}|${r.probe ? 1 : 0}|${r.sdkSpoof ? 1 : 0}|${r.refreshRate}|${r.mountNs ? 1 : 0}|${r.cowProp ? 1 : 0}|${r.cpu ? 1 : 0}|${r.mem ? 1 : 0}|${r.vfsNodes ? 1 : 0}|${r.propMode}|${r.hdrSpoof ? 1 : 0}|${ovrB64}`
     );
   }
   await writeFileZeroFork(ROUTES_DB_FILE, rLines.join('\n') + '\n');
@@ -894,6 +940,7 @@ async function flushStateZeroFork() {
         templateCount: Object.keys(mirageStore.templates).length,
         templates: mirageStore.templates,
         appRoutes: mirageStore.appRoutes,
+        autoSpoof: mirageStore.autoSpoof,
       },
       null,
       2
@@ -935,6 +982,93 @@ export function parseClusterBars(clustersStr: string) {
     });
 }
 
+export async function refreshRuntimeStatus() {
+  if (hasZeroForkIo()) {
+    const raw = await readFileZeroFork(RUNTIME_STATUS_FILE);
+    if (raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          mirageStore.runtimeStatus = parsed;
+          return;
+        }
+      } catch (_) {}
+    }
+  }
+  const res = await execRootShell(`"${CLI_BIN}" runtime-status list --json`);
+  if (res.errno === 0 && res.stdout.trim()) {
+    try {
+      const parsed = JSON.parse(res.stdout);
+      if (parsed && typeof parsed === 'object') {
+        mirageStore.runtimeStatus = parsed;
+      }
+    } catch (_) {}
+  }
+}
+
+export async function refreshWatcherStatus() {
+  if (detectRuntimeEnv() === 'BrowserMock') {
+    mirageStore.watcherStatus = { running: mirageStore.autoSpoof.enabled, pid: 1024 };
+    return;
+  }
+  const res = await execRootShell(`"${CLI_BIN}" auto-spoof status`);
+  if (res.errno === 0 && res.stdout.trim()) {
+    try {
+      const parsed = JSON.parse(res.stdout);
+      mirageStore.watcherStatus = {
+        running: Boolean(parsed.watcherRunning),
+        pid: Number(parsed.watcherPid || 0),
+      };
+    } catch (_) {}
+  }
+}
+
+export async function ensureWatcherRunningViaCli() {
+  if (detectRuntimeEnv() === 'BrowserMock') {
+    mirageStore.watcherStatus = { running: true, pid: 1024 };
+    return;
+  }
+  await execRootShell(`( nohup "${CLI_BIN}" watch-installs </dev/null >/dev/null 2>&1 & )`);
+  await new Promise((r) => setTimeout(r, 320));
+  await refreshWatcherStatus();
+}
+
+export async function saveAutoSpoofViaCli(rawCfg: AutoSpoofConfig, silent = false) {
+  const cfg = normalizeAutoSpoofConfig(rawCfg);
+  if (cfg.enabled && !cfg.tplId) {
+    const firstTpl = Object.keys(mirageStore.templates)[0] || '';
+    if (!firstTpl) {
+      showToast('请先至少保留 1 套硬件模板');
+      return;
+    }
+    cfg.tplId = firstTpl;
+  }
+
+  mirageStore.autoSpoof = cfg;
+  const payload = JSON.stringify(cfg);
+
+  if (detectRuntimeEnv() === 'BrowserMock') {
+    mirageStore.watcherStatus = { running: cfg.enabled, pid: cfg.enabled ? 1024 : 0 };
+    if (!silent) showToast(cfg.enabled ? '已开启新应用自动伪装' : '已关闭新应用自动伪装');
+    return;
+  }
+
+  const b64 = btoa(unescape(encodeURIComponent(payload)));
+  const res = await execRootShell(`echo "${b64}" | base64 -d | "${CLI_BIN}" auto-spoof set-stdin`);
+  if (res.errno !== 0 && hasZeroForkIo()) {
+    await writeFileZeroFork(AUTO_SPOOF_JSON_FILE, JSON.stringify(cfg, null, 2) + '\n');
+  }
+  if (cfg.enabled) {
+    await ensureWatcherRunningViaCli();
+  } else {
+    await refreshWatcherStatus();
+  }
+  triggerHaptic('success');
+  if (!silent) {
+    showToast(cfg.enabled ? '已更新新应用自动托管策略' : '已关闭新应用自动托管');
+  }
+}
+
 export async function syncStateFromRustCli() {
   await loadVersionFromModuleProp();
 
@@ -945,10 +1079,20 @@ export async function syncStateFromRustCli() {
         const data = JSON.parse(rawJson);
         mirageStore.templates = normalizeLoadedTemplates(data.templates);
         mirageStore.appRoutes = normalizeLoadedRoutes(data.appRoutes);
+        if (data.autoSpoof) {
+          mirageStore.autoSpoof = normalizeAutoSpoofConfig(data.autoSpoof);
+        }
         if (!mirageStore.version || mirageStore.version === '...') {
           mirageStore.version = data.version || '1.3.0';
           mirageStore.versionCode = data.versionCode || 130;
         }
+        const rawAuto = await readFileZeroFork(AUTO_SPOOF_JSON_FILE);
+        if (rawAuto.trim()) {
+          try {
+            mirageStore.autoSpoof = normalizeAutoSpoofConfig(JSON.parse(rawAuto));
+          } catch (_) {}
+        }
+        await refreshRuntimeStatus();
         return;
       } catch (_) {}
     }
@@ -964,6 +1108,12 @@ export async function syncStateFromRustCli() {
       }
       mirageStore.templates = normalizeLoadedTemplates(data.templates);
       mirageStore.appRoutes = normalizeLoadedRoutes(data.appRoutes);
+      if (data.autoSpoof) {
+        mirageStore.autoSpoof = normalizeAutoSpoofConfig(data.autoSpoof);
+      }
+      if (data.runtimeStatus && typeof data.runtimeStatus === 'object') {
+        mirageStore.runtimeStatus = data.runtimeStatus;
+      }
     } catch (_) {}
   }
 }
@@ -971,7 +1121,10 @@ export async function syncStateFromRustCli() {
 export async function reloadAppList() {
   mirageStore.loading = true;
   const configured = Object.keys(mirageStore.appRoutes);
-  const apps = await fetchInstalledAppsZeroFork(mirageStore.includeSystemApps, configured);
+  const [apps] = await Promise.all([
+    fetchInstalledAppsZeroFork(mirageStore.includeSystemApps, configured),
+    refreshRuntimeStatus(),
+  ]);
   mirageStore.installedApps = apps.sort((a, b) => {
     const aConf = Boolean(mirageStore.appRoutes[a.packageName]);
     const bConf = Boolean(mirageStore.appRoutes[b.packageName]);
@@ -1000,6 +1153,14 @@ export async function deleteTemplateViaCli(id: string) {
   if (hasZeroForkIo()) {
     delete mirageStore.templates[id];
     await removeFileZeroFork(`${TPL_DIR_PATH}/${id}.tpl`);
+    if (mirageStore.autoSpoof.tplId === id) {
+      mirageStore.autoSpoof.enabled = false;
+      mirageStore.autoSpoof.tplId = '';
+      await writeFileZeroFork(
+        AUTO_SPOOF_JSON_FILE,
+        JSON.stringify(mirageStore.autoSpoof, null, 2) + '\n'
+      );
+    }
     await flushStateZeroFork();
   } else {
     await execRootShell(`"${CLI_BIN}" template delete "${id}" --json`);
@@ -1054,11 +1215,16 @@ export async function updateAppRouteViaCli(
     await execRootShell(`"${CLI_BIN}" route remove "${pkg}" ${shouldRestart ? '--restart' : ''}`);
   } else {
     const nr = normalizeAppRoute(route);
+    const ovrB64 = !isAppOverridesEmpty(nr.overrides)
+      ? encodeBase64Url(JSON.stringify(nr.overrides))
+      : '';
     const cmd = [
       `"${CLI_BIN}" route set "${pkg}" "${nr.tplId}"`,
       `--build ${nr.build ? 1 : 0}`,
+      `--prop-mode ${nr.propMode}`,
       `--cow-prop ${nr.cowProp ? 1 : 0}`,
       `--gl ${nr.gl ? 1 : 0}`,
+      `--hdr ${nr.hdrSpoof ? 1 : 0}`,
       `--vfs ${nr.vfs ? 1 : 0}`,
       `--cpu ${nr.cpu ? 1 : 0}`,
       `--mem ${nr.mem ? 1 : 0}`,
@@ -1067,6 +1233,7 @@ export async function updateAppRouteViaCli(
       `--sdk ${nr.sdkSpoof ? 1 : 0}`,
       `--fps ${nr.refreshRate}`,
       `--mount-ns ${nr.mountNs ? 1 : 0}`,
+      ovrB64 ? `--overrides-b64 "${ovrB64}"` : '',
       shouldRestart ? '--restart' : '',
     ]
       .filter(Boolean)
@@ -1076,13 +1243,46 @@ export async function updateAppRouteViaCli(
   await syncStateFromRustCli();
 }
 
-/**
- * 在设置页切换全局 MountNS / COW 开关后，一键同步应用到全部已配置应用
- */
+export async function applyGlobalPropModeToAllRoutes(mode: PropSpoofMode) {
+  const clean = sanitizePropMode(mode);
+  const entries = Object.entries(mirageStore.appRoutes);
+  if (entries.length === 0) {
+    showToast('当前没有已配置的应用');
+    return;
+  }
+  let changed = 0;
+  for (const [pkg, r] of entries) {
+    if (!r.build) continue;
+    mirageStore.appRoutes[pkg] = normalizeAppRoute({
+      ...r,
+      propMode: clean,
+    });
+    changed++;
+  }
+  if (changed === 0) {
+    showToast('当前没有开启「伪装系统属性」的应用');
+    return;
+  }
+  if (hasZeroForkIo()) {
+    await flushStateZeroFork();
+  } else {
+    for (const [pkg, r] of Object.entries(mirageStore.appRoutes)) {
+      if (r.build) await updateAppRouteViaCli(pkg, r, false);
+    }
+  }
+  const label = clean === 'mount_ns' ? 'MountNS' : clean === 'cow' ? '纯 COW' : '传统 Hook';
+  triggerHaptic('success');
+  showToast(`已将系统属性引擎 (${label}) 同步至 ${changed} 款应用`);
+}
+
 export async function applyGlobalEngineFlagToAllRoutes(
   field: 'mountNs' | 'cowProp',
   enabled: boolean
 ) {
+  if (field === 'cowProp') {
+    await applyGlobalPropModeToAllRoutes(enabled ? 'cow' : 'hook');
+    return;
+  }
   const entries = Object.entries(mirageStore.appRoutes);
   if (entries.length === 0) {
     showToast('当前没有已配置的应用');
@@ -1091,7 +1291,7 @@ export async function applyGlobalEngineFlagToAllRoutes(
   for (const [pkg, r] of entries) {
     const next = normalizeAppRoute({
       ...r,
-      [field]: field === 'mountNs' ? enabled && r.vfs : enabled,
+      mountNs: enabled && r.vfs,
     });
     mirageStore.appRoutes[pkg] = next;
   }
@@ -1103,7 +1303,7 @@ export async function applyGlobalEngineFlagToAllRoutes(
     }
   }
   triggerHaptic('success');
-  showToast(`已将 ${field === 'mountNs' ? 'MountNS' : 'COW Prop'} 策略同步至 ${entries.length} 款应用`);
+  showToast(`已将 MountNS 策略同步至 ${entries.length} 款应用`);
 }
 
 export async function exportDiagnosticBundleViaCli() {

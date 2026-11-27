@@ -2,7 +2,21 @@
 // Copyright (c) 2025-2026 jjh138792
 // MirageForge: https://github.com/jjh138792/MirageForge
 
-import { sanitizeRefreshRate, type AppRoute, type DeviceTemplate } from './types';
+import {
+  isAppOverridesEmpty,
+  normalizeAppOverrides,
+  sanitizePropMode,
+  sanitizeRefreshRate,
+  type AppRoute,
+  type DeviceTemplate,
+} from './types';
+
+export function encodeBase64Url(text: string): string {
+  return btoa(unescape(encodeURIComponent(text)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
 
 export function normalizeTemplateVulkanFields(raw: Partial<DeviceTemplate>): DeviceTemplate {
   const tpl = { ...raw } as DeviceTemplate;
@@ -67,24 +81,40 @@ export function normalizeAppRoute(raw: Partial<AppRoute> & { tplId: string }): A
   const mem = typeof raw.mem === 'boolean' ? raw.mem : legacyVfs;
   const vfsNodes = typeof raw.vfsNodes === 'boolean' ? raw.vfsNodes : legacyVfs;
   const vfs = cpu || mem || vfsNodes;
-  return {
+  const gl = raw.gl !== false;
+
+  const resolvedMode = raw.propMode
+    ? sanitizePropMode(raw.propMode)
+    : raw.cowProp
+    ? 'cow'
+    : 'hook';
+  const propMode = build ? resolvedMode : 'hook';
+  const overrides = normalizeAppOverrides(raw.overrides);
+
+  const out: AppRoute = {
     tplId: String(raw.tplId),
     build,
-    cowProp: Boolean(raw.cowProp) && build,
-    gl: raw.gl !== false,
+    propMode,
+    cowProp: build && propMode === 'cow',
+    gl,
     vfs,
     cpu,
     mem,
     vfsNodes,
     probe: Boolean(raw.probe),
     sdkSpoof: Boolean(raw.sdkSpoof) && build,
-    refreshRate: sanitizeRefreshRate(raw.refreshRate),
+    hdrSpoof: Boolean(raw.hdrSpoof) && (build || gl),
+    refreshRate: build || gl ? sanitizeRefreshRate(raw.refreshRate) : 0,
     mountNs: Boolean(raw.mountNs) && vfs,
   };
+  if (!isAppOverridesEmpty(overrides)) {
+    out.overrides = overrides;
+  }
+  return out;
 }
 
 export function isRouteAnyEnabled(r: AppRoute): boolean {
-  return Boolean(r.build || r.cowProp || r.gl || r.cpu || r.mem || r.vfsNodes || r.probe);
+  return Boolean(r.build || r.gl || r.cpu || r.mem || r.vfsNodes || r.probe);
 }
 
 export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRoute): string {
@@ -97,13 +127,16 @@ export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRout
     }
   };
 
-  const anyProp = route.build;
+  const propMode = route.build ? route.propMode : 'hook';
   const anyVfs = route.cpu || route.mem || route.vfsNodes;
   const effectiveFps = sanitizeRefreshRate(route.refreshRate);
+  const enableHdr = (route.build || route.gl) && route.hdrSpoof;
 
   push('META:ENABLE_BUILD', route.build ? '1' : '0');
-  push('META:ENABLE_COW_PROP', route.build && route.cowProp ? '1' : '0');
+  push('META:PROP_MODE', propMode);
+  push('META:ENABLE_COW_PROP', route.build && propMode === 'cow' ? '1' : '0');
   push('META:ENABLE_GL', route.gl ? '1' : '0');
+  push('META:ENABLE_HDR', enableHdr ? '1' : '0');
   push('META:ENABLE_VFS', anyVfs ? '1' : '0');
   push('META:ENABLE_CPU', route.cpu ? '1' : '0');
   push('META:ENABLE_MEM', route.mem ? '1' : '0');
@@ -132,14 +165,23 @@ export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRout
     push('VULKAN:DRIVER_INFO', tpl.VK_DRIVER_INFO);
   }
 
-  const ramGb = tpl.RAM_GB > 0 ? tpl.RAM_GB : 16;
+  const ramGb =
+    route.overrides?.ramGb && route.overrides.ramGb > 0
+      ? route.overrides.ramGb
+      : tpl.RAM_GB > 0
+      ? tpl.RAM_GB
+      : 16;
+  const cpuCores =
+    route.overrides?.cpuCores && route.overrides.cpuCores > 0
+      ? route.overrides.cpuCores
+      : tpl.CPU_CORES;
   const ddrType = tpl.DDR_TYPE || 'LPDDR5X';
   const ddrVendor = tpl.DDR_VENDOR || 'SKhynix';
 
   if (route.cpu || route.vfsNodes) {
     push('VFS:CPU_HARDWARE', tpl.CPU_HARDWARE);
     push('VFS:CPU_ARCH', 'aarch64');
-    if (tpl.CPU_CORES > 0) push('VFS:CPU_CORES', tpl.CPU_CORES);
+    if (cpuCores > 0) push('VFS:CPU_CORES', cpuCores);
     push('VFS:CPU_MAX_FREQ', tpl.CPU_MAX_FREQ || 4320000);
     push('VFS:CPU_CLUSTERS', tpl.CPU_CLUSTERS);
     push('VFS:SOC_ID', tpl.SOC_ID);
@@ -154,7 +196,7 @@ export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRout
     push('VFS:DDR_VENDOR', ddrVendor);
   }
 
-  if (anyProp) {
+  if (route.build) {
     const abis = tpl.SUPPORTED_ABIS || 'arm64-v8a,armeabi-v7a,armeabi';
     const buildUtc = Math.floor(
       (parseInt(tpl.BUILD_TIME || '1736899200000', 10) || 1736899200000) / 1000
@@ -291,26 +333,32 @@ export function compileModularConfInTs(rawTpl: DeviceTemplate, rawRoute: AppRout
       }
     }
 
-    for (const raw of (tpl.CUSTOM_PROPS || '').split(/\r?\n/)) {
-      const tr = raw.trim();
-      if (!tr || tr.startsWith('#')) continue;
-      const eq = tr.indexOf('=');
-      if (eq > 0) {
-        const k = tr.slice(0, eq).trim();
-        if (k.includes('lcd_density') || k.endsWith('.dpi')) continue;
-        if (
-          !route.sdkSpoof &&
-          (k.includes('build.version.sdk') ||
-            k.includes('build.version.release') ||
-            k.includes('first_api_level') ||
-            k.includes('preview_sdk') ||
-            k.includes('version.codename'))
-        ) {
-          continue;
+    const appendCustomBlock = (block?: string) => {
+      if (!block) return;
+      for (const raw of block.split(/\r?\n/)) {
+        const tr = raw.trim();
+        if (!tr || tr.startsWith('#')) continue;
+        const eq = tr.indexOf('=');
+        if (eq > 0) {
+          const k = tr.slice(0, eq).trim();
+          if (!k || k.includes('lcd_density') || k.endsWith('.dpi')) continue;
+          if (
+            !route.sdkSpoof &&
+            (k.includes('build.version.sdk') ||
+              k.includes('build.version.release') ||
+              k.includes('first_api_level') ||
+              k.includes('preview_sdk') ||
+              k.includes('version.codename'))
+          ) {
+            continue;
+          }
+          lines.push(tr);
         }
-        lines.push(tr);
       }
-    }
+    };
+
+    appendCustomBlock(tpl.CUSTOM_PROPS);
+    appendCustomBlock(route.overrides?.customProps);
   }
 
   return lines.join('\n') + '\n';

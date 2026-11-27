@@ -23,11 +23,19 @@ export interface NavBarItem {
   icon: Component;
 }
 
-const props = defineProps<{
-  items: NavBarItem[];
-  activeIndex: number;
-  dockStyle: DockStyle;
-}>();
+const props = withDefaults(
+  defineProps<{
+    items: NavBarItem[];
+    activeIndex: number;
+    dockStyle: DockStyle;
+    externalOrbIndex?: number | null;
+    externalSwiping?: boolean;
+  }>(),
+  {
+    externalOrbIndex: null,
+    externalSwiping: false,
+  }
+);
 
 const emit = defineEmits<{
   (e: 'select', index: number): void;
@@ -47,14 +55,9 @@ const interactiveT = ref(0);
 const isOrbPressed = ref(false);
 const isOrbDragging = ref(false);
 
-// Q 弹果冻四维物理弹簧组：
-// 1. springX：欠阻尼水平位移，切换时带轻微越界回弹
 const springX = new JellySpring(props.activeIndex, 285, 16.5);
-// 2. springScale：按压/松手整体缩放回弹
 const springScale = new JellySpring(1, 320, 14);
-// 3. springJelly：独立体积守恒果冻形变振荡器（低阻尼，产生 2~3 次真实 Q 弹晃动）
 const springJelly = new JellySpring(0, 390, 10.5);
-// 4. springInteractive：临界阻尼光学层切换（平滑无闪烁）
 const springInteractive = new JellySpring(0, 230, 26);
 
 let rafId = 0;
@@ -101,13 +104,12 @@ function startPhysicsLoop() {
     orbX.value = curX;
 
     if (isBlurOnly.value) {
-      // 仅毛玻璃模式：纯净平滑滑移，无静态/活动态变化
       orbScaleX.value = 1;
       orbScaleY.value = 1;
       interactiveT.value = 0;
       setOrbRefractionScale(0);
 
-      if (!springX.isSettled()) {
+      if (!springX.isSettled() || props.externalSwiping) {
         rafId = requestAnimationFrame(tick);
       } else {
         rafId = 0;
@@ -116,19 +118,15 @@ function startPhysicsLoop() {
       return;
     }
 
-    // 速度拉长 + 刹停减速时反向果冻压缩冲量（越界或落位刹停自动抖动！）
     const edgeOvershoot =
       curX < 0 ? -curX : curX > props.items.length - 1 ? curX - (props.items.length - 1) : 0;
 
     if (edgeOvershoot > 0.02) {
-      // 顶到左右边界：像果冻撞玻璃壁一样横向压扁、纵向鼓起
       springJelly.target = -Math.min(0.24, edgeOvershoot * 0.45);
     } else {
-      // 滑动中：随水平速度拉长成水滴形
       springJelly.target = Math.min(0.26, Math.abs(vx) * 0.052);
     }
 
-    // 急加速/急刹停产生真实的惯性果冻冲量
     if (Math.abs(accelX) > 2.5) {
       const sign = vx * accelX >= 0 ? 1 : -1;
       const kick = clamp(Math.abs(accelX) * 0.012, 0, 0.45) * sign;
@@ -139,12 +137,10 @@ function startPhysicsLoop() {
     const j = clamp(springJelly.step(dt), -0.30, 0.36);
     const inter = clamp(springInteractive.step(dt), 0, 1);
 
-    // 严格体积守恒形变：横向拉长时纵向同步收窄，横向压扁时纵向同步鼓起
     orbScaleX.value = baseScale * (1 + j);
     orbScaleY.value = baseScale / (1 + j * 0.72);
     interactiveT.value = inter;
 
-    // 交互态 0 模糊边缘拉伸强度随速度与交互权重连续变化
     const rimStrength = inter * (28 + Math.min(10, Math.abs(vx) * 2.0));
     setOrbRefractionScale(rimStrength);
 
@@ -153,7 +149,8 @@ function startPhysicsLoop() {
       !springScale.isSettled() ||
       !springJelly.isSettled() ||
       !springInteractive.isSettled() ||
-      isOrbPressed.value
+      isOrbPressed.value ||
+      props.externalSwiping
     ) {
       rafId = requestAnimationFrame(tick);
     } else {
@@ -169,15 +166,59 @@ function startPhysicsLoop() {
   rafId = requestAnimationFrame(tick);
 }
 
+// 统一调度：全屏滑动进度 + 外部页签切换（消除同帧松手切页时的双冲量冲突）
 watch(
-  () => props.activeIndex,
-  (nextIdx) => {
-    if (!isOrbDragging.value) {
+  [() => props.externalSwiping, () => props.externalOrbIndex, () => props.activeIndex],
+  ([swiping, extIdx, actIdx], [prevSwiping, , prevActIdx]) => {
+    if (isOrbPressed.value || isOrbDragging.value) return;
+
+    if (swiping && typeof extIdx === 'number') {
+      if (!prevSwiping && !isBlurOnly.value) {
+        syncLensGeometries();
+        springInteractive.stiffness = 250;
+        springInteractive.damping = 26;
+        springInteractive.target = 1;
+
+        springScale.stiffness = 340;
+        springScale.damping = 15;
+        springScale.target = 1.18;
+        springJelly.impulse(1.4);
+      }
+
+      springX.stiffness = 460;
+      springX.damping = 24;
+      springX.target = extIdx;
+      startPhysicsLoop();
+      return;
+    }
+
+    if (!swiping && prevSwiping) {
+      springX.stiffness = isBlurOnly.value ? 260 : 300;
+      springX.damping = isBlurOnly.value ? 24 : 15.5;
+      springX.target = actIdx;
+
+      if (!isBlurOnly.value) {
+        springScale.stiffness = 300;
+        springScale.damping = 12.5;
+        springScale.target = 1.0;
+
+        springJelly.target = 0;
+        springJelly.impulse(actIdx !== prevActIdx ? -2.4 : 1.6);
+
+        springInteractive.stiffness = 170;
+        springInteractive.damping = 24;
+        springInteractive.target = 0;
+      }
+
+      startPhysicsLoop();
+      return;
+    }
+
+    if (actIdx !== prevActIdx) {
       springX.stiffness = isBlurOnly.value ? 260 : 285;
       springX.damping = isBlurOnly.value ? 24 : 16.5;
-      springX.target = nextIdx;
+      springX.target = actIdx;
       if (!isBlurOnly.value) {
-        // 外部切换页签也触发一次轻量 Q 弹果冻拉伸
         springJelly.impulse(1.8);
       }
       startPhysicsLoop();
@@ -227,7 +268,6 @@ function onDockPointerDown(e: PointerEvent) {
   const slotW = (rect.width - pad * 2) / count;
   const clickIdx = clamp((e.clientX - rect.left - pad) / slotW - 0.5, 0, count - 1);
 
-  // 触碰瞬间：浮升至顶层 0 模糊交互态 + Q 弹按压脉冲
   springInteractive.stiffness = 260;
   springInteractive.damping = 26;
   springInteractive.target = 1;
@@ -235,7 +275,7 @@ function onDockPointerDown(e: PointerEvent) {
   springScale.stiffness = 380;
   springScale.damping = 14;
   springScale.target = 1.13;
-  springJelly.impulse(-1.4); // 瞬间微微竖向压弹一下，模拟按压果冻手感
+  springJelly.impulse(-1.4);
   startPhysicsLoop();
 
   if (longPressTimer) clearTimeout(longPressTimer);
@@ -271,11 +311,9 @@ function onDockPointerMove(e: PointerEvent) {
     const slotW = (rect.width - pad * 2) / count;
     let rawIdx = (e.clientX - rect.left - pad) / slotW - 0.5;
 
-    // 橡皮筋阻尼越界（拉过头越拉越紧）
     if (rawIdx < 0) rawIdx = rawIdx * 0.28;
     if (rawIdx > maxIdx) rawIdx = maxIdx + (rawIdx - maxIdx) * 0.28;
 
-    // 拖拽粘滞阻尼跟随：既有跟手度又有液滴惯性滞后感
     springX.stiffness = 430;
     springX.damping = 23;
     springX.target = rawIdx;
@@ -297,7 +335,6 @@ function onDockPointerUp(e: PointerEvent) {
     clamp((e.clientX - rect.left - pad) / slotW - 0.5, 0, count - 1)
   );
 
-  // 松手归位：欠阻尼弹射落位 + 果冻回弹抖动
   springX.stiffness = isBlurOnly.value ? 260 : 300;
   springX.damping = isBlurOnly.value ? 24 : 15.5;
   springX.target = releaseIdx;
@@ -307,7 +344,6 @@ function onDockPointerUp(e: PointerEvent) {
     springScale.damping = 12.5;
     springScale.target = 1.0;
 
-    // 落位瞬间给果冻注入一次弹性回震
     springJelly.target = 0;
     springJelly.impulse(isOrbDragging.value ? -2.6 : 2.0);
 
@@ -358,10 +394,10 @@ onUnmounted(() => {
       @pointerup="onDockPointerUp"
       @pointercancel="onDockPointerUp"
     >
-      <!-- Layer 0 (z:0): 整条底栏玻璃层（全域拉伸+柔和模糊；毛玻璃模式纯磨砂） -->
+      <!-- Layer 0 (z:0): 整条底栏玻璃层 -->
       <div class="dock-glass-layer liquid-dock-glass" :class="dockStyle"></div>
 
-      <!-- Layer 1 (z:1): 静止态泡（位于图标下方！只拉伸+柔和模糊背后页面，绝不扭曲图标） -->
+      <!-- Layer 1 (z:1): 静止态泡（位于图标下方，全域拉伸+柔焦背景） -->
       <div
         ref="idleOrbRef"
         class="dock-orb orb-under orb-idle-glass"
@@ -372,7 +408,7 @@ onUnmounted(() => {
         }"
       ></div>
 
-      <!-- Layer 2 (z:2): 导航图标与文字（静止时 100% 锐利端正不被拉伸） -->
+      <!-- Layer 2 (z:2): 导航图标与文字 -->
       <div
         v-for="(item, idx) in items"
         :key="item.key"
@@ -383,7 +419,7 @@ onUnmounted(() => {
         <span class="dock-label">{{ item.label }}</span>
       </div>
 
-      <!-- Layer 3 (z:3): 交互态水晶泡（位于图标上方！0 模糊，仅拉边缘，松手无缝退回下层） -->
+      <!-- Layer 3 (z:3): 交互态水晶泡（位于图标上方，0 模糊仅拉边缘） -->
       <div
         v-if="!isBlurOnly"
         class="dock-orb orb-over orb-interactive-glass"

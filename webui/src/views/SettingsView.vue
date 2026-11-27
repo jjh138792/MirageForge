@@ -5,6 +5,7 @@ MirageForge: https://github.com/jjh138792/MirageForge
 -->
 
 <script setup lang="ts">
+import { ref, computed, onMounted } from 'vue';
 import {
   Sun,
   Moon,
@@ -19,6 +20,9 @@ import {
   ExternalLink,
   ChevronRight,
   RefreshCw,
+  Bot,
+  Plus,
+  X,
 } from 'lucide-vue-next';
 import { useI18n, type LocaleCode } from '../i18n';
 import { triggerHaptic } from '../bridge/ksu-io';
@@ -29,12 +33,19 @@ import {
   setAccentColor,
   setDockStyle,
   setRefractionLevel,
+  setDefaultPropMode,
   setEngineSetting,
+  applyGlobalPropModeToAllRoutes,
   applyGlobalEngineFlagToAllRoutes,
+  saveAutoSpoofViaCli,
+  refreshWatcherStatus,
+  ensureWatcherRunningViaCli,
   exportDiagnosticBundleViaCli,
   type AccentTheme,
+  type AutoSpoofConfig,
   type ThemeMode,
   type DockStyle,
+  type PropSpoofMode,
   type RefractionLevel,
 } from '../store/mirageStore';
 
@@ -44,6 +55,9 @@ const emit = defineEmits<{
 }>();
 
 const { locale, t, setLocale } = useI18n();
+const excludeInput = ref('');
+
+const templateList = computed(() => Object.values(mirageStore.templates));
 
 const accentSwatches: Array<{ key: AccentTheme; color: string }> = [
   { key: 'violet', color: '#8b5cf6' },
@@ -70,10 +84,29 @@ const refractionOptions: Array<{ key: RefractionLevel; labelKey: string }> = [
   { key: 'off', labelKey: 'settings.refractionOff' },
 ];
 
+const propModeOptions: Array<{ key: PropSpoofMode; label: string }> = [
+  { key: 'hook', label: '传统 Hook' },
+  { key: 'cow', label: '纯 COW' },
+  { key: 'mount_ns', label: 'MountNS' },
+];
+
 const localeOptions: Array<{ key: LocaleCode; label: string }> = [
   { key: 'zh-CN', label: '简体中文' },
   { key: 'zh-TW', label: '繁體中文' },
   { key: 'en-US', label: 'English' },
+];
+
+const autoCapSwitches: Array<{
+  key: 'build' | 'gl' | 'cpu' | 'mem' | 'vfsNodes' | 'mountNs' | 'hdrSpoof';
+  label: string;
+}> = [
+  { key: 'build', label: '系统属性' },
+  { key: 'gl', label: 'GPU' },
+  { key: 'cpu', label: 'CPU' },
+  { key: 'mem', label: '内存' },
+  { key: 'vfsNodes', label: '文件节点' },
+  { key: 'mountNs', label: 'MountNS' },
+  { key: 'hdrSpoof', label: 'HDR' },
 ];
 
 function selectLocale(code: LocaleCode) {
@@ -81,10 +114,65 @@ function selectLocale(code: LocaleCode) {
   setLocale(code);
 }
 
+function cloneAutoSpoof(): AutoSpoofConfig {
+  return {
+    ...mirageStore.autoSpoof,
+    excludePackages: [...(mirageStore.autoSpoof.excludePackages || [])],
+  };
+}
+
+async function patchAutoSpoof(patch: Partial<AutoSpoofConfig>, silent = false) {
+  const next: AutoSpoofConfig = {
+    ...cloneAutoSpoof(),
+    ...patch,
+  };
+  if (next.enabled && !next.tplId && templateList.value.length > 0) {
+    next.tplId = templateList.value[0].id;
+  }
+  await saveAutoSpoofViaCli(next, silent);
+}
+
+async function toggleAutoCapability(
+  key: 'build' | 'gl' | 'cpu' | 'mem' | 'vfsNodes' | 'mountNs' | 'hdrSpoof'
+) {
+  triggerHaptic('light');
+  const next = cloneAutoSpoof();
+  next[key] = !next[key];
+  if (key === 'mountNs' && next.mountNs && !next.cpu && !next.mem && !next.vfsNodes) {
+    next.vfsNodes = true;
+  }
+  if (key === 'hdrSpoof' && next.hdrSpoof && !next.build && !next.gl) {
+    next.gl = true;
+  }
+  await saveAutoSpoofViaCli(next, true);
+}
+
+async function addExcludePackage() {
+  const val = excludeInput.value.trim();
+  if (!val) return;
+  const next = cloneAutoSpoof();
+  if (!next.excludePackages.includes(val)) {
+    next.excludePackages.push(val);
+    await saveAutoSpoofViaCli(next, true);
+  }
+  excludeInput.value = '';
+}
+
+async function removeExcludePackage(pkg: string) {
+  triggerHaptic('light');
+  const next = cloneAutoSpoof();
+  next.excludePackages = next.excludePackages.filter((item) => item !== pkg);
+  await saveAutoSpoofViaCli(next, true);
+}
+
 function openRepo() {
   triggerHaptic('light');
   window.open('https://github.com/jjh138792/MirageForge', '_blank');
 }
+
+onMounted(() => {
+  refreshWatcherStatus();
+});
 </script>
 
 <template>
@@ -96,6 +184,7 @@ function openRepo() {
       </div>
     </div>
 
+    <!-- 1. 外观与交互 -->
     <div class="settings-group liquid-glass" v-touch-glass>
       <div class="group-title">
         <Palette :size="15" />
@@ -184,10 +273,39 @@ function openRepo() {
       </div>
     </div>
 
+    <!-- 2. 底层伪装引擎策略 -->
     <div class="settings-group liquid-glass" v-touch-glass>
       <div class="group-title">
         <Sliders :size="15" />
         <span>{{ t('settings.secEngine') }}</span>
+      </div>
+
+      <!-- 默认系统属性三引擎选择 -->
+      <div class="switch-card">
+        <div class="switch-copy">
+          <div class="switch-title">{{ t('settings.propModeDefaultTitle') }}</div>
+          <div class="switch-desc">{{ t('settings.propModeDefaultDesc') }}</div>
+        </div>
+        <div class="segmented-row">
+          <button
+            v-for="opt in propModeOptions"
+            :key="opt.key"
+            class="seg-btn tactile-press"
+            :class="{ active: settingsStore.defaultPropMode === opt.key }"
+            @click="setDefaultPropMode(opt.key)"
+          >
+            <span>{{ opt.label }}</span>
+          </button>
+        </div>
+        <div class="switch-extra">
+          <button
+            class="sync-all-btn tactile-press"
+            @click="applyGlobalPropModeToAllRoutes(settingsStore.defaultPropMode)"
+          >
+            <RefreshCw :size="12" />
+            <span>{{ t('settings.syncAllBtn') }}</span>
+          </button>
+        </div>
       </div>
 
       <div class="switch-card">
@@ -217,30 +335,6 @@ function openRepo() {
       <div class="switch-card">
         <div
           class="switch-row tactile-press"
-          @click="setEngineSetting('defaultCowProp', !settingsStore.defaultCowProp)"
-        >
-          <div class="mf-switch" :class="{ on: settingsStore.defaultCowProp }">
-            <div class="mf-switch-thumb"></div>
-          </div>
-          <div class="switch-copy">
-            <div class="switch-title">{{ t('settings.cowPropTitle') }}</div>
-            <div class="switch-desc">{{ t('settings.cowPropDesc') }}</div>
-          </div>
-        </div>
-        <div class="switch-extra">
-          <button
-            class="sync-all-btn tactile-press"
-            @click="applyGlobalEngineFlagToAllRoutes('cowProp', settingsStore.defaultCowProp)"
-          >
-            <RefreshCw :size="12" />
-            <span>{{ t('settings.syncAllBtn') }}</span>
-          </button>
-        </div>
-      </div>
-
-      <div class="switch-card">
-        <div
-          class="switch-row tactile-press"
           @click="setEngineSetting('autoRestartOnSave', !settingsStore.autoRestartOnSave)"
         >
           <div class="mf-switch" :class="{ on: settingsStore.autoRestartOnSave }">
@@ -254,6 +348,129 @@ function openRepo() {
       </div>
     </div>
 
+    <!-- 3. 新安装应用自动加入伪装（Linux inotify 零耗电托管） -->
+    <div class="settings-group liquid-glass" v-touch-glass>
+      <div class="group-head-row">
+        <div class="group-title">
+          <Bot :size="15" />
+          <span>{{ t('settings.secAutoSpoof') }}</span>
+        </div>
+        <span
+          class="watcher-pill"
+          :class="{ running: mirageStore.watcherStatus.running }"
+        >
+          {{
+            mirageStore.watcherStatus.running
+              ? t('settings.watcherRunning', { pid: mirageStore.watcherStatus.pid })
+              : t('settings.watcherStopped')
+          }}
+        </span>
+      </div>
+
+      <div class="switch-card">
+        <div
+          class="switch-row tactile-press"
+          @click="patchAutoSpoof({ enabled: !mirageStore.autoSpoof.enabled })"
+        >
+          <div class="mf-switch" :class="{ on: mirageStore.autoSpoof.enabled }">
+            <div class="mf-switch-thumb"></div>
+          </div>
+          <div class="switch-copy">
+            <div class="switch-title">{{ t('settings.autoSpoofEnable') }}</div>
+            <div class="switch-desc">{{ t('settings.autoSpoofDesc') }}</div>
+          </div>
+        </div>
+
+        <div
+          v-if="mirageStore.autoSpoof.enabled && !mirageStore.watcherStatus.running"
+          class="switch-extra"
+        >
+          <button class="sync-all-btn tactile-press" @click="ensureWatcherRunningViaCli()">
+            <RefreshCw :size="12" />
+            <span>{{ t('settings.watcherStartBtn') }}</span>
+          </button>
+        </div>
+      </div>
+
+      <template v-if="mirageStore.autoSpoof.enabled">
+        <div class="setting-block">
+          <div class="setting-label">{{ t('settings.autoSpoofTpl') }}</div>
+          <select
+            class="liquid-select"
+            :value="mirageStore.autoSpoof.tplId"
+            @change="(e) => patchAutoSpoof({ tplId: (e.target as HTMLSelectElement).value }, true)"
+          >
+            <option v-for="tpl in templateList" :key="tpl.id" :value="tpl.id">
+              {{ tpl.name }}
+            </option>
+          </select>
+        </div>
+
+        <div class="setting-block">
+          <div class="setting-label">自动托管属性引擎</div>
+          <div class="segmented-row">
+            <button
+              v-for="opt in propModeOptions"
+              :key="opt.key"
+              class="seg-btn tactile-press"
+              :class="{ active: mirageStore.autoSpoof.propMode === opt.key }"
+              @click="patchAutoSpoof({ build: true, propMode: opt.key }, true)"
+            >
+              <span>{{ opt.label }}</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="setting-block">
+          <div class="setting-label">{{ t('settings.autoSpoofSwitches') }}</div>
+          <div class="cap-chip-wrap">
+            <button
+              v-for="cap in autoCapSwitches"
+              :key="cap.key"
+              class="cap-chip tactile-press"
+              :class="{ on: mirageStore.autoSpoof[cap.key] }"
+              @click="toggleAutoCapability(cap.key)"
+            >
+              {{ cap.label }}
+            </button>
+          </div>
+        </div>
+
+        <div class="setting-block">
+          <div class="setting-label">{{ t('settings.autoSpoofExcludes') }}</div>
+          <div class="exclude-input-row">
+            <input
+              v-model="excludeInput"
+              type="text"
+              class="liquid-input"
+              :placeholder="t('settings.autoSpoofExcludePlaceholder')"
+              @keyup.enter="addExcludePackage"
+            />
+            <button class="exclude-add-btn tactile-press" @click="addExcludePackage">
+              <Plus :size="14" />
+              <span>{{ t('settings.autoSpoofAddBtn') }}</span>
+            </button>
+          </div>
+          <div v-if="mirageStore.autoSpoof.excludePackages.length > 0" class="exclude-chips">
+            <span
+              v-for="pkg in mirageStore.autoSpoof.excludePackages"
+              :key="pkg"
+              class="exclude-chip"
+            >
+              <span>{{ pkg }}</span>
+              <button class="exclude-del" @click="removeExcludePackage(pkg)" aria-label="移除">
+                <X :size="11" />
+              </button>
+            </span>
+          </div>
+          <p class="exclude-note">
+            已内置安全保护：KernelSU / APatch / Magisk / MMRL / KSUWebUI / LSPosed / Termux 始终自动跳过。
+          </p>
+        </div>
+      </template>
+    </div>
+
+    <!-- 4. 诊断与关于 -->
     <div class="settings-group liquid-glass" v-touch-glass>
       <div class="group-title">
         <Radar :size="15" />
@@ -328,6 +545,14 @@ function openRepo() {
   gap: 13px;
 }
 
+.group-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .group-title {
   display: flex;
   align-items: center;
@@ -335,6 +560,22 @@ function openRepo() {
   font-size: 13.5px;
   font-weight: 800;
   color: var(--accent-secondary);
+}
+
+.watcher-pill {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2.5px 8px;
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
+}
+
+.watcher-pill.running {
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.14);
+  border-color: rgba(16, 185, 129, 0.36);
 }
 
 .setting-block {
@@ -463,6 +704,81 @@ function openRepo() {
   background: rgba(var(--accent-primary-rgb), 0.14);
   color: var(--accent-primary);
   border: 1px solid rgba(var(--accent-primary-rgb), 0.34);
+}
+
+.cap-chip-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cap-chip {
+  padding: 6px 11px;
+  border-radius: 10px;
+  font-size: 11.5px;
+  font-weight: 700;
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
+  color: var(--text-secondary);
+}
+
+.cap-chip.on {
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.exclude-input-row {
+  display: flex;
+  gap: 7px;
+}
+
+.exclude-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-primary);
+  background: rgba(var(--accent-primary-rgb), 0.14);
+  border: 1px solid rgba(var(--accent-primary-rgb), 0.34);
+  flex-shrink: 0;
+}
+
+.exclude-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.exclude-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--subcard-bg);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
+}
+
+.exclude-del {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  padding: 1px;
+}
+
+.exclude-note {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  line-height: 1.45;
 }
 
 .action-row {
