@@ -25,8 +25,10 @@ struct GotPatchSpec {
     void **orig_out;
 };
 
-// 查询指定地址所在 VMA 的原始页权限，修补完精准还原（不破坏 RELRO 只读，也不弄坏可写 .got.plt）
-inline int query_page_prot(uintptr_t addr, FILE *(*orig_fopen_fn)(const char *, const char *), int (*orig_fclose_fn)(FILE *)) noexcept {
+inline int query_page_prot(
+    uintptr_t addr,
+    FILE *(*orig_fopen_fn)(const char *, const char *),
+    int (*orig_fclose_fn)(FILE *)) noexcept {
     FILE *fp = orig_fopen_fn ? orig_fopen_fn("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
     if (!fp) return PROT_READ | PROT_WRITE;
 
@@ -112,26 +114,50 @@ inline bool should_direct_got_patch_phdr(const char *name) noexcept {
 
     const char *slash = std::strrchr(name, '/');
     const char *fname = slash ? (slash + 1) : name;
+
+    // 严格跳过 Bionic / ART / Linker 核心库
     if (std::strcmp(fname, "libc.so") == 0 ||
         std::strcmp(fname, "libdl.so") == 0 ||
+        std::strcmp(fname, "libm.so") == 0 ||
         std::strcmp(fname, "libart.so") == 0 ||
-        std::strncmp(fname, "linker", 6) == 0) {
+        std::strcmp(fname, "libartbase.so") == 0 ||
+        std::strcmp(fname, "libdexfile.so") == 0 ||
+        std::strncmp(fname, "linker", 6) == 0 ||
+        std::strncmp(fname, "libopenjdk", 10) == 0) {
         return false;
     }
 
-    // 精准覆盖：所有未解压 Split APK 内嵌 .so、应用私有 .so、libvulkan.so、libhwui.so、libvndksupport.so 及厂商 vulkan.*.so
+    // 1. 应用私有路径或未解压 APK 路径
     if (std::strstr(name, ".apk") != nullptr ||
         std::strncmp(name, "/data/", 6) == 0 ||
         std::strncmp(name, "/mnt/", 5) == 0) {
         return true;
     }
+
+    // 2. 关键修复：Android Bionic 对 APK 内嵌库在 dlpi_name 中常仅保留纯文件名 (无 '/')
+    // 例如 "libvulkan_info.so"、"libaida_vulkan.so"、"libdevcheck.so"
+    if (slash == nullptr && std::strstr(fname, ".so") != nullptr) {
+        if (std::strncmp(fname, "libandroid", 10) != 0 &&
+            std::strncmp(fname, "libjavacore", 11) != 0 &&
+            std::strncmp(fname, "libbase", 7) != 0 &&
+            std::strncmp(fname, "libc++", 6) != 0 &&
+            std::strncmp(fname, "libutils", 8) != 0 &&
+            std::strncmp(fname, "libbinder", 9) != 0) {
+            return true;
+        }
+    }
+
+    // 3. 图形 / Vulkan / HAL 系统与厂商桥接库
     if (std::strcmp(fname, "libvulkan.so") == 0 ||
         std::strcmp(fname, "libhwui.so") == 0 ||
         std::strcmp(fname, "libvndksupport.so") == 0 ||
+        std::strcmp(fname, "libhardware.so") == 0 ||
         std::strcmp(fname, "libEGL.so") == 0 ||
+        std::strcmp(fname, "libGLESv1_CM.so") == 0 ||
         std::strcmp(fname, "libGLESv2.so") == 0 ||
         std::strcmp(fname, "libGLESv3.so") == 0 ||
-        std::strncmp(fname, "vulkan.", 7) == 0) {
+        std::strncmp(fname, "vulkan.", 7) == 0 ||
+        std::strstr(fname, "GLES_mali") != nullptr) {
         return true;
     }
     return false;
@@ -156,7 +182,6 @@ inline int direct_got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     const char *name = info->dlpi_name ? info->dlpi_name : "";
     if (!should_direct_got_patch_phdr(name)) return 0;
 
-    // 每个加载进内存的 .so（即使同属一个 Split APK）都拥有全局唯一的 dlpi_addr
     uintptr_t base = static_cast<uintptr_t>(info->dlpi_addr);
     if (g_direct_got_bases.find(base) != g_direct_got_bases.end()) {
         return 0;
@@ -177,7 +202,11 @@ inline int direct_got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     const char *strtab = nullptr;
     uintptr_t jmprel = 0;
     size_t pltrelsz = 0;
-    int pltrel_type = 0;
+#if defined(__LP64__)
+    int pltrel_type = DT_RELA;
+#else
+    int pltrel_type = DT_REL;
+#endif
     uintptr_t rela_tbl = 0;
     size_t rela_sz = 0;
     uintptr_t rel_tbl = 0;
@@ -204,6 +233,7 @@ inline int direct_got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     }
     if (!symtab || !strtab) return 0;
 
+    uint32_t lib_hits = 0;
     auto try_patch_entry = [&](uint32_t sym_idx, uint32_t r_type, uintptr_t r_offset) {
         if (sym_idx == 0 || !is_got_reloc_type(r_type)) return;
         const char *sym_name = strtab + symtab[sym_idx].st_name;
@@ -215,6 +245,7 @@ inline int direct_got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
                 if (write_got_slot_safe(slot, ctx->specs[k].replacement, ctx->specs[k].orig_out,
                                         ctx->orig_fopen_fn, ctx->orig_fclose_fn)) {
                     ++ctx->patched_slots;
+                    ++lib_hits;
                 }
                 break;
             }
@@ -274,6 +305,9 @@ inline int direct_got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     if (rela_tbl && rela_sz > 0) scan_rela(rela_tbl, rela_sz);
     if (rel_tbl && rel_sz > 0) scan_rel(rel_tbl, rel_sz);
 
+    if (lib_hits > 0) {
+        LOGI("[GOT_DIRECT] patched %u slot(s) in %s (base=0x%" PRIxPTR ")", lib_hits, name, base);
+    }
     return 0;
 }
 
