@@ -56,7 +56,6 @@ using PFN_vkGetDeviceProcAddr = PFN_vkVoidFunction (*)(void *device, const char 
 using PFN_vkGetPhysicalDeviceProperties = void (*)(void *physicalDevice, VkPhysicalDevicePropertiesCompat *pProperties);
 using PFN_vkGetPhysicalDeviceProperties2 = void (*)(void *physicalDevice, VkPhysicalDeviceProperties2Compat *pProperties);
 
-// AOSP hardware/hardware.h & hardware/hwvulkan.h 1:1 结构体定义 (兼容 32/64 位)
 struct HwModuleCompat;
 struct HwDeviceCompat;
 
@@ -100,6 +99,7 @@ struct HwVulkanDeviceCompat {
 };
 
 using PFN_hw_get_module = int (*)(const char *id, const HwModuleCompat **module);
+using PFN_hw_get_module_by_class = int (*)(const char *class_id, const char *inst, const HwModuleCompat **module);
 
 inline PFN_vkGetInstanceProcAddr orig_vkGetInstanceProcAddr = nullptr;
 inline PFN_vkGetDeviceProcAddr orig_vkGetDeviceProcAddr = nullptr;
@@ -107,6 +107,7 @@ inline PFN_vkGetPhysicalDeviceProperties orig_vkGetPhysicalDeviceProperties = nu
 inline PFN_vkGetPhysicalDeviceProperties2 orig_vkGetPhysicalDeviceProperties2 = nullptr;
 
 inline PFN_hw_get_module orig_hw_get_module = nullptr;
+inline PFN_hw_get_module_by_class orig_hw_get_module_by_class = nullptr;
 inline const HwModuleCompat *orig_hwvulkan_module = nullptr;
 inline int (*orig_hwvulkan_open)(const HwModuleCompat *, const char *, HwDeviceCompat **) = nullptr;
 inline HwModuleCompat g_wrapped_hwvulkan_module{};
@@ -116,7 +117,21 @@ inline PFN_vkGetInstanceProcAddr orig_icd_GetInstanceProcAddr = nullptr;
 inline PFN_vkGetPhysicalDeviceProperties orig_icd_vkGetPhysicalDeviceProperties = nullptr;
 inline PFN_vkGetPhysicalDeviceProperties2 orig_icd_vkGetPhysicalDeviceProperties2 = nullptr;
 
+inline void hook_vkGetPhysicalDeviceProperties(void *physicalDevice, VkPhysicalDevicePropertiesCompat *pProperties);
+inline void hook_vkGetPhysicalDeviceProperties2(void *physicalDevice, VkPhysicalDeviceProperties2Compat *pProperties);
+inline PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void *instance, const char *pName);
+
 inline void ensure_vulkan_symbols_loaded() {
+    if (orig_vkGetInstanceProcAddr == hook_vkGetInstanceProcAddr) {
+        orig_vkGetInstanceProcAddr = nullptr;
+    }
+    if (orig_vkGetPhysicalDeviceProperties == hook_vkGetPhysicalDeviceProperties) {
+        orig_vkGetPhysicalDeviceProperties = nullptr;
+    }
+    if (orig_vkGetPhysicalDeviceProperties2 == hook_vkGetPhysicalDeviceProperties2) {
+        orig_vkGetPhysicalDeviceProperties2 = nullptr;
+    }
+
     if (orig_vkGetInstanceProcAddr && orig_vkGetPhysicalDeviceProperties && orig_vkGetPhysicalDeviceProperties2) {
         return;
     }
@@ -133,19 +148,22 @@ inline void ensure_vulkan_symbols_loaded() {
     };
 
     if (!orig_vkGetInstanceProcAddr) {
-        orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(raw_lookup("vkGetInstanceProcAddr"));
+        auto fn = reinterpret_cast<PFN_vkGetInstanceProcAddr>(raw_lookup("vkGetInstanceProcAddr"));
+        if (fn && fn != hook_vkGetInstanceProcAddr) orig_vkGetInstanceProcAddr = fn;
     }
     if (!orig_vkGetDeviceProcAddr) {
         orig_vkGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(raw_lookup("vkGetDeviceProcAddr"));
     }
     if (!orig_vkGetPhysicalDeviceProperties) {
-        orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(raw_lookup("vkGetPhysicalDeviceProperties"));
+        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(raw_lookup("vkGetPhysicalDeviceProperties"));
+        if (fn && fn != hook_vkGetPhysicalDeviceProperties) orig_vkGetPhysicalDeviceProperties = fn;
     }
     if (!orig_vkGetPhysicalDeviceProperties2) {
-        orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(raw_lookup("vkGetPhysicalDeviceProperties2"));
-        if (!orig_vkGetPhysicalDeviceProperties2) {
-            orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(raw_lookup("vkGetPhysicalDeviceProperties2KHR"));
+        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(raw_lookup("vkGetPhysicalDeviceProperties2"));
+        if (!fn) {
+            fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(raw_lookup("vkGetPhysicalDeviceProperties2KHR"));
         }
+        if (fn && fn != hook_vkGetPhysicalDeviceProperties2) orig_vkGetPhysicalDeviceProperties2 = fn;
     }
 }
 
@@ -153,6 +171,9 @@ inline void init_vulkan_hal_symbols() {
     ErrnoRestorer errno_guard;
     if (!orig_hw_get_module) {
         orig_hw_get_module = reinterpret_cast<PFN_hw_get_module>(dlsym(RTLD_DEFAULT, "hw_get_module"));
+    }
+    if (!orig_hw_get_module_by_class) {
+        orig_hw_get_module_by_class = reinterpret_cast<PFN_hw_get_module_by_class>(dlsym(RTLD_DEFAULT, "hw_get_module_by_class"));
     }
     ensure_vulkan_symbols_loaded();
 }
@@ -192,7 +213,6 @@ inline void spoof_vulkan_props_struct(VkPhysicalDevicePropertiesCompat *props) {
     if (guard) emit_probe("VULKAN", "VkPhysicalDeviceProperties.deviceName", props->deviceName);
 }
 
-// 遍历 Vulkan 1.1+ pNext 扩展链：使用独立的 vk_driver_name / vk_driver_info，彻底杜绝 OpenGL ES 字符串串台
 inline void spoof_vulkan_pnext_chain(void *pNext) {
     if (!pNext || !g_cfg.gl.enabled) return;
     auto *curr = static_cast<VkBaseOutStructureCompat *>(pNext);
@@ -216,7 +236,7 @@ inline void spoof_vulkan_pnext_chain(void *pNext) {
 }
 
 // ============================================================================
-// 1. Vulkan HAL / ICD 底层源头拦截 (libvulkan.so -> hw_get_module / HMI / vk_icdGetInstanceProcAddr)
+// 1. Vulkan HAL / ICD 底层源头拦截 (hw_get_module / hw_get_module_by_class / HMI)
 // ============================================================================
 inline void hook_icd_vkGetPhysicalDeviceProperties(void *physicalDevice, VkPhysicalDevicePropertiesCompat *pProperties) {
     if (orig_icd_vkGetPhysicalDeviceProperties) {
@@ -240,12 +260,14 @@ inline PFN_vkVoidFunction hook_icd_GetInstanceProcAddr(void *instance, const cha
     if (!real_fn || !pName || !g_cfg.gl.enabled) return real_fn;
 
     if (std::strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
-        orig_icd_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_fn);
+        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_fn);
+        if (fn != hook_icd_vkGetPhysicalDeviceProperties) orig_icd_vkGetPhysicalDeviceProperties = fn;
         return reinterpret_cast<PFN_vkVoidFunction>(hook_icd_vkGetPhysicalDeviceProperties);
     }
     if (std::strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
         std::strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
-        orig_icd_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_fn);
+        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_fn);
+        if (fn != hook_icd_vkGetPhysicalDeviceProperties2) orig_icd_vkGetPhysicalDeviceProperties2 = fn;
         return reinterpret_cast<PFN_vkVoidFunction>(hook_icd_vkGetPhysicalDeviceProperties2);
     }
     return real_fn;
@@ -291,6 +313,14 @@ inline int hook_hw_get_module(const char *id, const HwModuleCompat **module) {
     return ret;
 }
 
+inline int hook_hw_get_module_by_class(const char *class_id, const char *inst, const HwModuleCompat **module) {
+    int ret = orig_hw_get_module_by_class ? orig_hw_get_module_by_class(class_id, inst, module) : -1;
+    if (ret == 0 && g_cfg.gl.enabled && class_id && std::strcmp(class_id, "vulkan") == 0 && module && *module) {
+        *module = wrap_hwvulkan_module_if_needed(*module);
+    }
+    return ret;
+}
+
 // ============================================================================
 // 2. 应用侧 Vulkan API 拦截层
 // ============================================================================
@@ -305,8 +335,11 @@ inline void hook_vkGetPhysicalDeviceProperties(void *physicalDevice, VkPhysicalD
 inline void hook_vkGetPhysicalDeviceProperties2(void *physicalDevice, VkPhysicalDeviceProperties2Compat *pProperties) {
     ensure_vulkan_symbols_loaded();
     if (!orig_vkGetPhysicalDeviceProperties2 && orig_vkGetInstanceProcAddr) {
-        orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             orig_vkGetInstanceProcAddr(nullptr, "vkGetPhysicalDeviceProperties2"));
+        if (fn && fn != hook_vkGetPhysicalDeviceProperties2) {
+            orig_vkGetPhysicalDeviceProperties2 = fn;
+        }
     }
     if (orig_vkGetPhysicalDeviceProperties2) {
         orig_vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
@@ -327,15 +360,19 @@ inline PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void *instance, const char 
     if (!pName || !g_cfg.gl.enabled) return real_fn;
 
     if (std::strcmp(pName, "vkGetInstanceProcAddr") == 0) {
-        return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetInstanceProcAddr);
+        return real_fn ? reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetInstanceProcAddr) : nullptr;
     }
     if (std::strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
-        if (real_fn) orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_fn);
+        if (!real_fn) return nullptr;
+        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_fn);
+        if (fn != hook_vkGetPhysicalDeviceProperties) orig_vkGetPhysicalDeviceProperties = fn;
         return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties);
     }
     if (std::strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
         std::strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
-        if (real_fn) orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_fn);
+        if (!real_fn) return nullptr;
+        auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_fn);
+        if (fn != hook_vkGetPhysicalDeviceProperties2) orig_vkGetPhysicalDeviceProperties2 = fn;
         return reinterpret_cast<PFN_vkVoidFunction>(hook_vkGetPhysicalDeviceProperties2);
     }
     return real_fn;

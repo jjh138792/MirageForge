@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <set>
+#include <tuple>
 #include <utility>
 #include <mutex>
 #include <dlfcn.h>
@@ -24,7 +25,9 @@ namespace mirage {
 
 inline zygisk::Api *g_zygisk_api = nullptr;
 inline std::mutex g_maps_mtx;
-inline std::set<std::pair<dev_t, ino_t>> g_hooked_elves;
+// 关键修复：按 (dev, inode, file_offset) 三元组去重！
+// 解决未解压 Split APK 中多个 .so 共享同一 (dev, inode) 导致后续懒加载 libvulkan_info.so / libaida_vulkan.so 被跳过的问题
+inline std::set<std::tuple<dev_t, ino_t, uintptr_t>> g_hooked_elf_segments;
 inline void *g_discard_old_slot = nullptr;
 inline dev_t g_self_dev = 0;
 inline ino_t g_self_ino = 0;
@@ -51,7 +54,6 @@ inline bool needs_vfs_syscall_plt() noexcept {
     return false;
 }
 
-// 传统文件 I/O PLT 回退条件：VFS 未走 MountNS，或系统属性处于传统 Hook 模式
 inline bool needs_legacy_vfs_file_plt() noexcept {
     if (g_cfg.vfs.any_enabled() && !g_vfs_ns_mounted.load(std::memory_order_acquire)) {
         return true;
@@ -62,9 +64,6 @@ inline bool needs_legacy_vfs_file_plt() noexcept {
     return false;
 }
 
-// 严格判定是否需要驻留任何 PLT Hook：
-// 若返回 false（如纯 COW/MountNS 系统属性 + 无 GPU/无探针/无高刷HDR），
-// 则 0 PLT Hook 并在 postAppSpecialize 反射完 Java Build 后立刻 DLCLOSE 自卸载实现零驻留！
 inline bool needs_any_plt_hooks() noexcept {
     return needs_prop_plt_hooks() ||
            g_cfg.gl.enabled ||
@@ -74,7 +73,6 @@ inline bool needs_any_plt_hooks() noexcept {
            g_cfg.probe.enabled;
 }
 
-// 当进程已决定驻留 PLT 时，若启用了 MountNS，顺手挂载文件 I/O 与 statfs 钩子以清洗 mountinfo/maps 并伪造文件系统魔数
 inline bool should_use_file_io_plt() noexcept {
     if (needs_legacy_vfs_file_plt()) return true;
     return needs_any_plt_hooks() &&
@@ -153,6 +151,7 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
         "libmeminfo.so",
         "libprocinfo.so",
         "libhardware.so",
+        "libvndksupport.so",
         "libgraphicsenv.so",
         "libc++.so",
         "libcutils.so",
@@ -196,33 +195,50 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
             const auto *wrapped = wrap_hwvulkan_module_if_needed(static_cast<const HwModuleCompat *>(real_sym));
             return const_cast<HwModuleCompat *>(wrapped);
         }
+        if (std::strcmp(symbol, "hw_get_module") == 0) {
+            auto fn = reinterpret_cast<PFN_hw_get_module>(real_sym);
+            if (fn != hook_hw_get_module) orig_hw_get_module = fn;
+            return reinterpret_cast<void *>(hook_hw_get_module);
+        }
+        if (std::strcmp(symbol, "hw_get_module_by_class") == 0) {
+            auto fn = reinterpret_cast<PFN_hw_get_module_by_class>(real_sym);
+            if (fn != hook_hw_get_module_by_class) orig_hw_get_module_by_class = fn;
+            return reinterpret_cast<void *>(hook_hw_get_module_by_class);
+        }
         if (std::strcmp(symbol, "vk_icdGetInstanceProcAddr") == 0) {
-            orig_icd_GetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_sym);
+            auto fn = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_sym);
+            if (fn != hook_icd_GetInstanceProcAddr) orig_icd_GetInstanceProcAddr = fn;
             return reinterpret_cast<void *>(hook_icd_GetInstanceProcAddr);
         }
         if (std::strcmp(symbol, "vkGetInstanceProcAddr") == 0) {
-            orig_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_sym);
+            auto fn = reinterpret_cast<PFN_vkGetInstanceProcAddr>(real_sym);
+            if (fn != hook_vkGetInstanceProcAddr) orig_vkGetInstanceProcAddr = fn;
             return reinterpret_cast<void *>(hook_vkGetInstanceProcAddr);
         }
         if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties") == 0) {
-            orig_vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_sym);
+            auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(real_sym);
+            if (fn != hook_vkGetPhysicalDeviceProperties) orig_vkGetPhysicalDeviceProperties = fn;
             return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties);
         }
         if (std::strcmp(symbol, "vkGetPhysicalDeviceProperties2") == 0 ||
             std::strcmp(symbol, "vkGetPhysicalDeviceProperties2KHR") == 0) {
-            orig_vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_sym);
+            auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(real_sym);
+            if (fn != hook_vkGetPhysicalDeviceProperties2) orig_vkGetPhysicalDeviceProperties2 = fn;
             return reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2);
         }
         if (std::strcmp(symbol, "glGetString") == 0) {
-            orig_glGetString = reinterpret_cast<decltype(orig_glGetString)>(real_sym);
+            auto fn = reinterpret_cast<decltype(orig_glGetString)>(real_sym);
+            if (fn != hook_glGetString) orig_glGetString = fn;
             return reinterpret_cast<void *>(hook_glGetString);
         }
         if (std::strcmp(symbol, "eglGetProcAddress") == 0) {
-            orig_eglGetProcAddress = reinterpret_cast<decltype(orig_eglGetProcAddress)>(real_sym);
+            auto fn = reinterpret_cast<decltype(orig_eglGetProcAddress)>(real_sym);
+            if (fn != hook_eglGetProcAddress) orig_eglGetProcAddress = fn;
             return reinterpret_cast<void *>(hook_eglGetProcAddress);
         }
         if (std::strcmp(symbol, "AMediaDrm_getPropertyString") == 0) {
-            orig_AMediaDrm_getPropertyString = reinterpret_cast<decltype(orig_AMediaDrm_getPropertyString)>(real_sym);
+            auto fn = reinterpret_cast<decltype(orig_AMediaDrm_getPropertyString)>(real_sym);
+            if (fn != hook_AMediaDrm_getPropertyString) orig_AMediaDrm_getPropertyString = fn;
             return reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString);
         }
     }
@@ -258,6 +274,7 @@ inline bool should_rescan_on_dlopen(const char *filename) noexcept {
     if (g_cfg.gl.enabled &&
         (std::strstr(filename, "vulkan") != nullptr ||
          std::strstr(filename, "libhardware") != nullptr ||
+         std::strstr(filename, "libvndksupport") != nullptr ||
          std::strstr(filename, "libGLES") != nullptr ||
          std::strstr(filename, "libEGL") != nullptr)) {
         return true;
@@ -320,8 +337,9 @@ inline void scan_and_commit_plt_hooks() {
     const bool use_file_plt = should_use_file_io_plt();
     const bool use_prop_plt = needs_prop_plt_hooks();
     const bool use_popen_plt = g_cfg.build.enabled && (g_cfg.build.effective_prop_mode != PropSpoofMode::MOUNT_NS);
+
+    std::set<std::pair<dev_t, ino_t>> batch_to_hook;
     char line[1024];
-    bool dirty = false;
 
     while (std::fgets(line, sizeof(line), fp)) {
         const char *sp = std::strchr(line, ' ');
@@ -347,8 +365,8 @@ inline void scan_and_commit_plt_hooks() {
             continue;
         }
 
-        auto elf_id = std::make_pair(dev, inode);
-        if (g_hooked_elves.find(elf_id) != g_hooked_elves.end()) {
+        auto seg_id = std::make_tuple(dev, inode, offset);
+        if (g_hooked_elf_segments.find(seg_id) != g_hooked_elf_segments.end()) {
             continue;
         }
 
@@ -363,8 +381,14 @@ inline void scan_and_commit_plt_hooks() {
             continue;
         }
 
-        g_hooked_elves.insert(elf_id);
-        dirty = true;
+        g_hooked_elf_segments.insert(seg_id);
+        batch_to_hook.insert(std::make_pair(dev, inode));
+    }
+    if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
+
+    for (const auto &elf_id : batch_to_hook) {
+        dev_t dev = elf_id.first;
+        ino_t inode = elf_id.second;
 
         auto reg = [&](const char *sym, void *new_fn, void **orig_slot) {
             void **target_old = (orig_slot && *orig_slot == nullptr) ? orig_slot : &g_discard_old_slot;
@@ -435,6 +459,7 @@ inline void scan_and_commit_plt_hooks() {
 
         if (g_cfg.gl.enabled) {
             reg("hw_get_module", reinterpret_cast<void *>(hook_hw_get_module), reinterpret_cast<void **>(&orig_hw_get_module));
+            reg("hw_get_module_by_class", reinterpret_cast<void *>(hook_hw_get_module_by_class), reinterpret_cast<void **>(&orig_hw_get_module_by_class));
             reg("glGetString", reinterpret_cast<void *>(hook_glGetString), reinterpret_cast<void **>(&orig_glGetString));
             reg("eglGetProcAddress", reinterpret_cast<void *>(hook_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
             reg("vkGetInstanceProcAddr", reinterpret_cast<void *>(hook_vkGetInstanceProcAddr), reinterpret_cast<void **>(&orig_vkGetInstanceProcAddr));
@@ -444,9 +469,8 @@ inline void scan_and_commit_plt_hooks() {
             reg("AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString));
         }
     }
-    if (orig_fclose) orig_fclose(fp); else std::fclose(fp);
 
-    if (dirty) {
+    if (!batch_to_hook.empty()) {
         g_zygisk_api->pltHookCommit();
     }
     g_maps_mtx.unlock();
