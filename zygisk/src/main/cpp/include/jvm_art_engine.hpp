@@ -20,11 +20,6 @@ inline std::atomic<bool> g_post_specialized{false};
 inline std::atomic<bool> g_fps_spoof_applied{false};
 inline std::atomic<bool> g_binder_mem_hooked{false};
 
-// ============================================================================
-// Java 层 ActivityManager.getMemoryInfo 精准拦截（基于 Zygisk hookJniNativeMethods）
-// - 拦截 BinderProxy.transactNative，非目标事务仅做 1 次整数判断，零性能损耗
-// - 复用设备自身的 MemoryInfo.readFromParcel / writeToParcel，100% 兼容 Android 8 ~ 17
-// ============================================================================
 using PFN_BinderProxy_transactNative = jboolean (*)(
     JNIEnv *env, jobject thiz, jint code, jobject dataObj, jobject replyObj, jint flags);
 
@@ -68,7 +63,6 @@ inline jboolean hook_BinderProxy_transactNative(
     ScopedHookGuard guard;
     if (!guard || env->ExceptionCheck()) return ok;
 
-    // 校验目标接口确为 android.app.IActivityManager（防止与其他 Binder 接口事务号碰撞）
     bool is_am = false;
     auto desc_obj = static_cast<jstring>(env->CallObjectMethod(thiz, g_mid_bp_get_desc));
     if (env->ExceptionCheck()) {
@@ -128,19 +122,33 @@ inline jboolean hook_BinderProxy_transactNative(
     uint64_t phys_bytes = static_cast<uint64_t>(g_cfg.vfs.ram_gb) * 1024ULL * 1024ULL * 1024ULL;
     uint64_t target_total = (phys_bytes * 935ULL) / 1000ULL;
 
-    double avail_ratio = 0.57;
-    if (real_total > 0 && real_avail > 0 && real_avail <= real_total) {
-        avail_ratio = static_cast<double>(real_avail) / static_cast<double>(real_total);
-        if (avail_ratio < 0.15) avail_ratio = 0.15;
-        if (avail_ratio > 0.85) avail_ratio = 0.85;
+    // 真实已用内存扣减法：target_avail = target_total - real_used
+    // 解决 8GB 真机常驻占 ~5.8GB 时按剩余比例缩放到 16GB 只剩 ~3.2GB 的失真问题
+    uint64_t target_avail = (target_total * 58ULL) / 100ULL;
+    if (real_total > 0 && real_avail >= 0 && real_avail <= real_total) {
+        uint64_t real_total_u = static_cast<uint64_t>(real_total);
+        uint64_t real_avail_u = static_cast<uint64_t>(real_avail);
+        uint64_t real_used_u  = real_total_u - real_avail_u;
+
+        if (target_total > real_total_u && target_total > real_used_u) {
+            target_avail = target_total - real_used_u;
+            uint64_t min_avail = (target_total * 38ULL) / 100ULL;
+            uint64_t max_avail = (target_total * 78ULL) / 100ULL;
+            if (target_avail < min_avail) target_avail = min_avail;
+            if (target_avail > max_avail) target_avail = max_avail;
+        } else {
+            double avail_ratio = static_cast<double>(real_avail_u) / static_cast<double>(real_total_u);
+            if (avail_ratio < 0.20) avail_ratio = 0.20;
+            if (avail_ratio > 0.80) avail_ratio = 0.80;
+            target_avail = static_cast<uint64_t>(static_cast<double>(target_total) * avail_ratio);
+        }
     }
-    uint64_t target_avail = static_cast<uint64_t>(static_cast<double>(target_total) * avail_ratio);
 
     uint64_t target_thresh = target_total / 16ULL;
     if (real_total > 0 && real_thresh > 0 && real_thresh < real_total) {
         double t_ratio = static_cast<double>(real_thresh) / static_cast<double>(real_total);
         if (t_ratio < 0.02) t_ratio = 0.02;
-        if (t_ratio > 0.25) t_ratio = 0.25;
+        if (t_ratio > 0.20) t_ratio = 0.20;
         target_thresh = static_cast<uint64_t>(static_cast<double>(target_total) * t_ratio);
     }
 
@@ -155,7 +163,6 @@ inline jboolean hook_BinderProxy_transactNative(
         env->SetLongField(mem_info, g_fid_meminfo_advertised, static_cast<jlong>(phys_bytes));
     }
 
-    // 原地重置 reply Parcel 并重新序列化（PARCELABLE_WRITE_RETURN_VALUE = 1）
     env->CallVoidMethod(replyObj, g_mid_parcel_set_size, static_cast<jint>(0));
     env->CallVoidMethod(replyObj, g_mid_parcel_set_pos, static_cast<jint>(0));
     env->CallVoidMethod(replyObj, g_mid_parcel_write_no_ex);
@@ -232,7 +239,6 @@ inline bool install_java_memory_info_hook(zygisk::Api *api, JNIEnv *env) {
         return false;
     }
 
-    // Android 14+ (API 34+) 新增 advertisedMem 字段，低版本安全忽略
     g_fid_meminfo_advertised = env->GetFieldID(g_cls_memory_info, "advertisedMem", "J");
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
@@ -281,8 +287,6 @@ inline bool install_java_memory_info_hook(zygisk::Api *api, JNIEnv *env) {
     return false;
 }
 
-// 仅在 postAppSpecialize 之后、且开启刷新率 (>=90Hz) 或 HDR/杜比视界声明时懒修补 DisplayInfo 缓存，
-// 绝不在 Zygote 阶段主动触发 Binder IPC，未开启时严格 0 改动
 inline void try_lazy_spoof_display_modes() {
     int target_hz = g_cfg.gl.max_refresh_rate;
     bool want_fps = (target_hz >= 90 && target_hz <= 240);

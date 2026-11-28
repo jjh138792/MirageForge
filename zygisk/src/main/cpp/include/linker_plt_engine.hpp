@@ -10,6 +10,7 @@
 #include <set>
 #include <tuple>
 #include <utility>
+#include <vector>
 #include <mutex>
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -20,13 +21,12 @@
 #include "bionic_prop_engine.hpp"
 #include "vfs_sysinfo_engine.hpp"
 #include "graphics_vulkan_gles.hpp"
+#include "elf_got_patcher.hpp"
 
 namespace mirage {
 
 inline zygisk::Api *g_zygisk_api = nullptr;
 inline std::mutex g_maps_mtx;
-// 关键修复：按 (dev, inode, file_offset) 三元组去重！
-// 解决未解压 Split APK 中多个 .so 共享同一 (dev, inode) 导致后续懒加载 libvulkan_info.so / libaida_vulkan.so 被跳过的问题
 inline std::set<std::tuple<dev_t, ino_t, uintptr_t>> g_hooked_elf_segments;
 inline void *g_discard_old_slot = nullptr;
 inline dev_t g_self_dev = 0;
@@ -34,11 +34,13 @@ inline ino_t g_self_ino = 0;
 
 using PFN_loader_dlopen = void *(*)(const char *filename, int flags, const void *caller_addr);
 using PFN_loader_android_dlopen_ext = void *(*)(const char *filename, int flags, const void *extinfo, const void *caller_addr);
+using PFN_android_load_sphal_library = void *(*)(const char *name, int flag);
 
 inline void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
 inline void *(*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
 inline PFN_loader_dlopen orig_loader_dlopen = nullptr;
 inline PFN_loader_android_dlopen_ext orig_loader_android_dlopen_ext = nullptr;
+inline PFN_android_load_sphal_library orig_android_load_sphal_library = nullptr;
 
 inline void scan_and_commit_plt_hooks();
 
@@ -87,6 +89,7 @@ inline void init_linker_symbols() {
     orig_android_dlopen_ext = reinterpret_cast<decltype(orig_android_dlopen_ext)>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
     orig_loader_dlopen = reinterpret_cast<PFN_loader_dlopen>(dlsym(RTLD_DEFAULT, "__loader_dlopen"));
     orig_loader_android_dlopen_ext = reinterpret_cast<PFN_loader_android_dlopen_ext>(dlsym(RTLD_DEFAULT, "__loader_android_dlopen_ext"));
+    orig_android_load_sphal_library = reinterpret_cast<PFN_android_load_sphal_library>(dlsym(RTLD_DEFAULT, "android_load_sphal_library"));
     if (!orig_loader_dlsym) {
         orig_loader_dlsym = reinterpret_cast<PFN_loader_dlsym>(dlsym(RTLD_DEFAULT, "__loader_dlsym"));
     }
@@ -177,6 +180,37 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
     return false;
 }
 
+inline bool should_rescan_on_dlopen(const char *filename) noexcept {
+    if (!filename) return false;
+    if (std::strstr(filename, "libpairipcore") != nullptr) return false;
+    if (g_cfg.gl.enabled &&
+        (std::strstr(filename, "vulkan") != nullptr ||
+         std::strstr(filename, "libhardware") != nullptr ||
+         std::strstr(filename, "libvndksupport") != nullptr ||
+         std::strstr(filename, "libGLES") != nullptr ||
+         std::strstr(filename, "libEGL") != nullptr)) {
+        return true;
+    }
+    if (std::strncmp(filename, "/system/", 8) == 0 ||
+        std::strncmp(filename, "/apex/", 6) == 0 ||
+        std::strncmp(filename, "/vendor/", 8) == 0) {
+        return false;
+    }
+    return true;
+}
+
+inline void *hook_android_load_sphal_library(const char *name, int flag) {
+    void *handle = orig_android_load_sphal_library ? orig_android_load_sphal_library(name, flag) : nullptr;
+    if (handle && should_rescan_on_dlopen(name)) {
+        ScopedHookGuard guard;
+        if (guard) {
+            emit_probe("SPHAL_LOAD", name ? name : "", "Incremental GOT/PLT Hook");
+            scan_and_commit_plt_hooks();
+        }
+    }
+    return handle;
+}
+
 inline void *hook_dlsym_all(void *handle, const char *symbol) {
     const void *caller_addr = __builtin_return_address(0);
     void *real_sym = nullptr;
@@ -194,6 +228,11 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
         if (std::strcmp(symbol, "HMI") == 0) {
             const auto *wrapped = wrap_hwvulkan_module_if_needed(static_cast<const HwModuleCompat *>(real_sym));
             return const_cast<HwModuleCompat *>(wrapped);
+        }
+        if (std::strcmp(symbol, "android_load_sphal_library") == 0) {
+            auto fn = reinterpret_cast<PFN_android_load_sphal_library>(real_sym);
+            if (fn != hook_android_load_sphal_library) orig_android_load_sphal_library = fn;
+            return reinterpret_cast<void *>(hook_android_load_sphal_library);
         }
         if (std::strcmp(symbol, "hw_get_module") == 0) {
             auto fn = reinterpret_cast<PFN_hw_get_module>(real_sym);
@@ -268,25 +307,6 @@ inline void *hook_dlsym_all(void *handle, const char *symbol) {
     return real_sym;
 }
 
-inline bool should_rescan_on_dlopen(const char *filename) noexcept {
-    if (!filename) return false;
-    if (std::strstr(filename, "libpairipcore") != nullptr) return false;
-    if (g_cfg.gl.enabled &&
-        (std::strstr(filename, "vulkan") != nullptr ||
-         std::strstr(filename, "libhardware") != nullptr ||
-         std::strstr(filename, "libvndksupport") != nullptr ||
-         std::strstr(filename, "libGLES") != nullptr ||
-         std::strstr(filename, "libEGL") != nullptr)) {
-        return true;
-    }
-    if (std::strncmp(filename, "/system/", 8) == 0 ||
-        std::strncmp(filename, "/apex/", 6) == 0 ||
-        std::strncmp(filename, "/vendor/", 8) == 0) {
-        return false;
-    }
-    return true;
-}
-
 inline void *hook_dlopen(const char *filename, int flags) {
     const void *caller_addr = __builtin_return_address(0);
     void *handle = orig_loader_dlopen
@@ -321,6 +341,62 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
         }
     }
     return handle;
+}
+
+// 基于 dl_iterate_phdr 按各 .so 唯一 dlpi_addr 原地修补 JUMP_SLOT + GLOB_DAT
+// 彻底解决 Split APK 非零偏移同 (dev, inode) 碰撞以及 -fno-plt 导致的漏 Hook
+inline void run_direct_got_patches() {
+    const bool use_file_plt = should_use_file_io_plt();
+    std::vector<GotPatchSpec> specs;
+    specs.reserve(32);
+
+    specs.push_back({"dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen)});
+    specs.push_back({"android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext)});
+    specs.push_back({"android_load_sphal_library", reinterpret_cast<void *>(hook_android_load_sphal_library), reinterpret_cast<void **>(&orig_android_load_sphal_library)});
+
+    if (g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || use_file_plt) {
+        specs.push_back({"dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym)});
+    }
+
+    if (g_cfg.gl.enabled) {
+        specs.push_back({"hw_get_module", reinterpret_cast<void *>(hook_hw_get_module), reinterpret_cast<void **>(&orig_hw_get_module)});
+        specs.push_back({"hw_get_module_by_class", reinterpret_cast<void *>(hook_hw_get_module_by_class), reinterpret_cast<void **>(&orig_hw_get_module_by_class)});
+        specs.push_back({"glGetString", reinterpret_cast<void *>(hook_glGetString), reinterpret_cast<void **>(&orig_glGetString)});
+        specs.push_back({"eglGetProcAddress", reinterpret_cast<void *>(hook_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress)});
+        specs.push_back({"vkGetInstanceProcAddr", reinterpret_cast<void *>(hook_vkGetInstanceProcAddr), reinterpret_cast<void **>(&orig_vkGetInstanceProcAddr)});
+        specs.push_back({"vkGetPhysicalDeviceProperties", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties)});
+        specs.push_back({"vkGetPhysicalDeviceProperties2", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties2)});
+        specs.push_back({"vkGetPhysicalDeviceProperties2KHR", reinterpret_cast<void *>(hook_vkGetPhysicalDeviceProperties2), reinterpret_cast<void **>(&orig_vkGetPhysicalDeviceProperties2)});
+        specs.push_back({"AMediaDrm_getPropertyString", reinterpret_cast<void *>(hook_AMediaDrm_getPropertyString), reinterpret_cast<void **>(&orig_AMediaDrm_getPropertyString)});
+    }
+
+    if (use_file_plt) {
+        specs.push_back({"open", reinterpret_cast<void *>(hook_open), reinterpret_cast<void **>(&orig_open)});
+        specs.push_back({"open64", reinterpret_cast<void *>(hook_open64), reinterpret_cast<void **>(&orig_open64)});
+        specs.push_back({"openat", reinterpret_cast<void *>(hook_openat), reinterpret_cast<void **>(&orig_openat)});
+        specs.push_back({"openat64", reinterpret_cast<void *>(hook_openat64), reinterpret_cast<void **>(&orig_openat64)});
+        specs.push_back({"fopen", reinterpret_cast<void *>(hook_fopen), reinterpret_cast<void **>(&orig_fopen)});
+        specs.push_back({"fopen64", reinterpret_cast<void *>(hook_fopen64), reinterpret_cast<void **>(&orig_fopen64)});
+        specs.push_back({"statfs", reinterpret_cast<void *>(hook_statfs), reinterpret_cast<void **>(&orig_statfs)});
+        specs.push_back({"statfs64", reinterpret_cast<void *>(hook_statfs64), reinterpret_cast<void **>(&orig_statfs64)});
+        specs.push_back({"fstatfs", reinterpret_cast<void *>(hook_fstatfs), reinterpret_cast<void **>(&orig_fstatfs)});
+        specs.push_back({"fstatfs64", reinterpret_cast<void *>(hook_fstatfs64), reinterpret_cast<void **>(&orig_fstatfs64)});
+    }
+
+    if (g_cfg.vfs.enable_mem) {
+        specs.push_back({"sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo)});
+    }
+    if (g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_mem) {
+        specs.push_back({"sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf)});
+    }
+    if (g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_vfs_nodes) {
+        specs.push_back({"uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname)});
+    }
+
+    uint32_t patched = apply_direct_got_patches_all(specs.data(), specs.size(), orig_fopen, orig_fclose);
+    if (patched > 0 && g_cfg.probe.enabled) {
+        emit_probe("GOT_DIRECT", "dl_iterate_phdr", "patched_slots=" + std::to_string(patched));
+    }
 }
 
 inline void scan_and_commit_plt_hooks() {
@@ -397,6 +473,7 @@ inline void scan_and_commit_plt_hooks() {
 
         reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
         reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
+        reg("android_load_sphal_library", reinterpret_cast<void *>(hook_android_load_sphal_library), reinterpret_cast<void **>(&orig_android_load_sphal_library));
         if (g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || use_file_plt) {
             reg("dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym));
         }
@@ -473,6 +550,11 @@ inline void scan_and_commit_plt_hooks() {
     if (!batch_to_hook.empty()) {
         g_zygisk_api->pltHookCommit();
     }
+
+    // 无论 pltHookRegister 是否命中，始终执行一次 dl_iterate_phdr 精确 GOT/PLT 直改
+    // 专门兜底 Split APK 内嵌非零偏移 .so（如 libvulkan_info.so / libaida_vulkan.so）与 -fno-plt GLOB_DAT
+    run_direct_got_patches();
+
     g_maps_mtx.unlock();
 }
 
