@@ -6,7 +6,7 @@
 
 **「千面万象，一念幻化」—— 基于 Zygisk 的按应用机型与硬件信息伪装模块**
 
-[![Version](https://img.shields.io/badge/Version-v1.2.2-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
+[![Version](https://img.shields.io/badge/Version-v1.3.0-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
 [![Zygisk](https://img.shields.io/badge/Zygisk-Supported-06b6d4?style=flat-square)](https://github.com/topjohnwu/zygisk-module-sample)
 [![License](https://img.shields.io/badge/License-GPL--3.0--only-f43f5e?style=flat-square)](LICENSE)
 
@@ -111,3 +111,5 @@ su -c "mirageforge_cli probe list --limit 30"
 ## 📄 开源协议
 
 本项目基于 **[GPL-3.0-only](LICENSE)** 协议开源。欢迎自由使用、修改与分享，但衍生作品必须同样保持开源。
+
+**最后**：如果你觉得这个模块好用的话不妨点一下**✨Star**

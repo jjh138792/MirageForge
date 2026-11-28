@@ -6,7 +6,7 @@
 
 **Per-App Device & Hardware Spoofing Zygisk Module**
 
-[![Version](https://img.shields.io/badge/Version-v1.2.1-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
+[![Version](https://img.shields.io/badge/Version-v1.3.0-8b5cf6?style=flat-square)](https://github.com/jjh138792/MirageForge/releases)
 [![Zygisk](https://img.shields.io/badge/Zygisk-Supported-06b6d4?style=flat-square)](https://github.com/topjohnwu/zygisk-module-sample)
 [![CLI](https://img.shields.io/badge/CLI-Rust%202021-f97316?style=flat-square)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-GPL--3.0--only-f43f5e?style=flat-square)](../LICENSE)
