@@ -1,7 +1,7 @@
 id=mirage_forge
 name=蜃楼工坊 · MirageForge
-version=1.2.2
-versionCode=1220
+version=1.3.0
+versionCode=1300
 author=jjh138792
 description=千面万象，一念幻化 —— 基于 Zygisk 的应用级多机型伪装引擎。
 updateJson=https://raw.githubusercontent.com/jjh138792/MirageForge/main/update.json
