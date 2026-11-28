@@ -56,6 +56,7 @@ inline bool needs_vfs_syscall_plt() noexcept {
     return false;
 }
 
+// 严格 0 改动：仅在 VFS 未走 MountNS 或系统属性处于传统 Hook 模式时才挂载文件 I/O PLT Hook
 inline bool needs_legacy_vfs_file_plt() noexcept {
     if (g_cfg.vfs.any_enabled() && !g_vfs_ns_mounted.load(std::memory_order_acquire)) {
         return true;
@@ -66,6 +67,14 @@ inline bool needs_legacy_vfs_file_plt() noexcept {
     return false;
 }
 
+inline bool should_use_file_io_plt() noexcept {
+    return needs_legacy_vfs_file_plt();
+}
+
+inline bool needs_dynamic_loader_hooks() noexcept {
+    return g_cfg.gl.enabled || needs_legacy_vfs_file_plt() || needs_prop_plt_hooks() || needs_display_lazy_hook();
+}
+
 inline bool needs_any_plt_hooks() noexcept {
     return needs_prop_plt_hooks() ||
            g_cfg.gl.enabled ||
@@ -73,13 +82,6 @@ inline bool needs_any_plt_hooks() noexcept {
            needs_vfs_syscall_plt() ||
            needs_legacy_vfs_file_plt() ||
            g_cfg.probe.enabled;
-}
-
-inline bool should_use_file_io_plt() noexcept {
-    if (needs_legacy_vfs_file_plt()) return true;
-    return needs_any_plt_hooks() &&
-           (g_vfs_ns_mounted.load(std::memory_order_acquire) ||
-            g_prop_ns_mounted.load(std::memory_order_acquire));
 }
 
 inline void init_linker_symbols() {
@@ -119,7 +121,9 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
 
     if (std::strstr(path, "mirage_forge") != nullptr ||
         std::strncmp(path, "/data/adb/", 10) == 0 ||
-        std::strstr(path, "libpairipcore") != nullptr) {
+        std::strstr(path, "libpairipcore") != nullptr ||
+        std::strstr(path, "webviewchromium") != nullptr ||
+        std::strstr(path, "GLES_mali") != nullptr) {
         return false;
     }
 
@@ -144,7 +148,27 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
         return true;
     }
 
-    static const char *const kSystemBridgeLibs[] = {
+    // 图形专属桥接库仅在开启「伪装 GPU」或高刷/HDR 时挂载（严守 0 改动）
+    if (g_cfg.gl.enabled || needs_display_lazy_hook()) {
+        static const char *const kGraphicsBridgeLibs[] = {
+            "libhardware.so",
+            "libvndksupport.so",
+            "libgraphicsenv.so",
+            "libEGL.so",
+            "libGLESv1_CM.so",
+            "libGLESv2.so",
+            "libGLESv3.so",
+            "libvulkan.so",
+            "libmediandk.so",
+            "libgui.so",
+            "libhwui.so",
+        };
+        for (const char *g : kGraphicsBridgeLibs) {
+            if (std::strcmp(fname, g) == 0) return true;
+        }
+    }
+
+    static const char *const kCoreBridgeLibs[] = {
         "libnativeloader.so",
         "libnativeloader_lazy.so",
         "libandroid_runtime.so",
@@ -153,26 +177,15 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
         "libopenjdkjvm.so",
         "libmeminfo.so",
         "libprocinfo.so",
-        "libhardware.so",
-        "libvndksupport.so",
-        "libgraphicsenv.so",
         "libc++.so",
         "libcutils.so",
         "libutils.so",
         "libbase.so",
         "libandroid.so",
-        "libEGL.so",
-        "libGLESv1_CM.so",
-        "libGLESv2.so",
-        "libGLESv3.so",
-        "libvulkan.so",
-        "libmediandk.so",
-        "libgui.so",
-        "libhwui.so",
-        "libandroidio.so"
+        "libandroidio.so",
     };
 
-    for (const char *bridge : kSystemBridgeLibs) {
+    for (const char *bridge : kCoreBridgeLibs) {
         if (std::strcmp(fname, bridge) == 0) {
             return true;
         }
@@ -180,31 +193,40 @@ inline bool should_hook_elf_path(const char *path, size_t len) noexcept {
     return false;
 }
 
+// 精准收紧增量扫描触发条件：杜绝 framework / connectivity / mapper / OpenCL 引发冗余全量扫描
 inline bool should_rescan_on_dlopen(const char *filename) noexcept {
-    if (!filename) return false;
-    if (std::strstr(filename, "libpairipcore") != nullptr) return false;
+    if (!filename || filename[0] == '\0') return false;
+    if (std::strstr(filename, "libpairipcore") != nullptr ||
+        std::strstr(filename, "webviewchromium") != nullptr ||
+        std::strstr(filename, "GLES_mali") != nullptr ||
+        std::strstr(filename, "mapper.") != nullptr ||
+        std::strstr(filename, "libOpenCL") != nullptr ||
+        std::strstr(filename, "libframework-") != nullptr) {
+        return false;
+    }
+
     if (g_cfg.gl.enabled &&
         (std::strstr(filename, "vulkan") != nullptr ||
          std::strstr(filename, "libhardware") != nullptr ||
-         std::strstr(filename, "libvndksupport") != nullptr ||
-         std::strstr(filename, "libGLES") != nullptr ||
+         std::strstr(filename, "libGLESv") != nullptr ||
          std::strstr(filename, "libEGL") != nullptr)) {
         return true;
     }
-    if (std::strncmp(filename, "/system/", 8) == 0 ||
-        std::strncmp(filename, "/apex/", 6) == 0 ||
-        std::strncmp(filename, "/vendor/", 8) == 0) {
-        return false;
+
+    if (std::strncmp(filename, "/data/", 6) == 0 ||
+        std::strncmp(filename, "/mnt/", 5) == 0 ||
+        std::strstr(filename, ".apk") != nullptr) {
+        return true;
     }
-    return true;
+    return false;
 }
 
 inline void *hook_android_load_sphal_library(const char *name, int flag) {
     void *handle = orig_android_load_sphal_library ? orig_android_load_sphal_library(name, flag) : nullptr;
-    if (handle && should_rescan_on_dlopen(name)) {
+    if (handle && g_cfg.gl.enabled && name && std::strstr(name, "vulkan") != nullptr) {
         ScopedHookGuard guard;
         if (guard) {
-            emit_probe("SPHAL_LOAD", name ? name : "", "Incremental GOT/PLT Hook");
+            emit_probe("SPHAL_LOAD", name, "Incremental GOT/PLT Hook");
             scan_and_commit_plt_hooks();
         }
     }
@@ -343,22 +365,19 @@ inline void *hook_android_dlopen_ext(const char *filename, int flags, const void
     return handle;
 }
 
-// 基于 dl_iterate_phdr 按各 .so 唯一 dlpi_addr 原地修补 JUMP_SLOT + GLOB_DAT
-// 彻底解决 Split APK 非零偏移同 (dev, inode) 碰撞以及 -fno-plt 导致的漏 Hook
+// 仅在启用 GPU 伪装或传统文件 PLT 回退时执行微秒级内存 GOT 直改（严守 0 改动与高性能）
 inline void run_direct_got_patches() {
     const bool use_file_plt = should_use_file_io_plt();
-    std::vector<GotPatchSpec> specs;
-    specs.reserve(32);
-
-    specs.push_back({"dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen)});
-    specs.push_back({"android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext)});
-    specs.push_back({"android_load_sphal_library", reinterpret_cast<void *>(hook_android_load_sphal_library), reinterpret_cast<void **>(&orig_android_load_sphal_library)});
-
-    if (g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || use_file_plt) {
-        specs.push_back({"dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym)});
+    if (!g_cfg.gl.enabled && !use_file_plt) {
+        return;
     }
 
+    std::vector<GotPatchSpec> specs;
+    specs.reserve(24);
+
     if (g_cfg.gl.enabled) {
+        specs.push_back({"android_load_sphal_library", reinterpret_cast<void *>(hook_android_load_sphal_library), reinterpret_cast<void **>(&orig_android_load_sphal_library)});
+        specs.push_back({"dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym)});
         specs.push_back({"hw_get_module", reinterpret_cast<void *>(hook_hw_get_module), reinterpret_cast<void **>(&orig_hw_get_module)});
         specs.push_back({"hw_get_module_by_class", reinterpret_cast<void *>(hook_hw_get_module_by_class), reinterpret_cast<void **>(&orig_hw_get_module_by_class)});
         specs.push_back({"glGetString", reinterpret_cast<void *>(hook_glGetString), reinterpret_cast<void **>(&orig_glGetString)});
@@ -377,23 +396,9 @@ inline void run_direct_got_patches() {
         specs.push_back({"openat64", reinterpret_cast<void *>(hook_openat64), reinterpret_cast<void **>(&orig_openat64)});
         specs.push_back({"fopen", reinterpret_cast<void *>(hook_fopen), reinterpret_cast<void **>(&orig_fopen)});
         specs.push_back({"fopen64", reinterpret_cast<void *>(hook_fopen64), reinterpret_cast<void **>(&orig_fopen64)});
-        specs.push_back({"statfs", reinterpret_cast<void *>(hook_statfs), reinterpret_cast<void **>(&orig_statfs)});
-        specs.push_back({"statfs64", reinterpret_cast<void *>(hook_statfs64), reinterpret_cast<void **>(&orig_statfs64)});
-        specs.push_back({"fstatfs", reinterpret_cast<void *>(hook_fstatfs), reinterpret_cast<void **>(&orig_fstatfs)});
-        specs.push_back({"fstatfs64", reinterpret_cast<void *>(hook_fstatfs64), reinterpret_cast<void **>(&orig_fstatfs64)});
     }
 
-    if (g_cfg.vfs.enable_mem) {
-        specs.push_back({"sysinfo", reinterpret_cast<void *>(hook_sysinfo), reinterpret_cast<void **>(&orig_sysinfo)});
-    }
-    if (g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_mem) {
-        specs.push_back({"sysconf", reinterpret_cast<void *>(hook_sysconf), reinterpret_cast<void **>(&orig_sysconf)});
-    }
-    if (g_cfg.vfs.enable_cpu || g_cfg.vfs.enable_vfs_nodes) {
-        specs.push_back({"uname", reinterpret_cast<void *>(hook_uname), reinterpret_cast<void **>(&orig_uname)});
-    }
-
-    uint32_t patched = apply_direct_got_patches_all(specs.data(), specs.size(), orig_fopen, orig_fclose);
+    uint32_t patched = apply_direct_got_patches_all(specs.data(), specs.size(), g_cfg.gl.enabled);
     if (patched > 0 && g_cfg.probe.enabled) {
         emit_probe("GOT_DIRECT", "dl_iterate_phdr", "patched_slots=" + std::to_string(patched));
     }
@@ -410,9 +415,10 @@ inline void scan_and_commit_plt_hooks() {
         return;
     }
 
-    const bool use_file_plt = should_use_file_io_plt();
-    const bool use_prop_plt = needs_prop_plt_hooks();
-    const bool use_popen_plt = g_cfg.build.enabled && (g_cfg.build.effective_prop_mode != PropSpoofMode::MOUNT_NS);
+    const bool use_file_plt   = should_use_file_io_plt();
+    const bool use_prop_plt   = needs_prop_plt_hooks();
+    const bool use_popen_plt  = g_cfg.build.enabled && (g_cfg.build.effective_prop_mode == PropSpoofMode::HOOK);
+    const bool use_loader_plt = needs_dynamic_loader_hooks();
 
     std::set<std::pair<dev_t, ino_t>> batch_to_hook;
     char line[1024];
@@ -471,11 +477,15 @@ inline void scan_and_commit_plt_hooks() {
             g_zygisk_api->pltHookRegister(dev, inode, sym, new_fn, target_old);
         };
 
-        reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
-        reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
-        reg("android_load_sphal_library", reinterpret_cast<void *>(hook_android_load_sphal_library), reinterpret_cast<void **>(&orig_android_load_sphal_library));
-        if (g_cfg.gl.enabled || g_cfg.vfs.any_enabled() || use_file_plt) {
-            reg("dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym));
+        if (use_loader_plt) {
+            reg("dlopen", reinterpret_cast<void *>(hook_dlopen), reinterpret_cast<void **>(&orig_dlopen));
+            reg("android_dlopen_ext", reinterpret_cast<void *>(hook_android_dlopen_ext), reinterpret_cast<void **>(&orig_android_dlopen_ext));
+            if (g_cfg.gl.enabled) {
+                reg("android_load_sphal_library", reinterpret_cast<void *>(hook_android_load_sphal_library), reinterpret_cast<void **>(&orig_android_load_sphal_library));
+            }
+            if (g_cfg.gl.enabled || use_file_plt) {
+                reg("dlsym", reinterpret_cast<void *>(hook_dlsym_all), reinterpret_cast<void **>(&orig_dlsym));
+            }
         }
 
         if (use_prop_plt) {
@@ -551,10 +561,7 @@ inline void scan_and_commit_plt_hooks() {
         g_zygisk_api->pltHookCommit();
     }
 
-    // 无论 pltHookRegister 是否命中，始终执行一次 dl_iterate_phdr 精确 GOT/PLT 直改
-    // 专门兜底 Split APK 内嵌非零偏移 .so（如 libvulkan_info.so / libaida_vulkan.so）与 -fno-plt GLOB_DAT
     run_direct_got_patches();
-
     g_maps_mtx.unlock();
 }
 

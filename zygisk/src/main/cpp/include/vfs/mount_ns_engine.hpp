@@ -30,9 +30,12 @@
 #include "bionic_prop_engine.hpp"
 #include "vfs/io_hooks.hpp"
 
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0x40000000
+#endif
+
 namespace mirage {
 
-// 中性暂存目录：不含任何模块或 Root 特征字样，挂载完即 MNT_DETACH 蒸发
 constexpr const char *NEUTRAL_STAGE_ROOT = "/data/local/tmp/.st_ns";
 constexpr uint32_t kMaxVfsMountJobs      = 192;
 constexpr uint32_t kMaxPropMountJobs     = 64;
@@ -74,6 +77,87 @@ struct MountNsVfsChildReport {
     int32_t live_param_b[kMaxLiveUpdateNodes];
     uint8_t vfs_results[kMaxVfsMountJobs];
 };
+
+// ============================================================================
+// 通用 SCM_RIGHTS 跨进程独立 FD 传递工具（用于将自建 socketpair 交给 App 进程）
+// ============================================================================
+inline bool send_fds_over_unix(int sock, uint8_t tag, const int *fds, int fd_count) noexcept {
+    if (sock < 0 || fd_count < 0 || fd_count > 4) return false;
+
+    struct msghdr msg{};
+    struct iovec iov{};
+    iov.iov_base = &tag;
+    iov.iov_len  = sizeof(tag);
+    msg.msg_iov    = &iov;
+    msg.msg_iovlen = 1;
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int) * 4)];
+        struct cmsghdr align;
+    } cmsg_u{};
+
+    if (fd_count > 0 && fds != nullptr) {
+        msg.msg_control = cmsg_u.buf;
+        msg.msg_controllen = CMSG_SPACE(sizeof(int) * static_cast<size_t>(fd_count));
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type  = SCM_RIGHTS;
+        cmsg->cmsg_len   = CMSG_LEN(sizeof(int) * static_cast<size_t>(fd_count));
+        std::memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * static_cast<size_t>(fd_count));
+    }
+
+    ssize_t n;
+    do {
+        n = sendmsg(sock, &msg, MSG_NOSIGNAL);
+    } while (n == -1 && errno == EINTR);
+    return n == static_cast<ssize_t>(sizeof(tag));
+}
+
+inline int recv_fds_over_unix(int sock, uint8_t *out_tag, int *out_fds, int max_fds) noexcept {
+    if (sock < 0 || !out_tag) return -1;
+    for (int i = 0; i < max_fds; ++i) out_fds[i] = -1;
+
+    uint8_t tag = 0;
+    struct msghdr msg{};
+    struct iovec iov{};
+    iov.iov_base = &tag;
+    iov.iov_len  = sizeof(tag);
+    msg.msg_iov    = &iov;
+    msg.msg_iovlen = 1;
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int) * 4)];
+        struct cmsghdr align;
+    } cmsg_u{};
+    msg.msg_control = cmsg_u.buf;
+    msg.msg_controllen = sizeof(cmsg_u.buf);
+
+    ssize_t n;
+    do {
+        n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+    } while (n == -1 && errno == EINTR);
+    if (n != static_cast<ssize_t>(sizeof(tag))) return -1;
+
+    *out_tag = tag;
+    int got = 0;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+            size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+            int total = static_cast<int>(data_len / sizeof(int));
+            int tmp[8];
+            if (total > 8) total = 8;
+            std::memcpy(tmp, CMSG_DATA(cmsg), static_cast<size_t>(total) * sizeof(int));
+            for (int i = 0; i < total; ++i) {
+                if (got < max_fds) {
+                    out_fds[got++] = tmp[i];
+                } else if (tmp[i] >= 0) {
+                    close(tmp[i]);
+                }
+            }
+        }
+    }
+    return got;
+}
 
 // ============================================================================
 // 固定等宽字节长度的 /proc/meminfo 格式化器（严禁截断、0 读端撕裂）
@@ -126,32 +210,41 @@ inline std::string format_meminfo_fixed_width(int ram_gb, int jitter_permille) {
     return (n > 0) ? std::string(buf, static_cast<size_t>(n)) : "";
 }
 
-// ============================================================================
-// App 侧物理自检（以 untrusted_app 身份验证 bind-mount 仍存活且 SELinux 允许读取）
-// - 原生 procfs 文件 st_size 为 0；原生 sysfs 节点 st_size 为 4096
-// - 挂载后的 tmpfs 副本 st_size 等于实际写入字节数，且能成功 read 1 字节
-// ============================================================================
-inline bool verify_mounted_vfs_node_as_app(const std::string &path, size_t expected_len) noexcept {
+// 哨兵节点物理自检（以 untrusted_app 身份仅检 /proc 与 /sys 各 1 个哨兵，耗时 < 0.1ms）
+inline bool verify_vfs_sentinel_as_app(const std::string &path, size_t expected_len, int *out_err, long long *out_sz) noexcept {
+    if (out_err) *out_err = 0;
+    if (out_sz) *out_sz = -1;
     if (path.empty() || expected_len == 0) return false;
+
     int fd = orig_open ? orig_open(path.c_str(), O_RDONLY | O_CLOEXEC, 0)
                        : open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        if (out_err) *out_err = errno;
+        return false;
+    }
 
     struct stat st{};
     bool ok = false;
-    if (fstat(fd, &st) == 0 && st.st_size > 0) {
-        bool size_distinguished = true;
+    if (fstat(fd, &st) == 0) {
+        if (out_sz) *out_sz = static_cast<long long>(st.st_size);
+        bool size_distinguished = (st.st_size > 0);
         if (path.rfind("/sys/", 0) == 0 && expected_len != 4096 && st.st_size == 4096) {
             size_distinguished = false;
         }
         long long diff = static_cast<long long>(st.st_size) - static_cast<long long>(expected_len);
         if (diff < 0) diff = -diff;
 
-        if (size_distinguished && diff <= 16) {
+        if (size_distinguished && diff <= 32) {
             char probe_ch = 0;
             ssize_t nr = read(fd, &probe_ch, 1);
-            ok = (nr == 1);
+            if (nr == 1) {
+                ok = true;
+            } else if (out_err) {
+                *out_err = (nr < 0) ? errno : EIO;
+            }
         }
+    } else if (out_err) {
+        *out_err = errno;
     }
 
     if (orig_close) orig_close(fd); else close(fd);
@@ -159,7 +252,7 @@ inline bool verify_mounted_vfs_node_as_app(const std::string &path, size_t expec
 }
 
 // ============================================================================
-// Phase 1 (App 侧，preAppSpecialize)：仅挂载系统属性区并立即 MAP_SHARED 钉入地址空间
+// Phase 1 (App 侧，preAppSpecialize)：挂载系统属性区并立即 MAP_SHARED 钉入地址空间
 // ============================================================================
 inline MountNsExecSummary request_prop_mount_ns_in_pre_specialize(int fd) {
     MountNsExecSummary summary{};
@@ -305,7 +398,6 @@ inline MountNsExecSummary request_prop_mount_ns_in_pre_specialize(int fd) {
     }
     summary.diag = read_str(fd);
 
-    // 零脏页原地刷新：以 PROT_READ | MAP_SHARED | MAP_FIXED 替换旧映射（后续 unmount 不影响已建立映射）
     for (size_t i = 0; i < prop_jobs.size(); ++i) {
         if (prop_results[i] != 1) continue;
         const auto &pj = prop_jobs[i];
@@ -347,19 +439,18 @@ inline MountNsExecSummary request_prop_mount_ns_in_pre_specialize(int fd) {
 }
 
 // ============================================================================
-// Phase 2 (App 侧，postAppSpecialize)：在 SpecializeCommon 与 KernelSU/Zygisk Next
-// unmount 清扫全部完成后挂载 VFS 节点，记录全部符号链接别名并做可读性物理自检
+// Phase 2 (App 侧，postAppSpecialize)：通过独立 socketpair 发起 VFS 挂载 + 2 哨兵极速核验
 // ============================================================================
-inline MountNsExecSummary request_vfs_mount_ns_in_post_specialize(int fd) {
+inline MountNsExecSummary request_vfs_mount_ns_in_post_specialize(int vfs_fd) {
     MountNsExecSummary summary{};
     auto send_skip = [&](const std::string &reason) -> MountNsExecSummary {
         uint8_t zero = 0;
-        write_full(fd, &zero, sizeof(zero));
+        if (vfs_fd >= 0) write_full(vfs_fd, &zero, sizeof(zero));
         summary.diag = reason;
         return summary;
     };
 
-    if (fd < 0 || !g_cfg.vfs.any_enabled() || !g_cfg.vfs.enable_mount_ns) {
+    if (vfs_fd < 0 || !g_cfg.vfs.any_enabled() || !g_cfg.vfs.enable_mount_ns) {
         return send_skip("vfs_ns_disabled");
     }
 
@@ -399,8 +490,6 @@ inline MountNsExecSummary request_vfs_mount_ns_in_post_specialize(int fd) {
 
         auto it = canonical_to_idx.find(canonical);
         if (it != canonical_to_idx.end()) {
-            // 同一物理目标的符号链接别名（如 cpu0..3/cpufreq/* -> cpufreq/policy0/*）：
-            // 仅在伪装内容或频率范围一致时注册为别名，避免跨异构簇串台
             VfsMountJob &existing = vfs_jobs[it->second];
             bool compatible = (live_kind == LIVE_NODE_CPUFREQ && existing.live_kind == LIVE_NODE_CPUFREQ &&
                                existing.param_a == pa && existing.param_b == pb) ||
@@ -485,40 +574,73 @@ inline MountNsExecSummary request_vfs_mount_ns_in_post_specialize(int fd) {
     int32_t ppid_i32 = static_cast<int32_t>(ppid);
     uint32_t vfs_count = static_cast<uint32_t>(vfs_jobs.size());
 
-    if (!write_full(fd, &want_flag, sizeof(want_flag)) ||
-        !write_full(fd, &ppid_i32, sizeof(ppid_i32)) ||
-        !write_full(fd, &vfs_count, sizeof(vfs_count))) {
-        summary.diag = "vfs_ipc_write_hdr_failed";
+    if (!write_full(vfs_fd, &want_flag, sizeof(want_flag)) ||
+        !write_full(vfs_fd, &ppid_i32, sizeof(ppid_i32)) ||
+        !write_full(vfs_fd, &vfs_count, sizeof(vfs_count))) {
+        summary.diag = "vfs_ipc_write_hdr_failed(errno=" + std::to_string(errno) + ")";
         return summary;
     }
 
     for (const auto &job : vfs_jobs) {
-        if (!write_str(fd, job.path) ||
-            !write_str(fd, job.content) ||
-            !write_full(fd, &job.live_kind, sizeof(job.live_kind)) ||
-            !write_full(fd, &job.param_a, sizeof(job.param_a)) ||
-            !write_full(fd, &job.param_b, sizeof(job.param_b))) {
-            summary.diag = "vfs_ipc_write_body_failed";
+        if (!write_str(vfs_fd, job.path) ||
+            !write_str(vfs_fd, job.content) ||
+            !write_full(vfs_fd, &job.live_kind, sizeof(job.live_kind)) ||
+            !write_full(vfs_fd, &job.param_a, sizeof(job.param_a)) ||
+            !write_full(vfs_fd, &job.param_b, sizeof(job.param_b))) {
+            summary.diag = "vfs_ipc_write_body_failed(errno=" + std::to_string(errno) + ")";
             return summary;
         }
     }
 
     std::vector<uint8_t> vfs_results(vfs_count, 0);
-    if (!read_full(fd, vfs_results.data(), vfs_results.size()) ||
-        !read_full(fd, &summary.live_nodes, sizeof(summary.live_nodes))) {
-        summary.diag = "vfs_ipc_read_res_failed";
+    if (!read_full(vfs_fd, vfs_results.data(), vfs_results.size()) ||
+        !read_full(vfs_fd, &summary.live_nodes, sizeof(summary.live_nodes))) {
+        summary.diag = "vfs_ipc_read_res_failed(errno=" + std::to_string(errno) + ")";
         return summary;
     }
-    std::string comp_diag = read_str(fd);
+    std::string comp_diag = read_str(vfs_fd);
 
-    // App 侧真实可读物理自检：仅将确认存活且 untrusted_app 可读的节点（连同符号链接别名）注册为 MountNS
+    // 极速 2 哨兵物理自检：分别抽检 1 个 /proc 哨兵与 1 个 /sys 哨兵（总耗时 < 0.1ms）
+    size_t proc_sentinel = vfs_jobs.size();
+    size_t sys_sentinel  = vfs_jobs.size();
+    for (size_t i = 0; i < vfs_jobs.size(); ++i) {
+        if (vfs_results[i] != 1) continue;
+        const std::string &p = vfs_jobs[i].path;
+        if (p.rfind("/proc/", 0) == 0) {
+            if (p == "/proc/cpuinfo" || proc_sentinel == vfs_jobs.size()) proc_sentinel = i;
+        } else if (p.rfind("/sys/", 0) == 0) {
+            if (p == "/sys/devices/system/cpu/present" || sys_sentinel == vfs_jobs.size()) sys_sentinel = i;
+        }
+    }
+
+    bool proc_ok = true;
+    bool sys_ok  = true;
+    std::string sentinel_note;
+
+    if (proc_sentinel < vfs_jobs.size()) {
+        int err = 0;
+        long long sz = -1;
+        proc_ok = verify_vfs_sentinel_as_app(vfs_jobs[proc_sentinel].path, vfs_jobs[proc_sentinel].content.size(), &err, &sz);
+        if (!proc_ok) {
+            sentinel_note += " proc_fail(err=" + std::to_string(err) + ",sz=" + std::to_string(sz) + ")";
+        }
+    }
+    if (sys_sentinel < vfs_jobs.size()) {
+        int err = 0;
+        long long sz = -1;
+        sys_ok = verify_vfs_sentinel_as_app(vfs_jobs[sys_sentinel].path, vfs_jobs[sys_sentinel].content.size(), &err, &sz);
+        if (!sys_ok) {
+            sentinel_note += " sys_fail(err=" + std::to_string(err) + ",sz=" + std::to_string(sz) + ")";
+        }
+    }
+
     uint32_t verified_ok = 0;
     uint32_t alias_total = 0;
     for (size_t i = 0; i < vfs_jobs.size(); ++i) {
         if (vfs_results[i] != 1) continue;
-        if (!verify_mounted_vfs_node_as_app(vfs_jobs[i].path, vfs_jobs[i].content.size())) {
-            continue;
-        }
+        bool is_proc = (vfs_jobs[i].path.rfind("/proc/", 0) == 0);
+        if ((is_proc && !proc_ok) || (!is_proc && !sys_ok)) continue;
+
         for (const auto &alias : vfs_jobs[i].aliases) {
             g_ns_mounted_paths.insert(alias);
             ++alias_total;
@@ -532,12 +654,13 @@ inline MountNsExecSummary request_vfs_mount_ns_in_post_specialize(int fd) {
     }
 
     summary.diag = comp_diag + " verified=" + std::to_string(verified_ok) +
-                   "/" + std::to_string(vfs_count) + " aliases=" + std::to_string(alias_total);
+                   "/" + std::to_string(vfs_count) + " aliases=" + std::to_string(alias_total) +
+                   sentinel_note;
     return summary;
 }
 
 // ============================================================================
-// Companion 侧：活体动态 pwrite 后台线程（仅对纯内存 tmpfs FD 生效，零闪存损耗）
+// Companion 侧：活体动态 pwrite 后台线程（仅纯 RAM tmpfs FD，零闪存损耗）
 // ============================================================================
 struct LiveVfsItem {
     int fd = -1;
@@ -636,6 +759,7 @@ inline void cleanup_stale_stage_dirs_throttled() {
     closedir(dir);
 }
 
+// 系统属性区：克隆原文件真实 SELinux 标签 (u:object_r:*_prop:s0)
 inline bool apply_cloned_selinux_label(const char *src_path, const char *tgt_path, bool force_ctx_mounted) noexcept {
     if (force_ctx_mounted) return true;
     static constexpr const char *kFallbackCtx = "u:object_r:system_file:s0";
@@ -649,6 +773,13 @@ inline bool apply_cloned_selinux_label(const char *src_path, const char *tgt_pat
         }
     }
     return lsetxattr(src_path, "security.selinux", kFallbackCtx, std::strlen(kFallbackCtx) + 1, 0) == 0;
+}
+
+// VFS 文件节点：直接使用全版本 untrusted_app 必可读的 u:object_r:system_file:s0，避免 tmpfs 贴 proc/sysfs 标签被 SELinux 拒绝
+inline bool apply_vfs_readable_selinux_label(const char *src_path, bool force_ctx_mounted) noexcept {
+    if (force_ctx_mounted) return true;
+    static constexpr const char *kSysFileCtx = "u:object_r:system_file:s0";
+    return lsetxattr(src_path, "security.selinux", kSysFileCtx, std::strlen(kSysFileCtx) + 1, 0) == 0;
 }
 
 inline uint8_t prepare_stage_dir_in_worker(
@@ -724,7 +855,7 @@ inline bool check_target_mnt_ns_isolated(int32_t app_pid, int32_t ppid, char *ou
 }
 
 // ============================================================================
-// Phase 1 (Companion 侧)：处理系统属性区 MountNS（零脏页 MAP_SHARED 源头）
+// Phase 1 (Companion 侧)：处理系统属性区 MountNS（零脏页 MAP_SHARED）
 // ============================================================================
 inline MountNsExecSummary companion_handle_prop_mount_ns_sync(int fd, int32_t app_pid) {
     MountNsExecSummary summary{};
@@ -939,19 +1070,19 @@ inline MountNsExecSummary companion_handle_prop_mount_ns_sync(int fd, int32_t ap
 }
 
 // ============================================================================
-// Phase 2 (Companion 侧)：在 postAppSpecialize 阶段处理 VFS 节点挂载与活体线程
+// Phase 2 (Companion 侧)：在独立 socketpair 后台线程中处理 postAppSpecialize VFS 挂载
 // ============================================================================
-inline MountNsExecSummary companion_handle_vfs_mount_ns_sync(int fd, int32_t app_pid) {
+inline MountNsExecSummary companion_handle_vfs_mount_ns_sync(int vfs_fd, int32_t app_pid) {
     MountNsExecSummary summary{};
     uint8_t want_flag = 0;
-    if (!read_full(fd, &want_flag, sizeof(want_flag)) || want_flag == 0) {
+    if (!read_full(vfs_fd, &want_flag, sizeof(want_flag)) || want_flag == 0) {
         return summary;
     }
 
     int32_t ppid = 0;
     uint32_t vfs_count = 0;
-    if (!read_full(fd, &ppid, sizeof(ppid)) ||
-        !read_full(fd, &vfs_count, sizeof(vfs_count))) {
+    if (!read_full(vfs_fd, &ppid, sizeof(ppid)) ||
+        !read_full(vfs_fd, &vfs_count, sizeof(vfs_count))) {
         return summary;
     }
     if (vfs_count > kMaxVfsMountJobs) vfs_count = kMaxVfsMountJobs;
@@ -967,11 +1098,11 @@ inline MountNsExecSummary companion_handle_vfs_mount_ns_sync(int fd, int32_t app
     vfs_jobs.reserve(vfs_count);
     for (uint32_t i = 0; i < vfs_count; ++i) {
         CompVfsJob j{};
-        j.path = read_str(fd);
-        j.content = read_str(fd);
-        read_full(fd, &j.live_kind, sizeof(j.live_kind));
-        read_full(fd, &j.param_a, sizeof(j.param_a));
-        read_full(fd, &j.param_b, sizeof(j.param_b));
+        j.path = read_str(vfs_fd);
+        j.content = read_str(vfs_fd);
+        read_full(vfs_fd, &j.live_kind, sizeof(j.live_kind));
+        read_full(vfs_fd, &j.param_a, sizeof(j.param_a));
+        read_full(vfs_fd, &j.param_b, sizeof(j.param_b));
         vfs_jobs.push_back(std::move(j));
     }
 
@@ -979,9 +1110,9 @@ inline MountNsExecSummary companion_handle_vfs_mount_ns_sync(int fd, int32_t app
     std::vector<uint8_t> vfs_results(vfs_count, 0);
 
     auto send_reply = [&]() {
-        if (vfs_count > 0) write_full(fd, vfs_results.data(), vfs_results.size());
-        write_full(fd, &summary.live_nodes, sizeof(summary.live_nodes));
-        write_str(fd, summary.diag);
+        if (vfs_count > 0) write_full(vfs_fd, vfs_results.data(), vfs_results.size());
+        write_full(vfs_fd, &summary.live_nodes, sizeof(summary.live_nodes));
+        write_str(vfs_fd, summary.diag);
     };
 
     char app_ns_path[64] = {0};
@@ -1075,7 +1206,7 @@ inline MountNsExecSummary companion_handle_vfs_mount_ns_sync(int fd, int32_t app
                         }
 
                         bool keep_live_fd = false;
-                        if (written == v_lens[i] && apply_cloned_selinux_label(src_path, tgt, is_force_ctx)) {
+                        if (written == v_lens[i] && apply_vfs_readable_selinux_label(src_path, is_force_ctx)) {
                             if (mount(src_path, tgt, nullptr, MS_BIND, nullptr) == 0) {
                                 mount(nullptr, tgt, nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
                                 rep.vfs_results[i] = 1;

@@ -25,38 +25,42 @@ struct GotPatchSpec {
     void **orig_out;
 };
 
-inline int query_page_prot(
-    uintptr_t addr,
-    FILE *(*orig_fopen_fn)(const char *, const char *),
-    int (*orig_fclose_fn)(FILE *)) noexcept {
-    FILE *fp = orig_fopen_fn ? orig_fopen_fn("/proc/self/maps", "r") : std::fopen("/proc/self/maps", "r");
-    if (!fp) return PROT_READ | PROT_WRITE;
-
-    int prot = PROT_READ | PROT_WRITE;
-    char line[512];
-    while (std::fgets(line, sizeof(line), fp)) {
-        uintptr_t s = 0, e = 0;
-        char perms[8] = {0};
-        if (std::sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s", &s, &e, perms) >= 3) {
-            if (addr >= s && addr < e) {
-                prot = 0;
-                if (perms[0] == 'r') prot |= PROT_READ;
-                if (perms[1] == 'w') prot |= PROT_WRITE;
-                if (perms[2] == 'x') prot |= PROT_EXEC;
-                break;
+// 直接基于内存中已有的 PT_GNU_RELRO / PT_LOAD 推算槽位原始页权限，彻底消除 /proc/self/maps I/O
+inline int infer_slot_prot_from_phdr(const struct dl_phdr_info *info, uintptr_t slot_addr) noexcept {
+    uintptr_t base = static_cast<uintptr_t>(info->dlpi_addr);
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const auto &ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_GNU_RELRO) {
+            uintptr_t rs = base + ph.p_vaddr;
+            uintptr_t re = rs + ph.p_memsz;
+            if (slot_addr >= rs && slot_addr < re) {
+                return PROT_READ;
             }
         }
     }
-    if (orig_fclose_fn) orig_fclose_fn(fp); else std::fclose(fp);
-    return prot;
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const auto &ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_LOAD) {
+            uintptr_t ls = base + ph.p_vaddr;
+            uintptr_t le = ls + ph.p_memsz;
+            if (slot_addr >= ls && slot_addr < le) {
+                int p = 0;
+                if (ph.p_flags & PF_R) p |= PROT_READ;
+                if (ph.p_flags & PF_W) p |= PROT_WRITE;
+                if (ph.p_flags & PF_X) p |= PROT_EXEC;
+                return p ? p : (PROT_READ | PROT_WRITE);
+            }
+        }
+    }
+    return PROT_READ | PROT_WRITE;
 }
 
-inline bool write_got_slot_safe(
+inline bool write_got_slot_fast(
+    const struct dl_phdr_info *info,
     void **slot,
     void *replacement,
     void **orig_out,
-    FILE *(*orig_fopen_fn)(const char *, const char *),
-    int (*orig_fclose_fn)(FILE *)) noexcept {
+    uintptr_t page_sz) noexcept {
     if (!slot || !replacement) return false;
 
     void *cur = *slot;
@@ -66,12 +70,9 @@ inline bool write_got_slot_safe(
         *orig_out = cur;
     }
 
-    long page_sz = sysconf(_SC_PAGESIZE);
-    if (page_sz <= 0) page_sz = 4096;
     uintptr_t slot_addr = reinterpret_cast<uintptr_t>(slot);
-    uintptr_t page_start = slot_addr & ~static_cast<uintptr_t>(page_sz - 1);
-
-    int orig_prot = query_page_prot(slot_addr, orig_fopen_fn, orig_fclose_fn);
+    uintptr_t page_start = slot_addr & ~(page_sz - 1);
+    int orig_prot = infer_slot_prot_from_phdr(info, slot_addr);
     bool need_mprotect = (orig_prot & PROT_WRITE) == 0;
 
     if (need_mprotect) {
@@ -104,60 +105,59 @@ inline bool is_got_reloc_type(uint32_t r_type) noexcept {
 #endif
 }
 
-inline bool should_direct_got_patch_phdr(const char *name) noexcept {
+inline bool should_direct_got_patch_phdr(const char *name, bool gl_enabled) noexcept {
     if (!name || name[0] == '\0') return false;
     if (std::strstr(name, "mirage_forge") != nullptr ||
         std::strncmp(name, "/data/adb/", 10) == 0 ||
-        std::strstr(name, "libpairipcore") != nullptr) {
+        std::strstr(name, "libpairipcore") != nullptr ||
+        std::strstr(name, "webviewchromium") != nullptr ||
+        std::strstr(name, "GLES_mali") != nullptr ||
+        std::strstr(name, "libllvm") != nullptr ||
+        std::strstr(name, "libadreno") != nullptr) {
         return false;
     }
 
     const char *slash = std::strrchr(name, '/');
     const char *fname = slash ? (slash + 1) : name;
 
-    // 严格跳过 Bionic / ART / Linker 核心库
-    if (std::strcmp(fname, "libc.so") == 0 ||
-        std::strcmp(fname, "libdl.so") == 0 ||
-        std::strcmp(fname, "libm.so") == 0 ||
-        std::strcmp(fname, "libart.so") == 0 ||
-        std::strcmp(fname, "libartbase.so") == 0 ||
-        std::strcmp(fname, "libdexfile.so") == 0 ||
-        std::strncmp(fname, "linker", 6) == 0 ||
-        std::strncmp(fname, "libopenjdk", 10) == 0) {
-        return false;
+    // 跳过所有系统基础与巨型框架库，保持零拖慢
+    static const char *const kSkipPrefixes[] = {
+        "libc.", "libdl.", "libm.", "libz.", "liblog.",
+        "libart", "libdex", "linker", "libopenjdk", "libicu",
+        "libandroid", "libjavacore", "libbase", "libc++", "libutils",
+        "libbinder", "libframework", "libcrypto", "libssl", "libsqlite",
+        "libskia", "libgui", "libui.", "libinput", "libmedia",
+        "libstagefright", "libaudio", "libcamera", "libhidl", "libfmq",
+        "libnativehelper", "libnativeloader", "mapper.", "libOpenCL",
+    };
+    for (const char *pfx : kSkipPrefixes) {
+        if (std::strncmp(fname, pfx, std::strlen(pfx)) == 0) {
+            return false;
+        }
     }
 
-    // 1. 应用私有路径或未解压 APK 路径
+    // 1. 仅在开启「伪装 GPU」时才触碰图形/Vulkan 系统与 HAL 桥接库（严格遵守 0 改动）
+    if (gl_enabled) {
+        if (std::strcmp(fname, "libvulkan.so") == 0 ||
+            std::strcmp(fname, "libhwui.so") == 0 ||
+            std::strcmp(fname, "libvndksupport.so") == 0 ||
+            std::strcmp(fname, "libhardware.so") == 0 ||
+            std::strcmp(fname, "libEGL.so") == 0 ||
+            std::strcmp(fname, "libGLESv1_CM.so") == 0 ||
+            std::strcmp(fname, "libGLESv2.so") == 0 ||
+            std::strcmp(fname, "libGLESv3.so") == 0 ||
+            std::strncmp(fname, "vulkan.", 7) == 0) {
+            return true;
+        }
+    }
+
+    // 2. 应用自身库及未解压 Split APK 内嵌库（含 Bionic 返回的无路径裸 SONAME）
     if (std::strstr(name, ".apk") != nullptr ||
         std::strncmp(name, "/data/", 6) == 0 ||
         std::strncmp(name, "/mnt/", 5) == 0) {
         return true;
     }
-
-    // 2. 关键修复：Android Bionic 对 APK 内嵌库在 dlpi_name 中常仅保留纯文件名 (无 '/')
-    // 例如 "libvulkan_info.so"、"libaida_vulkan.so"、"libdevcheck.so"
     if (slash == nullptr && std::strstr(fname, ".so") != nullptr) {
-        if (std::strncmp(fname, "libandroid", 10) != 0 &&
-            std::strncmp(fname, "libjavacore", 11) != 0 &&
-            std::strncmp(fname, "libbase", 7) != 0 &&
-            std::strncmp(fname, "libc++", 6) != 0 &&
-            std::strncmp(fname, "libutils", 8) != 0 &&
-            std::strncmp(fname, "libbinder", 9) != 0) {
-            return true;
-        }
-    }
-
-    // 3. 图形 / Vulkan / HAL 系统与厂商桥接库
-    if (std::strcmp(fname, "libvulkan.so") == 0 ||
-        std::strcmp(fname, "libhwui.so") == 0 ||
-        std::strcmp(fname, "libvndksupport.so") == 0 ||
-        std::strcmp(fname, "libhardware.so") == 0 ||
-        std::strcmp(fname, "libEGL.so") == 0 ||
-        std::strcmp(fname, "libGLESv1_CM.so") == 0 ||
-        std::strcmp(fname, "libGLESv2.so") == 0 ||
-        std::strcmp(fname, "libGLESv3.so") == 0 ||
-        std::strncmp(fname, "vulkan.", 7) == 0 ||
-        std::strstr(fname, "GLES_mali") != nullptr) {
         return true;
     }
     return false;
@@ -169,25 +169,28 @@ inline std::unordered_set<uintptr_t> g_direct_got_bases;
 struct DirectGotIterateCtx {
     const GotPatchSpec *specs;
     size_t spec_count;
-    FILE *(*orig_fopen_fn)(const char *, const char *);
-    int (*orig_fclose_fn)(FILE *);
+    bool gl_enabled;
+    uintptr_t page_sz;
+    uint64_t char_mask[2]; // 128-bit ASCII 首字符快筛位图
     uint32_t patched_slots;
-    uint32_t scanned_libs;
 };
+
+inline bool mask_has_char(const uint64_t mask[2], unsigned char c) noexcept {
+    if (c >= 128) return false;
+    return ((mask[c >> 6] >> (c & 63)) & 1ULL) != 0;
+}
 
 inline int direct_got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     auto *ctx = static_cast<DirectGotIterateCtx *>(data);
     if (!info || !ctx || info->dlpi_addr == 0 || !info->dlpi_phdr) return 0;
 
     const char *name = info->dlpi_name ? info->dlpi_name : "";
-    if (!should_direct_got_patch_phdr(name)) return 0;
+    if (!should_direct_got_patch_phdr(name, ctx->gl_enabled)) return 0;
 
     uintptr_t base = static_cast<uintptr_t>(info->dlpi_addr);
-    if (g_direct_got_bases.find(base) != g_direct_got_bases.end()) {
+    if (!g_direct_got_bases.insert(base).second) {
         return 0;
     }
-    g_direct_got_bases.insert(base);
-    ++ctx->scanned_libs;
 
     const ElfW(Dyn) *dyn = nullptr;
     for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
@@ -233,19 +236,17 @@ inline int direct_got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     }
     if (!symtab || !strtab) return 0;
 
-    uint32_t lib_hits = 0;
     auto try_patch_entry = [&](uint32_t sym_idx, uint32_t r_type, uintptr_t r_offset) {
         if (sym_idx == 0 || !is_got_reloc_type(r_type)) return;
         const char *sym_name = strtab + symtab[sym_idx].st_name;
-        if (!sym_name || sym_name[0] == '\0') return;
+        unsigned char c0 = static_cast<unsigned char>(sym_name[0]);
+        if (__builtin_expect(!mask_has_char(ctx->char_mask, c0), 1)) return;
 
         for (size_t k = 0; k < ctx->spec_count; ++k) {
             if (std::strcmp(sym_name, ctx->specs[k].symbol) == 0) {
                 auto **slot = reinterpret_cast<void **>(base + r_offset);
-                if (write_got_slot_safe(slot, ctx->specs[k].replacement, ctx->specs[k].orig_out,
-                                        ctx->orig_fopen_fn, ctx->orig_fclose_fn)) {
+                if (write_got_slot_fast(info, slot, ctx->specs[k].replacement, ctx->specs[k].orig_out, ctx->page_sz)) {
                     ++ctx->patched_slots;
-                    ++lib_hits;
                 }
                 break;
             }
@@ -305,22 +306,28 @@ inline int direct_got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     if (rela_tbl && rela_sz > 0) scan_rela(rela_tbl, rela_sz);
     if (rel_tbl && rel_sz > 0) scan_rel(rel_tbl, rel_sz);
 
-    if (lib_hits > 0) {
-        LOGI("[GOT_DIRECT] patched %u slot(s) in %s (base=0x%" PRIxPTR ")", lib_hits, name, base);
-    }
     return 0;
 }
 
 inline uint32_t apply_direct_got_patches_all(
     const GotPatchSpec *specs,
     size_t spec_count,
-    FILE *(*orig_fopen_fn)(const char *, const char *),
-    int (*orig_fclose_fn)(FILE *)) {
+    bool gl_enabled) {
     if (!specs || spec_count == 0) return 0;
     ErrnoRestorer errno_guard;
     if (!g_direct_got_mtx.try_lock()) return 0;
 
-    DirectGotIterateCtx ctx{specs, spec_count, orig_fopen_fn, orig_fclose_fn, 0, 0};
+    long psz = sysconf(_SC_PAGESIZE);
+    if (psz <= 0) psz = 4096;
+
+    DirectGotIterateCtx ctx{specs, spec_count, gl_enabled, static_cast<uintptr_t>(psz), {0, 0}, 0};
+    for (size_t i = 0; i < spec_count; ++i) {
+        unsigned char c0 = static_cast<unsigned char>(specs[i].symbol[0]);
+        if (c0 < 128) {
+            ctx.char_mask[c0 >> 6] |= (1ULL << (c0 & 63));
+        }
+    }
+
     dl_iterate_phdr(direct_got_phdr_cb, &ctx);
 
     g_direct_got_mtx.unlock();

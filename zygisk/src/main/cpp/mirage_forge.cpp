@@ -15,8 +15,8 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <dirent.h>
-#include <poll.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 
 #include "zygisk.hpp"
@@ -34,7 +34,9 @@ using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
 using namespace mirage;
 
-static constexpr const char *kPhase2MagicToken = "__MIRAGE_PHASE2__";
+// SCM_RIGHTS 通道位图标志
+static constexpr uint8_t kChanBitVfs = 1u << 0;
+static constexpr uint8_t kChanBitLog = 1u << 1;
 
 class MirageForgeModule : public zygisk::ModuleBase {
 public:
@@ -112,9 +114,8 @@ public:
 
         if (!g_cfg.is_any_enabled()) {
             uint8_t zero = 0;
-            write_full(fd, &zero, sizeof(zero)); // Phase 1: want_prop_ns = 0
-            write_full(fd, &zero, sizeof(zero)); // Phase 2: want_vfs_ns = 0
-            write_full(fd, &zero, sizeof(zero)); // Step 4: has_status = 0
+            write_full(fd, &zero, sizeof(zero)); // Phase 1 prop_ns = 0
+            write_full(fd, &zero, sizeof(zero)); // has_pre_status = 0
             close(fd);
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
@@ -139,13 +140,15 @@ public:
         const bool want_prop_ns = (g_cfg.build.enabled && g_cfg.build.prop_mode == PropSpoofMode::MOUNT_NS);
         const bool want_vfs_ns  = (g_cfg.vfs.any_enabled() && g_cfg.vfs.enable_mount_ns);
 
-        // Phase 1：系统属性 MountNS（preAppSpecialize 同步挂载并立刻 MAP_SHARED 刷新）
+        // 1. Phase 1：系统属性 MountNS（preAppSpecialize 同步挂载并立刻 MAP_SHARED 钉入地址空间）
         MountNsExecSummary prop_ns_sum = request_prop_mount_ns_in_pre_specialize(fd);
 
+        // 若仅启用 VFS MountNS 而未启用属性 MountNS，单线程阶段先 unshare 保证命名空间隔离
         if (!want_prop_ns && want_vfs_ns && getppid() > 1) {
             unshare(CLONE_NEWNS);
         }
 
+        // 2. 系统属性三引擎自适应执行与降级：MountNS -> 纯 COW -> Hook
         final_prop_verified_ = 0;
         final_prop_inserted_ = 0;
         status_diag_ = prop_ns_sum.diag;
@@ -191,30 +194,56 @@ public:
             }
         }
 
+        // 3. 同步汇报 Phase 1 状态并按需通过 SCM_RIGHTS 接收独立 socketpair（绝不复用 Zygisk 原生 fd 跨阶段）
+        bool will_hook_am_mem = (g_cfg.vfs.enable_mem && g_cfg.vfs.ram_gb > 0);
+        bool pre_resident = needs_any_plt_hooks() || will_hook_am_mem;
+        uint8_t has_pre_status = 1;
+        uint8_t req_chan_mask = (want_vfs_ns ? kChanBitVfs : 0u) | (g_cfg.probe.enabled ? kChanBitLog : 0u);
+        uint8_t pre_zero_res = pre_resident ? 0 : 1;
+
+        write_full(fd, &has_pre_status, sizeof(has_pre_status));
+        write_full(fd, &req_chan_mask, sizeof(req_chan_mask));
+        write_str(fd, g_cfg.build.enabled ? prop_mode_to_str(g_cfg.build.prop_mode) : "off");
+        write_str(fd, g_cfg.build.enabled ? prop_mode_to_str(g_cfg.build.effective_prop_mode) : "off");
+        write_full(fd, &final_prop_verified_, sizeof(final_prop_verified_));
+        write_full(fd, &final_prop_inserted_, sizeof(final_prop_inserted_));
+        write_full(fd, &pre_zero_res, sizeof(pre_zero_res));
+        write_str(fd, status_diag_);
+
+        uint8_t granted_mask = 0;
+        int rx_fds[4] = {-1, -1, -1, -1};
+        int rx_cnt = recv_fds_over_unix(fd, &granted_mask, rx_fds, 4);
+
+        // Zygisk 原生 companion fd 任务全部完成，立刻干净关闭！
+        close(fd);
+
+        int idx = 0;
+        if (rx_cnt > 0 && (granted_mask & kChanBitVfs) && idx < rx_cnt && rx_fds[idx] >= 0) {
+            phase2_vfs_fd_ = rx_fds[idx++];
+            api->exemptFd(phase2_vfs_fd_);
+        }
+        if (rx_cnt > 0 && (granted_mask & kChanBitLog) && idx < rx_cnt && rx_fds[idx] >= 0) {
+            g_probe_log_fd = rx_fds[idx++];
+            api->exemptFd(g_probe_log_fd);
+        }
+        for (; idx < rx_cnt; ++idx) {
+            if (rx_fds[idx] >= 0) close(rx_fds[idx]);
+        }
+
         if (g_cfg.probe.enabled) {
             install_crash_signal_logger(pkg_name);
         }
 
         g_cfg.active = true;
-        LOGI("[PRE][%s][pid=%d] prop=%s(%u,+%u) want_vfs_ns=%d fd=%d",
-             pkg_name.c_str(), app_pid,
-             g_cfg.build.enabled ? prop_mode_to_str(g_cfg.build.effective_prop_mode) : "off",
-             final_prop_verified_, final_prop_inserted_, want_vfs_ns ? 1 : 0, fd);
+        pending_vfs_ns_ = want_vfs_ns;
 
-        if (want_vfs_ns) {
-            api->exemptFd(fd);
-            companion_fd_ = fd;
-            pending_vfs_ns_ = true;
+        // 若需在 postAppSpecialize 执行 Phase 2 VFS MountNS，延后 PLT 扫描至 MountNS 完成后
+        // （挂载成功即彻底免挂 29 个文件 I/O PLT Hook）
+        if (pending_vfs_ns_) {
             return;
         }
 
-        uint8_t no_vfs_ns = 0;
-        write_full(fd, &no_vfs_ns, sizeof(no_vfs_ns));
-
-        bool will_hook_am_mem = (g_cfg.vfs.enable_mem && g_cfg.vfs.ram_gb > 0);
-        need_resident_hooks_ = needs_any_plt_hooks() || will_hook_am_mem;
-        finalize_companion_session(fd, 0, 0, /*already_exempted=*/false);
-
+        need_resident_hooks_ = pre_resident;
         if (need_resident_hooks_) {
             init_linker_symbols();
             scan_and_commit_plt_hooks();
@@ -229,91 +258,41 @@ public:
 
         bool will_hook_am_mem = (g_cfg.vfs.enable_mem && g_cfg.vfs.ram_gb > 0);
 
+        // Phase 2：通过独立 socketpair 在 KernelSU / Zygisk Next unmount 结束后执行 VFS MountNS
         if (pending_vfs_ns_) {
             MountNsExecSummary vfs_sum{};
-            int active_fd = -1;
-            bool pre_fd_ok = false;
+            if (phase2_vfs_fd_ >= 0) {
+                vfs_sum = request_vfs_mount_ns_in_post_specialize(phase2_vfs_fd_);
 
-            // 1. 先检查跨 SpecializeCommon 保留的 companion_fd_ 是否仍然健康
-            if (companion_fd_ >= 0 && fcntl(companion_fd_, F_GETFD) != -1) {
-                struct pollfd pfd{};
-                pfd.fd = companion_fd_;
-                pfd.events = POLLIN;
-                int pr = poll(&pfd, 1, 0);
-                if (pr >= 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) == 0) {
-                    pre_fd_ok = true;
-                } else {
-                    LOGW("[POST][%s] pre_fd=%d unusable (poll=%d revents=0x%x errno=%d)",
-                         g_cfg.pkg_name.c_str(), companion_fd_, pr,
-                         static_cast<unsigned>(pfd.revents), errno);
+                need_resident_hooks_ = needs_any_plt_hooks() || will_hook_am_mem;
+                uint8_t final_zero_res = need_resident_hooks_ ? 0 : 1;
+                if (!vfs_sum.diag.empty()) {
+                    if (!status_diag_.empty()) status_diag_ += "|";
+                    status_diag_ += vfs_sum.diag;
                 }
+
+                // 将最终哨兵核验结果回传 Companion 刷新 runtime_status.json
+                uint8_t has_post_ack = 1;
+                write_full(phase2_vfs_fd_, &has_post_ack, sizeof(has_post_ack));
+                write_full(phase2_vfs_fd_, &vfs_sum.vfs_mounted, sizeof(vfs_sum.vfs_mounted));
+                write_full(phase2_vfs_fd_, &vfs_sum.vfs_requested, sizeof(vfs_sum.vfs_requested));
+                write_full(phase2_vfs_fd_, &final_zero_res, sizeof(final_zero_res));
+                write_str(phase2_vfs_fd_, status_diag_);
+
+                close(phase2_vfs_fd_);
+                phase2_vfs_fd_ = -1;
             } else {
-                LOGW("[POST][%s] pre_fd=%d invalid (errno=%d)",
-                     g_cfg.pkg_name.c_str(), companion_fd_, errno);
-            }
-
-            if (pre_fd_ok) {
-                vfs_sum = request_vfs_mount_ns_in_post_specialize(companion_fd_);
-                if (vfs_sum.diag.rfind("vfs_ipc_", 0) == 0) {
-                    LOGW("[POST][%s] pre_fd=%d IPC broken (%s), closing & retrying via Phase2 reconnect",
-                         g_cfg.pkg_name.c_str(), companion_fd_, vfs_sum.diag.c_str());
-                    close(companion_fd_);
-                    companion_fd_ = -1;
-                } else {
-                    active_fd = companion_fd_;
-                    companion_fd_ = -1;
-                }
-            } else if (companion_fd_ >= 0) {
-                close(companion_fd_);
-                companion_fd_ = -1;
-            }
-
-            // 2. 若 pre_fd 断连，在 postAppSpecialize 发起同步 Phase 2 重连兜底
-            if (active_fd < 0) {
-                int fd2 = api->connectCompanion();
-                if (fd2 >= 0) {
-                    int32_t app_pid = static_cast<int32_t>(getpid());
-                    uint8_t hit2 = 0;
-                    if (write_str(fd2, kPhase2MagicToken) &&
-                        write_str(fd2, g_cfg.pkg_name) &&
-                        write_full(fd2, &app_pid, sizeof(app_pid)) &&
-                        read_full(fd2, &hit2, sizeof(hit2)) && hit2 == 1) {
-                        LOGI("[POST][%s] Phase2 reconnect succeeded (fd=%d)", g_cfg.pkg_name.c_str(), fd2);
-                        vfs_sum = request_vfs_mount_ns_in_post_specialize(fd2);
-                        active_fd = fd2;
-                    } else {
-                        LOGW("[POST][%s] Phase2 reconnect handshake failed (fd=%d errno=%d)",
-                             g_cfg.pkg_name.c_str(), fd2, errno);
-                        close(fd2);
-                    }
-                } else {
-                    LOGW("[POST][%s] connectCompanion() in postAppSpecialize failed (errno=%d)",
-                         g_cfg.pkg_name.c_str(), errno);
-                    if (vfs_sum.diag.empty()) {
-                        vfs_sum.diag = "post_reconnect_failed(errno=" + std::to_string(errno) + ")";
-                    }
+                need_resident_hooks_ = needs_any_plt_hooks() || will_hook_am_mem;
+                if (g_cfg.probe.enabled) {
+                    emit_probe("VFS_MOUNT_NS", "Phase2_Channel", "missing_socketpair_fallback_plt");
                 }
             }
 
-            if (!vfs_sum.diag.empty()) {
-                if (!status_diag_.empty()) status_diag_ += "|";
-                status_diag_ += vfs_sum.diag;
+            if (g_cfg.probe.enabled) {
+                emit_probe("VFS_MOUNT_NS",
+                           vfs_sum.vfs_mounted > 0 ? "PostSpecialize_Active" : "PostSpecialize_Fallback",
+                           vfs_sum.diag);
             }
-
-            need_resident_hooks_ = needs_any_plt_hooks() || will_hook_am_mem;
-            if (active_fd >= 0) {
-                finalize_companion_session(
-                    active_fd,
-                    vfs_sum.vfs_mounted,
-                    vfs_sum.vfs_requested,
-                    /*already_exempted=*/true
-                );
-            }
-
-            LOGI("[POST][%s][pid=%d] vfs=%u/%u live=%u probe_fd=%d diag=%s",
-                 g_cfg.pkg_name.c_str(), static_cast<int>(getpid()),
-                 vfs_sum.vfs_mounted, vfs_sum.vfs_requested, vfs_sum.live_nodes,
-                 g_probe_log_fd, status_diag_.c_str());
 
             pending_vfs_ns_ = false;
 
@@ -346,43 +325,12 @@ public:
 private:
     Api *api = nullptr;
     JNIEnv *env = nullptr;
-    int companion_fd_ = -1;
+    int phase2_vfs_fd_ = -1;
     bool pending_vfs_ns_ = false;
     bool need_resident_hooks_ = false;
     uint32_t final_prop_verified_ = 0;
     uint32_t final_prop_inserted_ = 0;
     std::string status_diag_;
-
-    void finalize_companion_session(int fd, uint32_t vfs_mounted, uint32_t vfs_requested, bool already_exempted) {
-        uint8_t zero_residence = need_resident_hooks_ ? 0 : 1;
-        uint8_t has_status = 1;
-        bool ok_w = write_full(fd, &has_status, sizeof(has_status)) &&
-                    write_str(fd, g_cfg.build.enabled ? prop_mode_to_str(g_cfg.build.prop_mode) : "off") &&
-                    write_str(fd, g_cfg.build.enabled ? prop_mode_to_str(g_cfg.build.effective_prop_mode) : "off") &&
-                    write_full(fd, &final_prop_verified_, sizeof(final_prop_verified_)) &&
-                    write_full(fd, &final_prop_inserted_, sizeof(final_prop_inserted_)) &&
-                    write_full(fd, &vfs_mounted, sizeof(vfs_mounted)) &&
-                    write_full(fd, &vfs_requested, sizeof(vfs_requested)) &&
-                    write_full(fd, &zero_residence, sizeof(zero_residence)) &&
-                    write_str(fd, status_diag_);
-
-        uint8_t sink_ready = 0;
-        bool ok_r = ok_w && read_full(fd, &sink_ready, sizeof(sink_ready));
-
-        if (!ok_w || !ok_r) {
-            LOGW("[SESSION][%s] finalize IPC failed (ok_w=%d ok_r=%d errno=%d)",
-                 g_cfg.pkg_name.c_str(), ok_w ? 1 : 0, ok_r ? 1 : 0, errno);
-        }
-
-        if (ok_r && g_cfg.probe.enabled && sink_ready == 1) {
-            if (!already_exempted) {
-                api->exemptFd(fd);
-            }
-            g_probe_log_fd = fd;
-        } else {
-            close(fd);
-        }
-    }
 
     void load_modular_config(const std::vector<std::pair<std::string, std::string>> &raw_kvs) {
         bool legacy_vfs_on = false;
@@ -516,7 +464,7 @@ private:
 };
 
 // ============================================================================
-// Root Companion 守护进程（支持 Phase 1 + 后台线程 / 同步 Phase 2 重连双路径）
+// Root Companion 守护进程（独立 socketpair 隔离 Phase 2 VFS MountNS 与探针通道）
 // ============================================================================
 static std::mutex g_file_write_mtx;
 static std::mutex g_companion_cache_mtx;
@@ -617,7 +565,8 @@ static void record_launch_telemetry(const std::string &pkg, int32_t pid, const s
     append_line_as_root(LAUNCH_LOG_PATH, buf);
 }
 
-static void run_probe_log_sink_loop(int sock_fd) {
+static void *companion_log_sink_thread(void *arg) {
+    int sock_fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
     std::string pending;
     std::string pending_crash_line;
     std::time_t pending_crash_ts = 0;
@@ -676,94 +625,53 @@ static void run_probe_log_sink_loop(int sock_fd) {
     }
 
     close(sock_fd);
-}
-
-static void *companion_log_sink_only_thread(void *arg) {
-    int sock_fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
-    run_probe_log_sink_loop(sock_fd);
     return nullptr;
 }
 
-struct CompanionSessionCtx {
-    int sock_fd = -1;
-    int32_t app_pid = 0;
+struct PostVfsThreadCtx {
+    int vfs_fd = -1;
     std::string pkg_name;
-    std::string version_snapshot;
-    std::string model;
-    std::string gpu;
-    int ram_gb = 16;
+    RuntimeStatusRecord base_status;
     bool probe_on = false;
 };
 
-static bool run_phase2_and_record_status(int sock_fd, const CompanionSessionCtx &meta) {
-    MountNsExecSummary vfs_summary = companion_handle_vfs_mount_ns_sync(sock_fd, meta.app_pid);
-
-    uint8_t has_status = 0;
-    if (!read_full(sock_fd, &has_status, sizeof(has_status)) || has_status == 0) {
-        return false;
-    }
-
-    RuntimeStatusRecord st{};
-    st.timestamp = static_cast<int64_t>(std::time(nullptr));
-    st.pid = meta.app_pid;
-    st.prop_req = read_str(sock_fd);
-    st.prop_eff = read_str(sock_fd);
-    read_full(sock_fd, &st.prop_verified, sizeof(st.prop_verified));
-    read_full(sock_fd, &st.prop_inserted, sizeof(st.prop_inserted));
-    read_full(sock_fd, &st.vfs_mounted, sizeof(st.vfs_mounted));
-    read_full(sock_fd, &st.vfs_requested, sizeof(st.vfs_requested));
-    uint8_t zero_res_u8 = 0;
-    read_full(sock_fd, &zero_res_u8, sizeof(zero_res_u8));
-    st.zero_residence = (zero_res_u8 == 1);
-    st.live_nodes = vfs_summary.live_nodes;
-    st.diag = read_str(sock_fd);
-
-    record_runtime_status_as_root(meta.pkg_name, st);
-    record_launch_telemetry(meta.pkg_name, meta.app_pid, meta.model, meta.gpu, meta.ram_gb);
-
-    if (!meta.probe_on) {
-        uint8_t no_ready = 0;
-        write_full(sock_fd, &no_ready, sizeof(no_ready));
-        return false;
-    }
-
-    mkdir(DATA_ROOT_DIR, 0700);
-    append_line_as_root(
-        PROBE_LOG_PATH,
-        "[PROBE][" + meta.pkg_name + "][SESSION] MirageForge_v" + meta.version_snapshot +
-            "_Attached => " + meta.model + " | " + meta.gpu +
-            " | prop=" + st.prop_eff + "(" + std::to_string(st.prop_verified) +
-            ",+" + std::to_string(st.prop_inserted) + ")" +
-            " | vfs=" + std::to_string(st.vfs_mounted) + "/" + std::to_string(st.vfs_requested) +
-            " | zero_res=" + std::string(st.zero_residence ? "1" : "0") +
-            " @@ zygisk::specialize(pid=" + std::to_string(meta.app_pid) + ")"
-    );
-    if (!st.diag.empty() && st.diag != "prop_ns_disabled") {
-        append_line_as_root(
-            PROBE_LOG_PATH,
-            "[PROBE][" + meta.pkg_name + "][ENGINE_DIAG] " + st.prop_req + "->" + st.prop_eff +
-                " => " + st.diag + " @@ companion(pid=" + std::to_string(meta.app_pid) + ")"
-        );
-    }
-    return true;
-}
-
-static void *companion_phase2_and_sink_thread(void *arg) {
-    auto *ctx = static_cast<CompanionSessionCtx *>(arg);
+static void *companion_post_vfs_thread(void *arg) {
+    auto *ctx = static_cast<PostVfsThreadCtx *>(arg);
     if (!ctx) return nullptr;
 
-    int sock_fd = ctx->sock_fd;
-    bool want_sink = run_phase2_and_record_status(sock_fd, *ctx);
-    delete ctx;
+    int vfs_fd = ctx->vfs_fd;
+    MountNsExecSummary vfs_sum = companion_handle_vfs_mount_ns_sync(vfs_fd, ctx->base_status.pid);
 
-    if (want_sink) {
-        uint8_t ready = 1;
-        if (write_full(sock_fd, &ready, sizeof(ready))) {
-            run_probe_log_sink_loop(sock_fd);
-            return nullptr;
+    uint8_t has_post_ack = 0;
+    if (read_full(vfs_fd, &has_post_ack, sizeof(has_post_ack)) && has_post_ack == 1) {
+        uint32_t final_mounted = 0;
+        uint32_t final_req = 0;
+        uint8_t final_zero_res = 0;
+        read_full(vfs_fd, &final_mounted, sizeof(final_mounted));
+        read_full(vfs_fd, &final_req, sizeof(final_req));
+        read_full(vfs_fd, &final_zero_res, sizeof(final_zero_res));
+        std::string full_diag = read_str(vfs_fd);
+
+        RuntimeStatusRecord updated = ctx->base_status;
+        updated.timestamp = static_cast<int64_t>(std::time(nullptr));
+        updated.vfs_mounted = final_mounted;
+        updated.vfs_requested = final_req;
+        updated.live_nodes = vfs_sum.live_nodes;
+        updated.zero_residence = (final_zero_res == 1);
+        updated.diag = full_diag;
+
+        record_runtime_status_as_root(ctx->pkg_name, updated);
+        if (ctx->probe_on) {
+            append_line_as_root(
+                PROBE_LOG_PATH,
+                "[PROBE][" + ctx->pkg_name + "][ENGINE_DIAG] " + updated.prop_req + "->" + updated.prop_eff +
+                    " => " + updated.diag + " @@ post_vfs(pid=" + std::to_string(updated.pid) + ")"
+            );
         }
     }
-    close(sock_fd);
+
+    close(vfs_fd);
+    delete ctx;
     return nullptr;
 }
 
@@ -828,75 +736,15 @@ struct CompanionCache {
 static CompanionCache g_companion_cache;
 
 static void companion_handler(int fd) {
-    std::string first_str = read_str(fd);
-    if (first_str.empty()) {
+    std::string pkg_name = read_str(fd);
+    int32_t app_pid = 0;
+    read_full(fd, &app_pid, sizeof(app_pid));
+
+    if (pkg_name.empty()) {
         uint8_t zero = 0;
         write_full(fd, &zero, sizeof(zero));
         return;
     }
-
-    // 同步 Phase 2 重连通道（当 preAppSpecialize 的 fd 跨 SpecializeCommon 失效时自动走此路径）
-    if (first_str == kPhase2MagicToken) {
-        std::string pkg_name = read_str(fd);
-        int32_t app_pid = 0;
-        read_full(fd, &app_pid, sizeof(app_pid));
-
-        std::unordered_map<std::string, std::string> entries;
-        std::string version_snapshot;
-        {
-            std::lock_guard<std::mutex> lock(g_companion_cache_mtx);
-            g_companion_cache.refresh_if_needed();
-            auto it = g_companion_cache.pkg_configs.find(pkg_name);
-            if (it == g_companion_cache.pkg_configs.end()) {
-                uint8_t zero = 0;
-                write_full(fd, &zero, sizeof(zero));
-                return;
-            }
-            entries = it->second;
-            version_snapshot = g_companion_cache.cached_version;
-        }
-
-        uint8_t one = 1;
-        if (!write_full(fd, &one, sizeof(one))) return;
-
-        auto flag_on = [&](const char *k) -> bool {
-            auto it = entries.find(k);
-            return it != entries.end() && it->second == "1";
-        };
-
-        CompanionSessionCtx meta{};
-        meta.sock_fd = fd;
-        meta.app_pid = app_pid;
-        meta.pkg_name = std::move(pkg_name);
-        meta.version_snapshot = std::move(version_snapshot);
-        meta.model = entries.count("BUILD:MODEL") ? entries.at("BUILD:MODEL") : "Custom";
-        meta.gpu   = entries.count("GLES:RENDERER") ? entries.at("GLES:RENDERER") : "DefaultGPU";
-        meta.ram_gb = entries.count("VFS:RAM_GB") ? std::atoi(entries.at("VFS:RAM_GB").c_str()) : 16;
-        meta.probe_on = flag_on("META:ENABLE_PROBE");
-
-        if (run_phase2_and_record_status(fd, meta)) {
-            int sink_fd = dup(fd);
-            if (sink_fd >= 0) {
-                pthread_t tid;
-                if (pthread_create(&tid, nullptr, companion_log_sink_only_thread,
-                                   reinterpret_cast<void *>(static_cast<intptr_t>(sink_fd))) == 0) {
-                    pthread_detach(tid);
-                    uint8_t ready = 1;
-                    write_full(fd, &ready, sizeof(ready));
-                    return;
-                }
-                close(sink_fd);
-            }
-            uint8_t no_ready = 0;
-            write_full(fd, &no_ready, sizeof(no_ready));
-        }
-        return;
-    }
-
-    // 常规 Phase 1 入口
-    std::string pkg_name = std::move(first_str);
-    int32_t app_pid = 0;
-    read_full(fd, &app_pid, sizeof(app_pid));
 
     std::unordered_map<std::string, std::string> entries;
     std::string version_snapshot;
@@ -943,28 +791,98 @@ static void companion_handler(int fd) {
         write_str(fd, kv.second);
     }
 
-    // Phase 1：在 preAppSpecialize 内同步处理系统属性 MountNS
+    // 1. Phase 1：同步处理系统属性 MountNS
     (void)companion_handle_prop_mount_ns_sync(fd, app_pid);
 
-    int dup_fd = dup(fd);
-    if (dup_fd < 0) return;
+    // 2. 同步接收 Phase 1 状态并立即落盘 runtime_status.json（必成功、绝不丢失）
+    uint8_t has_pre_status = 0;
+    if (!read_full(fd, &has_pre_status, sizeof(has_pre_status)) || has_pre_status == 0) {
+        return;
+    }
 
-    auto *ctx = new CompanionSessionCtx();
-    ctx->sock_fd = dup_fd;
-    ctx->app_pid = app_pid;
-    ctx->pkg_name = std::move(pkg_name);
-    ctx->version_snapshot = std::move(version_snapshot);
-    ctx->model = entries.count("BUILD:MODEL") ? entries.at("BUILD:MODEL") : "Custom";
-    ctx->gpu   = entries.count("GLES:RENDERER") ? entries.at("GLES:RENDERER") : "DefaultGPU";
-    ctx->ram_gb = entries.count("VFS:RAM_GB") ? std::atoi(entries.at("VFS:RAM_GB").c_str()) : 16;
-    ctx->probe_on = flag_on("META:ENABLE_PROBE");
+    uint8_t req_chan_mask = 0;
+    read_full(fd, &req_chan_mask, sizeof(req_chan_mask));
 
-    pthread_t tid;
-    if (pthread_create(&tid, nullptr, companion_phase2_and_sink_thread, ctx) == 0) {
-        pthread_detach(tid);
-    } else {
-        close(dup_fd);
-        delete ctx;
+    RuntimeStatusRecord st{};
+    st.timestamp = static_cast<int64_t>(std::time(nullptr));
+    st.pid = app_pid;
+    st.prop_req = read_str(fd);
+    st.prop_eff = read_str(fd);
+    read_full(fd, &st.prop_verified, sizeof(st.prop_verified));
+    read_full(fd, &st.prop_inserted, sizeof(st.prop_inserted));
+    uint8_t zero_res_u8 = 0;
+    read_full(fd, &zero_res_u8, sizeof(zero_res_u8));
+    st.zero_residence = (zero_res_u8 == 1);
+    st.diag = read_str(fd);
+
+    record_runtime_status_as_root(pkg_name, st);
+
+    std::string model = entries.count("BUILD:MODEL") ? entries.at("BUILD:MODEL") : "Custom";
+    std::string gpu   = entries.count("GLES:RENDERER") ? entries.at("GLES:RENDERER") : "DefaultGPU";
+    int ram_gb        = entries.count("VFS:RAM_GB") ? std::atoi(entries.at("VFS:RAM_GB").c_str()) : 16;
+    bool probe_on     = flag_on("META:ENABLE_PROBE");
+
+    record_launch_telemetry(pkg_name, app_pid, model, gpu, ram_gb);
+
+    if (probe_on) {
+        mkdir(DATA_ROOT_DIR, 0700);
+        append_line_as_root(
+            PROBE_LOG_PATH,
+            "[PROBE][" + pkg_name + "][SESSION] MirageForge_v" + version_snapshot +
+                "_Attached => " + model + " | " + gpu +
+                " | prop=" + st.prop_eff + "(" + std::to_string(st.prop_verified) +
+                ",+" + std::to_string(st.prop_inserted) + ")" +
+                " | zero_res=" + std::string(st.zero_residence ? "1" : "0") +
+                " @@ zygisk::preAppSpecialize(pid=" + std::to_string(app_pid) + ")"
+        );
+    }
+
+    // 3. 按需创建完全独立的 socketpair，通过 SCM_RIGHTS 移交 App 后立刻结束 companion_handler
+    uint8_t granted_mask = 0;
+    int tx_fds[2] = {-1, -1};
+    int tx_cnt = 0;
+
+    if (req_chan_mask & kChanBitVfs) {
+        int vfs_sp[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, vfs_sp) == 0) {
+            auto *p2_ctx = new PostVfsThreadCtx();
+            p2_ctx->vfs_fd = vfs_sp[0];
+            p2_ctx->pkg_name = pkg_name;
+            p2_ctx->base_status = st;
+            p2_ctx->probe_on = probe_on;
+
+            pthread_t tid;
+            if (pthread_create(&tid, nullptr, companion_post_vfs_thread, p2_ctx) == 0) {
+                pthread_detach(tid);
+                granted_mask |= kChanBitVfs;
+                tx_fds[tx_cnt++] = vfs_sp[1];
+            } else {
+                close(vfs_sp[0]);
+                close(vfs_sp[1]);
+                delete p2_ctx;
+            }
+        }
+    }
+
+    if (probe_on && (req_chan_mask & kChanBitLog)) {
+        int log_sp[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, log_sp) == 0) {
+            pthread_t tid;
+            if (pthread_create(&tid, nullptr, companion_log_sink_thread,
+                               reinterpret_cast<void *>(static_cast<intptr_t>(log_sp[0]))) == 0) {
+                pthread_detach(tid);
+                granted_mask |= kChanBitLog;
+                tx_fds[tx_cnt++] = log_sp[1];
+            } else {
+                close(log_sp[0]);
+                close(log_sp[1]);
+            }
+        }
+    }
+
+    send_fds_over_unix(fd, granted_mask, tx_fds, tx_cnt);
+    for (int i = 0; i < tx_cnt; ++i) {
+        if (tx_fds[i] >= 0) close(tx_fds[i]);
     }
 }
 
